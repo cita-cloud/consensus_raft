@@ -353,14 +353,14 @@ impl RaftServer {
                 let mut peer = self.peer.write().await;
                 match rx.try_recv() {
                     Ok(RaftServerMessage::Proposal { proposal }) => {
-                        match peer.process_proposal(proposal).await {
-                            // ignore uninitialized here
-                            Err(Error::RaftGroupUninitialized) => (),
-                            other => other?,
+                        if let Err(e) = peer.process_proposal(proposal).await {
+                            warn!("process proposal failed: {:?}", e);
                         }
                     }
                     Ok(RaftServerMessage::Raft { message }) => {
-                        peer.raft_group.step(message).await?;
+                        if let Err(e) = peer.raft_group.step(message).await {
+                            warn!("raft group step message failed: {:?}", e);
+                        }
                     }
                     Err(mpsc::error::TryRecvError::Empty) => (),
                     Err(mpsc::error::TryRecvError::Closed) => {
@@ -370,10 +370,14 @@ impl RaftServer {
                 }
                 if peer.raft_group.is_initialized() {
                     if tick_clock.elapsed() >= tick_interval {
-                        peer.raft_group.tick().await?;
+                        if let Err(e) = peer.raft_group.tick().await {
+                            warn!("raft group tick failed: {:?}", e);
+                        }
                         tick_clock = Instant::now();
                     }
-                    peer.on_ready().await?;
+                    if let Err(e) = peer.on_ready().await {
+                        warn!("raft group on_ready failed: {:?}", e);
+                    }
                 }
             }
             interval.tick().await;
