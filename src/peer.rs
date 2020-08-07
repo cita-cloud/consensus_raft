@@ -65,7 +65,7 @@ impl RaftGroup {
     async fn propose(&self, hash: Vec<u8>) -> Result<()> {
         if let Some(ref r) = self.node {
             let mut r = r.write().await;
-            r.propose(vec![], hash).unwrap();
+            r.propose(vec![], hash)?;
             Ok(())
         } else {
             Err(Error::RaftGroupUninitialized)
@@ -240,11 +240,7 @@ impl Peer {
         match proposal {
             Proposal::Normal { hash } => {
                 if !self.committed.contains(&hash)
-                    && self
-                        .network_manager
-                        .check_proposal(hash.clone())
-                        .await
-                        .unwrap()
+                    && self.network_manager.check_proposal(hash.clone()).await?
                 {
                     self.raft_group.propose(hash.clone()).await?;
                 }
@@ -287,7 +283,7 @@ impl Peer {
                 if let EntryType::EntryConfChange = entry.get_entry_type() {
                     // For conf change messages, make them effective.
                     let mut cc = ConfChange::default();
-                    cc.merge_from_bytes(&entry.data).unwrap();
+                    cc.merge_from_bytes(&entry.data)?;
                     let cs = self.raft_group.apply_conf_change(&cc).await?;
                     store.wl().set_conf_state(cs);
                 } else {
@@ -344,7 +340,7 @@ impl RaftServer {
     ) -> Result<()> {
         tokio::spawn(self.clone().wait_proposal(tx));
         let mut tick_clock = Instant::now();
-        let tick_interval = Duration::from_millis(100);
+        let tick_interval = Duration::from_millis(80);
 
         let d = Duration::from_millis(10);
         let mut interval = time::interval(d);
@@ -412,7 +408,7 @@ impl RaftServer {
     }
 
     pub async fn add_follower(mut tx: mpsc::Sender<RaftServerMessage>) {
-        let d = Duration::from_secs(20);
+        let d = Duration::from_secs(5);
         let mut interval = time::interval(d);
         interval.tick().await;
         let mut cc = ConfChange::default();
