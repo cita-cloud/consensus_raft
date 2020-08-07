@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_imports)] // TODO: remove it
-
 mod config;
 mod network;
 mod peer;
+mod error;
 
 use clap::Clap;
 use git_version::git_version;
@@ -77,8 +76,6 @@ fn main() {
     }
 }
 
-
-
 async fn register_network_msg_handler(
     network_port: u16,
     port: String,
@@ -97,25 +94,24 @@ async fn register_network_msg_handler(
     Ok(response.into_inner().is_success)
 }
 
-use cita_ng_proto::network::network_service_client::NetworkServiceClient;
-use cita_ng_proto::network::RegisterInfo;
-use cita_ng_proto::common::SimpleResponse;
 use cita_ng_proto::consensus::{
     consensus_service_server::ConsensusService, consensus_service_server::ConsensusServiceServer,
     ConsensusConfiguration,
 };
-use tonic::{transport::Server, Request};
-use std::time::Duration;
-use tokio::time;
+use cita_ng_proto::network::network_service_client::NetworkServiceClient;
+use cita_ng_proto::network::RegisterInfo;
 use cita_ng_proto::network::{
     network_msg_handler_service_server::NetworkMsgHandlerService,
     network_msg_handler_service_server::NetworkMsgHandlerServiceServer, NetworkMsg,
 };
-use std::sync::Arc;
-use std::sync::Mutex;
+use raft::prelude::*;
 use std::fs::File;
 use std::io::Read;
-use raft::prelude::*;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+use tokio::time;
+use tonic::{transport::Server, Request};
 
 #[tokio::main]
 async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
@@ -154,8 +150,7 @@ async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
     let raft_server = if is_leader {
         info!("init leader");
         peer::RaftServer::new(1, tx.clone(), controller_port, network_port)
-    }
-    else {
+    } else {
         info!("init follower");
         peer::RaftServer::new(2, tx.clone(), controller_port, network_port)
     };
@@ -169,6 +164,7 @@ async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
     Server::builder()
         .add_service(ConsensusServiceServer::new(raft_server.clone()))
         .add_service(NetworkMsgHandlerServiceServer::new(raft_server.clone()))
-        .serve(addr).await?;
+        .serve(addr)
+        .await?;
     Ok(())
 }

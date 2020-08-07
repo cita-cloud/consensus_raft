@@ -1,15 +1,14 @@
 use cita_ng_proto::controller::consensus2_controller_service_client::Consensus2ControllerServiceClient;
-use cita_ng_proto::network::{
-    network_service_client::NetworkServiceClient, NetworkMsg,
-};
-use tokio::time;
+use cita_ng_proto::network::{network_service_client::NetworkServiceClient, NetworkMsg};
 use std::time::Duration;
+use tokio::time;
 
-use cita_ng_proto::common::{ Hash, Empty };
-use raft::eraftpb::Message;
+use cita_ng_proto::common::{Empty, Hash};
 #[allow(unused)]
 use log::{info, warn};
+use raft::eraftpb::Message;
 use tonic::transport::channel::Channel;
+use crate::error::Result;
 
 pub struct NetworkManager {
     controller_port: u16,
@@ -30,9 +29,8 @@ impl NetworkManager {
 
     async fn controller_client(&mut self) -> &mut Consensus2ControllerServiceClient<Channel> {
         if let Some(ref mut client) = self.controller {
-            return client
-        }
-        else {
+            return client;
+        } else {
             let d = Duration::from_millis(100);
             let mut interval = time::interval(d);
             let controller_addr = format!("http://127.0.0.1:{}", self.controller_port);
@@ -55,9 +53,8 @@ impl NetworkManager {
 
     async fn network_client(&mut self) -> &mut NetworkServiceClient<Channel> {
         if let Some(ref mut client) = self.network {
-            return client
-        }
-        else {
+            return client;
+        } else {
             let d = Duration::from_millis(100);
             let mut interval = time::interval(d);
             let network_addr = format!("http://127.0.0.1:{}", self.network_port);
@@ -78,7 +75,10 @@ impl NetworkManager {
         }
     }
 
-    pub async fn check_proposal(&mut self, proposal: Vec<u8>) -> Result<bool, Box<dyn std::error::Error>>{
+    pub async fn check_proposal(
+        &mut self,
+        proposal: Vec<u8>,
+    ) -> Result<bool> {
         info!("check proposal...");
         let controller = self.controller_client().await;
         let request = tonic::Request::new(Hash { hash: proposal });
@@ -86,7 +86,10 @@ impl NetworkManager {
         Ok(response.into_inner().is_success)
     }
 
-    pub async fn commit_block(&mut self, proposal: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn commit_block(
+        &mut self,
+        proposal: Vec<u8>,
+    ) -> Result<()> {
         info!("commit block...");
         let controller = self.controller_client().await;
         let request = tonic::Request::new(Hash { hash: proposal });
@@ -94,7 +97,7 @@ impl NetworkManager {
         Ok(())
     }
 
-    pub async fn get_proposal(&mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub async fn get_proposal(&mut self) -> Result<Vec<u8>> {
         info!("get proposal...");
         let controller = self.controller_client().await;
         let request = tonic::Request::new(Empty {});
@@ -102,7 +105,7 @@ impl NetworkManager {
         Ok(response.into_inner().hash)
     }
 
-    pub async fn broadcast(&mut self, msg: Message) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn broadcast(&mut self, msg: Message) -> Result<()> {
         use protobuf::Message as _;
 
         info!("broadcast...");
@@ -118,8 +121,8 @@ impl NetworkManager {
         let _response = network.broadcast(request).await?;
         Ok(())
     }
-    
-    pub async fn send_msg(&mut self, msg: Message) -> Result<(), Box<dyn std::error::Error>> {
+
+    pub async fn send_msg(&mut self, msg: Message) -> Result<()> {
         use protobuf::Message as _;
 
         info!("broadcast...");
@@ -136,5 +139,3 @@ impl NetworkManager {
         Ok(())
     }
 }
-
-
