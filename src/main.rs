@@ -13,13 +13,12 @@
 // limitations under the License.
 
 mod config;
+mod error;
 mod network;
 mod peer;
-mod error;
 
 use clap::Clap;
 use git_version::git_version;
-#[allow(unused)]
 use log::{info, warn};
 
 const GIT_VERSION: &str = git_version!(
@@ -94,21 +93,14 @@ async fn register_network_msg_handler(
     Ok(response.into_inner().is_success)
 }
 
-use cita_ng_proto::consensus::{
-    consensus_service_server::ConsensusService, consensus_service_server::ConsensusServiceServer,
-    ConsensusConfiguration,
-};
+use cita_ng_proto::consensus::consensus_service_server::ConsensusServiceServer;
+use cita_ng_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
 use cita_ng_proto::network::network_service_client::NetworkServiceClient;
 use cita_ng_proto::network::RegisterInfo;
-use cita_ng_proto::network::{
-    network_msg_handler_service_server::NetworkMsgHandlerService,
-    network_msg_handler_service_server::NetworkMsgHandlerServiceServer, NetworkMsg,
-};
-use raft::prelude::*;
+
 use std::fs::File;
 use std::io::Read;
-use std::sync::Arc;
-use std::sync::Mutex;
+
 use std::time::Duration;
 use tokio::time;
 use tonic::{transport::Server, Request};

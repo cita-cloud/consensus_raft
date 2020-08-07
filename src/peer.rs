@@ -18,15 +18,13 @@ use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio::time;
 
-use crate::network::NetworkManager;
-use crate::error::{Error, Result};
-
-#[allow(unused)]
 use log::{info, warn};
 use protobuf::Message as _;
 use slog::o;
 use slog::Drain;
 
+use crate::error::{Error, Result};
+use crate::network::NetworkManager;
 
 #[derive(Debug)]
 pub enum RaftServerMessage {
@@ -237,7 +235,7 @@ impl Peer {
         }
     }
 
-    async fn process_proposal(&mut self, proposal: Proposal) -> Result<()>{
+    async fn process_proposal(&mut self, proposal: Proposal) -> Result<()> {
         info!("process proposal");
         match proposal {
             Proposal::Normal { hash } => {
@@ -278,9 +276,7 @@ impl Peer {
 
         for msg in ready.messages.drain(..) {
             info!("broadcast msg..");
-            self.network_manager
-                .broadcast(msg)
-                .await?;
+            self.network_manager.broadcast(msg).await?;
         }
         if let Some(committed_entries) = ready.committed_entries.take() {
             for entry in &committed_entries {

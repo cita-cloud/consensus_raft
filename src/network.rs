@@ -1,14 +1,12 @@
+use crate::error::Result;
+use cita_ng_proto::common::{Empty, Hash};
 use cita_ng_proto::controller::consensus2_controller_service_client::Consensus2ControllerServiceClient;
 use cita_ng_proto::network::{network_service_client::NetworkServiceClient, NetworkMsg};
+use log::info;
+use raft::eraftpb::Message;
 use std::time::Duration;
 use tokio::time;
-
-use cita_ng_proto::common::{Empty, Hash};
-#[allow(unused)]
-use log::{info, warn};
-use raft::eraftpb::Message;
 use tonic::transport::channel::Channel;
-use crate::error::Result;
 
 pub struct NetworkManager {
     controller_port: u16,
@@ -75,10 +73,7 @@ impl NetworkManager {
         }
     }
 
-    pub async fn check_proposal(
-        &mut self,
-        proposal: Vec<u8>,
-    ) -> Result<bool> {
+    pub async fn check_proposal(&mut self, proposal: Vec<u8>) -> Result<bool> {
         info!("check proposal...");
         let controller = self.controller_client().await;
         let request = tonic::Request::new(Hash { hash: proposal });
@@ -86,10 +81,7 @@ impl NetworkManager {
         Ok(response.into_inner().is_success)
     }
 
-    pub async fn commit_block(
-        &mut self,
-        proposal: Vec<u8>,
-    ) -> Result<()> {
+    pub async fn commit_block(&mut self, proposal: Vec<u8>) -> Result<()> {
         info!("commit block...");
         let controller = self.controller_client().await;
         let request = tonic::Request::new(Hash { hash: proposal });
@@ -125,7 +117,7 @@ impl NetworkManager {
     pub async fn send_msg(&mut self, msg: Message) -> Result<()> {
         use protobuf::Message as _;
 
-        info!("broadcast...");
+        info!("send_msg...");
 
         let network = self.network_client().await;
         let payload = msg.write_to_bytes().unwrap();
