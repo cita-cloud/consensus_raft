@@ -1,0 +1,29 @@
+[package]
+name = "cita_ng_raft"
+version = "0.1.0"
+authors = ["whfuyn <whfuyn@outlook.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = "0.4.11"
+log4rs = "0.13.0"
+clap = { git = "https://github.com/clap-rs/clap/" }
+git-version = "0.3.4"
+cita_ng_proto = { git = "https://github.com/rink1969/cita_ng_proto" }
+tonic = "0.2.0"
+prost = "0.6"
+bytes = "0.5"
+protobuf = { version = "2.8", features = ["with-bytes"] }
+tokio = { version = "0.2", features = ["full"] }
+rand = "0.7"
+serde = "1.0.114"
+serde_derive = "1.0.114"
+toml = "0.5"
+raft = { git = "https://github.com/tikv/raft-rs", version = "0.6.0-alpha"}
+slog = "2.2"
+slog-envlogger = { version = "2.1.0" }
+slog-stdlog = { version = "4" }
+slog-term = { version = "2.4.0" }
+slog-async = "2.3.0"
