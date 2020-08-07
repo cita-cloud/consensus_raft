@@ -246,7 +246,7 @@ impl Peer {
                         .await
                         .unwrap()
                 {
-                    self.raft_group.propose(hash).await?;
+                    self.raft_group.propose(hash.clone()).await?;
                 }
             }
             Proposal::ConfChange { cc } => {
@@ -295,10 +295,7 @@ impl Peer {
                     let proposal = entry.data.clone();
                     if self.raft_group.is_leader().await? {
                         info!("leader commiting proposal..");
-                        self.network_manager
-                            .commit_block(proposal.clone())
-                            .await
-                            .expect("commit failed");
+                        self.network_manager.commit_block(proposal.clone()).await?;
                     } else {
                         info!("follower ignore commiting");
                     }
@@ -340,12 +337,14 @@ impl RaftServer {
         Self { peer, tx }
     }
 
-    pub async fn start(self, mut rx: mpsc::Receiver<RaftServerMessage>) -> Result<()> {
+    pub async fn start(
+        self,
+        tx: mpsc::Sender<RaftServerMessage>,
+        mut rx: mpsc::Receiver<RaftServerMessage>,
+    ) -> Result<()> {
+        tokio::spawn(self.clone().wait_proposal(tx));
         let mut tick_clock = Instant::now();
         let tick_interval = Duration::from_millis(100);
-
-        let mut block_clock = Instant::now();
-        let mut block_interval = Duration::from_millis(100);
 
         let d = Duration::from_millis(10);
         let mut interval = time::interval(d);
@@ -370,20 +369,6 @@ impl RaftServer {
                     }
                 }
                 if peer.raft_group.is_initialized() {
-                    if block_clock.elapsed() >= block_interval {
-                        if let (Some(config), true) =
-                            (&peer.config, peer.raft_group.is_leader().await.unwrap())
-                        {
-                            // block_interval = Duration::from_millis(1000);
-                            block_interval = Duration::from_secs((config.block_interval) as u64);
-                            let hash = peer.network_manager.get_proposal().await?;
-                            if peer.network_manager.check_proposal(hash.clone()).await? {
-                                let proposal = Proposal::Normal { hash };
-                                peer.process_proposal(proposal).await?;
-                            }
-                        }
-                        block_clock = Instant::now();
-                    }
                     if tick_clock.elapsed() >= tick_interval {
                         peer.raft_group.tick().await?;
                         tick_clock = Instant::now();
@@ -391,6 +376,33 @@ impl RaftServer {
                     peer.on_ready().await?;
                 }
             }
+            interval.tick().await;
+        }
+    }
+
+    async fn wait_proposal(self, mut tx: mpsc::Sender<RaftServerMessage>) {
+        let mut block_clock = Instant::now();
+        let mut block_interval = Duration::from_millis(300);
+        loop {
+            if block_clock.elapsed() >= block_interval {
+                let mut peer = self.peer.write().await;
+                if let (Some(config), true) =
+                    (&peer.config, peer.raft_group.is_leader().await.unwrap())
+                {
+                    // block_interval = Duration::from_millis(1000);
+                    block_interval = Duration::from_secs((config.block_interval) as u64);
+                    if let Ok(hash) = peer.network_manager.get_proposal().await {
+                        if let Ok(true) = peer.network_manager.check_proposal(hash.clone()).await {
+                            let proposal = Proposal::Normal { hash };
+                            tx.send(RaftServerMessage::Proposal { proposal })
+                                .await
+                                .unwrap();
+                        }
+                    }
+                }
+                block_clock = Instant::now();
+            }
+            let mut interval = time::interval(block_interval);
             interval.tick().await;
         }
     }

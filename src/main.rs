@@ -148,7 +148,7 @@ async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     info!("start raft server");
-    tokio::spawn(raft_server.clone().start(rx));
+    tokio::spawn(raft_server.clone().start(tx.clone(), rx));
     if is_leader {
         tokio::spawn(peer::RaftServer::add_follower(tx.clone()));
     }
