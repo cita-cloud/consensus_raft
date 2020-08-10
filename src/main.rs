@@ -98,9 +98,6 @@ use cita_ng_proto::network::network_msg_handler_service_server::NetworkMsgHandle
 use cita_ng_proto::network::network_service_client::NetworkServiceClient;
 use cita_ng_proto::network::RegisterInfo;
 
-use std::fs::File;
-use std::io::Read;
-
 use std::time::Duration;
 use tokio::time;
 use tonic::{transport::Server, Request};
@@ -108,9 +105,7 @@ use tonic::{transport::Server, Request};
 #[tokio::main]
 async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
     //read consensus-config.toml
-    let mut buffer = String::new();
-    File::open("consensus-config.toml")
-        .and_then(|mut f| f.read_to_string(&mut buffer))
+    let buffer = std::fs::read_to_string("consensus-config.toml")
         .unwrap_or_else(|err| panic!("Error while loading config: [{}]", err));
     let config = config::RaftConfig::new(&buffer);
 
