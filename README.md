@@ -1,2 +1,2 @@
-# cita_ng_raft
-The raft consensus component for CITA NG.
+# cita_cloud_raft
+The raft consensus component for CITA Cloud.
