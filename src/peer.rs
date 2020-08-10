@@ -164,7 +164,8 @@ impl RaftGroup {
     async fn advance(&self, ready: Ready) -> Result<()> {
         if let Some(ref r) = self.node {
             let mut r = r.write().await;
-            Ok(r.advance(ready))
+            r.advance(ready);
+            Ok(())
         } else {
             Err(Error::RaftGroupUninitialized)
         }
@@ -239,10 +240,14 @@ impl Peer {
         info!("process proposal");
         match proposal {
             Proposal::Normal { hash } => {
-                if !self.committed.contains(&hash)
-                    && self.network_manager.check_proposal(hash.clone()).await?
-                {
-                    self.raft_group.propose(hash.clone()).await?;
+                if !self.committed.contains(&hash) {
+                    if self.network_manager.check_proposal(hash.clone()).await? {
+                        self.raft_group.propose(hash.clone()).await?;
+                    } else {
+                        info!("check porposal failed.");
+                    }
+                } else {
+                    info!("proposal had already committed.");
                 }
             }
             Proposal::ConfChange { cc } => {
@@ -260,7 +265,7 @@ impl Peer {
         let store = self.raft_group.log_store().await?;
         let mut ready = self.raft_group.ready().await?;
         if let Err(e) = store.wl().append(ready.entries()) {
-            warn!("store append entries failed: `{}`", e);
+            info!("store append entries failed: `{}`", e);
             return Ok(());
         }
         if *ready.snapshot() != Snapshot::default() {
@@ -271,8 +276,8 @@ impl Peer {
         }
 
         for msg in ready.messages.drain(..) {
-            info!("broadcast msg..");
-            self.network_manager.broadcast(msg).await?;
+            info!("sending msg..");
+            self.network_manager.send_msg(msg).await?;
         }
         if let Some(committed_entries) = ready.committed_entries.take() {
             for entry in &committed_entries {
@@ -304,7 +309,7 @@ impl Peer {
                 s.mut_hard_state().term = last_committed.term;
             }
         }
-        // Call `RawNode::advance` interface to update position flags in the raft.
+        // Call `RawNode::advance`interface to update position flags in the raft.
         self.raft_group.advance(ready).await?;
         Ok(())
     }
@@ -340,7 +345,7 @@ impl RaftServer {
     ) -> Result<()> {
         tokio::spawn(self.clone().wait_proposal(tx));
         let mut tick_clock = Instant::now();
-        let tick_interval = Duration::from_millis(80);
+        let tick_interval = Duration::from_millis(100);
 
         let d = Duration::from_millis(10);
         let mut interval = time::interval(d);
@@ -382,22 +387,19 @@ impl RaftServer {
 
     async fn wait_proposal(self, mut tx: mpsc::Sender<RaftServerMessage>) {
         let mut block_clock = Instant::now();
-        let mut block_interval = Duration::from_millis(300);
+        let mut block_interval = Duration::from_millis(500);
         loop {
             if block_clock.elapsed() >= block_interval {
                 let mut peer = self.peer.write().await;
                 if let (Some(config), true) =
                     (&peer.config, peer.raft_group.is_leader().await.unwrap())
                 {
-                    // block_interval = Duration::from_millis(1000);
                     block_interval = Duration::from_secs((config.block_interval) as u64);
                     if let Ok(hash) = peer.network_manager.get_proposal().await {
-                        if let Ok(true) = peer.network_manager.check_proposal(hash.clone()).await {
-                            let proposal = Proposal::Normal { hash };
-                            tx.send(RaftServerMessage::Proposal { proposal })
-                                .await
-                                .unwrap();
-                        }
+                        let proposal = Proposal::Normal { hash };
+                        tx.send(RaftServerMessage::Proposal { proposal })
+                            .await
+                            .unwrap();
                     }
                 }
                 block_clock = Instant::now();
@@ -408,9 +410,10 @@ impl RaftServer {
     }
 
     pub async fn add_follower(mut tx: mpsc::Sender<RaftServerMessage>) {
+        info!("add follower");
         let d = Duration::from_secs(5);
-        let mut interval = time::interval(d);
-        interval.tick().await;
+        let mut delay = time::interval(d);
+        delay.tick().await;
         let mut cc = ConfChange::default();
         cc.node_id = 2;
         cc.set_change_type(ConfChangeType::AddNode);
@@ -440,7 +443,13 @@ impl NetworkMsgHandlerService for RaftServer {
         if msg.module != "consensus" {
             Err(tonic::Status::invalid_argument("wrong module"))
         } else {
-            let raft_msg = protobuf::parse_from_bytes(msg.msg.as_slice()).unwrap();
+            let raft_msg: Message = protobuf::parse_from_bytes(msg.msg.as_slice()).unwrap();
+            let origin = msg.origin;
+            let from = raft_msg.from;
+            {
+                let mut peer = self.peer.write().await;
+                peer.network_manager.update_table(from, origin);
+            }
             self.tx
                 .clone()
                 .send(RaftServerMessage::Raft { message: raft_msg })
