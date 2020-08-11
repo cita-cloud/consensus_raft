@@ -3,12 +3,13 @@ use raft::eraftpb::Message;
 use raft::prelude::ConfChange;
 use raft::prelude::ConfState;
 use raft::prelude::Config;
+use raft::prelude::Entry;
 use raft::prelude::EntryType;
+use raft::prelude::HardState;
 use raft::prelude::RawNode;
 use raft::prelude::Ready;
 use raft::prelude::Snapshot;
 use raft::storage::MemStorage;
-use raft::StateRole;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -51,15 +52,6 @@ impl RaftGroup {
 
     fn is_initialized(&self) -> bool {
         self.node.is_some()
-    }
-
-    async fn is_leader(&self) -> Result<bool> {
-        if let Some(ref r) = self.node {
-            let r = r.read().await;
-            Ok(r.raft.state == StateRole::Leader)
-        } else {
-            Err(Error::RaftGroupUninitialized)
-        }
     }
 
     async fn propose(&self, hash: Vec<u8>) -> Result<()> {
@@ -147,6 +139,36 @@ impl RaftGroup {
         if let Some(ref r) = self.node {
             let r = r.read().await;
             Ok(r.raft.raft_log.store.clone())
+        } else {
+            Err(Error::RaftGroupUninitialized)
+        }
+    }
+
+    async fn apply_snapshot(&self, snapshot: Snapshot) -> Result<()> {
+        if let Some(ref r) = self.node {
+            let mut r = r.write().await;
+            r.mut_store().wl().apply_snapshot(snapshot)?;
+            Ok(())
+        } else {
+            Err(Error::RaftGroupUninitialized)
+        }
+    }
+
+    async fn append_entries(&self, ents: &[Entry]) -> Result<()> {
+        if let Some(ref r) = self.node {
+            let mut r = r.write().await;
+            r.mut_store().wl().append(ents)?;
+            Ok(())
+        } else {
+            Err(Error::RaftGroupUninitialized)
+        }
+    }
+
+    async fn set_hardstate(&self, hs: HardState) -> Result<()> {
+        if let Some(ref r) = self.node {
+            let mut r = r.write().await;
+            r.mut_store().wl().set_hardstate(hs);
+            Ok(())
         } else {
             Err(Error::RaftGroupUninitialized)
         }
@@ -263,14 +285,23 @@ impl Peer {
         }
         let store = self.raft_group.log_store().await?;
         let mut ready = self.raft_group.ready().await?;
-        if let Err(e) = store.wl().append(ready.entries()) {
-            info!("store append entries failed: `{}`", e);
-            return Ok(());
-        }
-        if *ready.snapshot() != Snapshot::default() {
+
+        if !ready.snapshot().is_empty() {
             let s = ready.snapshot().clone();
-            if let Err(e) = store.wl().apply_snapshot(s) {
+            if let Err(e) = self.raft_group.apply_snapshot(s).await {
                 info!("apply snapshot failed: {:?}", e);
+            }
+        }
+
+        if !ready.entries().is_empty() {
+            if let Err(e) = self.raft_group.append_entries(ready.entries()).await {
+                info!("append entries failed: {:?}", e);
+            }
+        }
+
+        if let Some(hs) = ready.hs() {
+            if let Err(e) = self.raft_group.set_hardstate(hs.clone()).await {
+                info!("set hardstate failed: {:?}", e);
             }
         }
 
@@ -278,28 +309,26 @@ impl Peer {
             info!("sending msg..");
             self.network_manager.send_msg(msg).await?;
         }
+
         if let Some(committed_entries) = ready.committed_entries.take() {
             for entry in &committed_entries {
                 if entry.data.is_empty() {
-                    // From new elected leaders.
                     continue;
                 }
-                if let EntryType::EntryConfChange = entry.get_entry_type() {
-                    // For conf change messages, make them effective.
-                    let mut cc = ConfChange::default();
-                    cc.merge_from_bytes(&entry.data)?;
-                    let cs = self.raft_group.apply_conf_change(&cc).await?;
-                    store.wl().set_conf_state(cs);
-                } else {
-                    info!("commiting proposal..");
-                    let proposal = entry.data.clone();
-                    if self.raft_group.is_leader().await? {
-                        info!("leader commiting proposal..");
+                match entry.get_entry_type() {
+                    EntryType::EntryNormal => {
+                        info!("commiting proposal..");
+                        let proposal = entry.data.clone();
                         self.network_manager.commit_block(proposal.clone()).await?;
-                    } else {
-                        info!("follower ignore commiting");
+                        self.committed.insert(proposal);
                     }
-                    self.committed.insert(proposal);
+                    EntryType::EntryConfChange => {
+                        let mut cc = ConfChange::default();
+                        cc.merge_from_bytes(&entry.data)?;
+                        let cs = self.raft_group.apply_conf_change(&cc).await?;
+                        store.wl().set_conf_state(cs);
+                    }
+                    EntryType::EntryConfChangeV2 => warn!("ConfChangeV2 unimplemented."),
                 }
             }
             if let Some(last_committed) = committed_entries.last() {
@@ -407,8 +436,7 @@ impl RaftServer {
         loop {
             if block_clock.elapsed() >= block_interval {
                 let mut peer = self.peer.write().await;
-                if let (Some(config), Ok(true)) = (&peer.config, peer.raft_group.is_leader().await)
-                {
+                if let Some(ref config) = peer.config {
                     block_interval = Duration::from_secs((config.block_interval) as u64);
                     if let Ok(hash) = peer.network_manager.get_proposal().await {
                         let proposal = Proposal::Normal { hash };
