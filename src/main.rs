@@ -104,7 +104,7 @@ use tonic::{transport::Server, Request};
 
 #[tokio::main]
 async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
-    //read consensus-config.toml
+    // read consensus-config.toml
     let buffer = std::fs::read_to_string("consensus-config.toml")
         .unwrap_or_else(|err| panic!("Error while loading config: [{}]", err));
     let config = config::RaftConfig::new(&buffer);
@@ -145,7 +145,7 @@ async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
     info!("start raft server");
     tokio::spawn(raft_server.clone().start(tx.clone(), rx));
     if is_leader {
-        tokio::spawn(peer::RaftServer::add_follower(tx.clone()));
+        tokio::spawn(peer::RaftServer::add_follower(2, tx.clone()));
     }
     info!("start grpc server!");
     Server::builder()

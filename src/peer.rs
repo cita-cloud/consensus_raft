@@ -391,8 +391,8 @@ impl RaftServer {
         loop {
             if block_clock.elapsed() >= block_interval {
                 let mut peer = self.peer.write().await;
-                if let (Some(config), true) =
-                    (&peer.config, peer.raft_group.is_leader().await.unwrap())
+                if let (Some(config), Ok(true)) =
+                    (&peer.config, peer.raft_group.is_leader().await)
                 {
                     block_interval = Duration::from_secs((config.block_interval) as u64);
                     if let Ok(hash) = peer.network_manager.get_proposal().await {
@@ -409,18 +409,20 @@ impl RaftServer {
         }
     }
 
-    pub async fn add_follower(mut tx: mpsc::Sender<RaftServerMessage>) {
+    pub async fn add_follower(n: u64, mut tx: mpsc::Sender<RaftServerMessage>) {
         info!("add follower");
         let d = Duration::from_secs(5);
         let mut delay = time::interval(d);
         delay.tick().await;
-        let mut cc = ConfChange::default();
-        cc.node_id = 2;
-        cc.set_change_type(ConfChangeType::AddNode);
-        let proposal = Proposal::ConfChange { cc };
-        tx.send(RaftServerMessage::Proposal { proposal })
-            .await
-            .unwrap();
+        for id in 2..=n {
+            let mut cc = ConfChange::default();
+            cc.node_id = id;
+            cc.set_change_type(ConfChangeType::AddNode);
+            let proposal = Proposal::ConfChange { cc };
+            tx.send(RaftServerMessage::Proposal { proposal })
+                .await
+                .unwrap();
+        }
     }
 }
 
