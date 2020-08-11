@@ -36,7 +36,7 @@ pub enum RaftServerMessage {
 pub enum Proposal {
     Normal { hash: Vec<u8> },
     ConfChange { cc: ConfChange },
-    TransferLeader,
+    // TransferLeader,
 }
 
 struct RaftGroup {
@@ -253,7 +253,6 @@ impl Peer {
             Proposal::ConfChange { cc } => {
                 self.raft_group.propose_conf_change(cc).await?;
             }
-            Proposal::TransferLeader => info!("transfer leader unimplemented"),
         }
         Ok(())
     }
@@ -350,38 +349,55 @@ impl RaftServer {
         let d = Duration::from_millis(10);
         let mut interval = time::interval(d);
         loop {
-            {
-                let mut peer = self.peer.write().await;
-                match rx.try_recv() {
-                    Ok(RaftServerMessage::Proposal { proposal }) => {
-                        if let Err(e) = peer.process_proposal(proposal).await {
-                            warn!("process proposal failed: {:?}", e);
-                        }
-                    }
-                    Ok(RaftServerMessage::Raft { message }) => {
-                        if let Err(e) = peer.raft_group.step(message).await {
-                            warn!("raft group step message failed: {:?}", e);
-                        }
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => (),
-                    Err(mpsc::error::TryRecvError::Closed) => {
-                        info!("Recv closed.");
-                        return Ok(());
-                    }
+            match rx.try_recv() {
+                Ok(RaftServerMessage::Proposal { proposal }) => {
+                    tokio::spawn(self.clone().raft_process_proposal(proposal));
                 }
-                if peer.raft_group.is_initialized() {
-                    if tick_clock.elapsed() >= tick_interval {
-                        if let Err(e) = peer.raft_group.tick().await {
-                            warn!("raft group tick failed: {:?}", e);
-                        }
-                        tick_clock = Instant::now();
-                    }
-                    if let Err(e) = peer.on_ready().await {
-                        warn!("raft group on_ready failed: {:?}", e);
-                    }
+                Ok(RaftServerMessage::Raft { message }) => {
+                    tokio::spawn(self.clone().raft_step(message));
+                }
+                Err(mpsc::error::TryRecvError::Empty) => (),
+                Err(mpsc::error::TryRecvError::Closed) => {
+                    info!("Recv closed.");
+                    return Ok(());
                 }
             }
+            if tick_clock.elapsed() >= tick_interval {
+                tokio::spawn(self.clone().raft_tick());
+                tick_clock = Instant::now();
+            }
+            tokio::spawn(self.clone().raft_on_ready());
             interval.tick().await;
+        }
+    }
+
+    async fn raft_process_proposal(self, proposal: Proposal) {
+        let mut peer = self.peer.write().await;
+        if let Err(e) = peer.process_proposal(proposal).await {
+            warn!("process proposal failed: {:?}", e);
+        }
+    }
+
+    async fn raft_step(self, message: Message) {
+        let mut peer = self.peer.write().await;
+        if let Err(e) = peer.raft_group.step(message).await {
+            warn!("raft group step message failed: {:?}", e);
+        }
+    }
+
+    async fn raft_tick(self) {
+        let peer = self.peer.write().await;
+        if peer.raft_group.is_initialized() {
+            if let Err(e) = peer.raft_group.tick().await {
+                warn!("raft group tick failed: {:?}", e);
+            }
+        }
+    }
+
+    async fn raft_on_ready(self) {
+        let mut peer = self.peer.write().await;
+        if let Err(e) = peer.on_ready().await {
+            warn!("raft group on_ready failed: {:?}", e);
         }
     }
 
@@ -391,8 +407,7 @@ impl RaftServer {
         loop {
             if block_clock.elapsed() >= block_interval {
                 let mut peer = self.peer.write().await;
-                if let (Some(config), Ok(true)) =
-                    (&peer.config, peer.raft_group.is_leader().await)
+                if let (Some(config), Ok(true)) = (&peer.config, peer.raft_group.is_leader().await)
                 {
                     block_interval = Duration::from_secs((config.block_interval) as u64);
                     if let Ok(hash) = peer.network_manager.get_proposal().await {
@@ -426,12 +441,12 @@ impl RaftServer {
     }
 }
 
-use cita_ng_proto::common::SimpleResponse;
-use cita_ng_proto::consensus::{
+use cita_cloud_proto::common::SimpleResponse;
+use cita_cloud_proto::consensus::{
     consensus_service_server::ConsensusService, ConsensusConfiguration,
 };
-use cita_ng_proto::network::network_msg_handler_service_server::NetworkMsgHandlerService;
-use cita_ng_proto::network::NetworkMsg;
+use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerService;
+use cita_cloud_proto::network::NetworkMsg;
 
 #[tonic::async_trait]
 impl NetworkMsgHandlerService for RaftServer {
