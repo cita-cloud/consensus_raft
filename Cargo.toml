@@ -1,5 +1,5 @@
 [package]
-name = "cita_cloud_raft"
+name = "consensus"
 version = "0.1.0"
 authors = ["whfuyn <whfuyn@outlook.com>"]
 edition = "2018"
@@ -9,7 +9,7 @@ log = "0.4.11"
 log4rs = "0.13.0"
 clap = { git = "https://github.com/clap-rs/clap/" }
 git-version = "0.3.4"
-cita_ng_proto = { git = "https://github.com/rink1969/cita_ng_proto" }
+cita_cloud_proto = { git = "https://github.com/cita-cloud/cita_cloud_proto" }
 tonic = "0.2.0"
 prost = "0.6"
 bytes = "0.5"

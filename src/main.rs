@@ -93,10 +93,10 @@ async fn register_network_msg_handler(
     Ok(response.into_inner().is_success)
 }
 
-use cita_ng_proto::consensus::consensus_service_server::ConsensusServiceServer;
-use cita_ng_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
-use cita_ng_proto::network::network_service_client::NetworkServiceClient;
-use cita_ng_proto::network::RegisterInfo;
+use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServer;
+use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
+use cita_cloud_proto::network::network_service_client::NetworkServiceClient;
+use cita_cloud_proto::network::RegisterInfo;
 
 use std::time::Duration;
 use tokio::time;

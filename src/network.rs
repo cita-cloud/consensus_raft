@@ -1,7 +1,7 @@
 use crate::error::Result;
-use cita_ng_proto::common::{Empty, Hash};
-use cita_ng_proto::controller::consensus2_controller_service_client::Consensus2ControllerServiceClient;
-use cita_ng_proto::network::{network_service_client::NetworkServiceClient, NetworkMsg};
+use cita_cloud_proto::common::{Empty, Hash};
+use cita_cloud_proto::controller::consensus2_controller_service_client::Consensus2ControllerServiceClient;
+use cita_cloud_proto::network::{network_service_client::NetworkServiceClient, NetworkMsg};
 use log::info;
 use raft::eraftpb::Message;
 use std::collections::HashMap;
@@ -123,7 +123,6 @@ impl NetworkManager {
         info!("send_msg...");
 
         let to = msg.to;
-        dbg!(&self.dispatch_table);
         if let Some(&origin) = self.dispatch_table.get(&to) {
             info!("send single msg to {}: {}.", to, origin);
             let network = self.network_client().await;
