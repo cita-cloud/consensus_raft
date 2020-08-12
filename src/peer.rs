@@ -224,7 +224,7 @@ impl Peer {
 
         let cfg = Config {
             id,
-            election_tick: 10,
+            election_tick: 20,
             heartbeat_tick: 3,
             ..Default::default()
         };
@@ -235,6 +235,7 @@ impl Peer {
         s.mut_metadata().mut_conf_state().voters = vec![1];
         let storage = MemStorage::new();
         storage.wl().apply_snapshot(s).unwrap();
+
         let mut raw_node = RawNode::new(&cfg, storage, &logger).unwrap();
         raw_node.campaign().unwrap();
         let raft_group = RaftGroup::new(Some(raw_node));
@@ -337,7 +338,6 @@ impl Peer {
                 s.mut_hard_state().term = last_committed.term;
             }
         }
-        // Call `RawNode::advance`interface to update position flags in the raft.
         self.raft_group.advance(ready).await?;
         Ok(())
     }
@@ -345,6 +345,7 @@ impl Peer {
 
 #[derive(Clone)]
 pub struct RaftServer {
+    id: u64,
     peer: Arc<RwLock<Peer>>,
     tx: mpsc::Sender<RaftServerMessage>,
 }
@@ -363,7 +364,7 @@ impl RaftServer {
         };
 
         let peer = Arc::new(RwLock::new(peer));
-        Self { peer, tx }
+        Self { id, peer, tx }
     }
 
     pub async fn start(
@@ -408,9 +409,13 @@ impl RaftServer {
     }
 
     async fn raft_step(self, message: Message) {
-        let mut peer = self.peer.write().await;
-        if let Err(e) = peer.raft_group.step(message).await {
-            warn!("raft group step message failed: {:?}", e);
+        if message.to == self.id {
+            let mut peer = self.peer.write().await;
+            if let Err(e) = peer.raft_group.step(message).await {
+                warn!("raft group step message failed: {:?}", e);
+            }
+        } else {
+            warn!("#{} server ignore message to #{}", self.id, message.to);
         }
     }
 
@@ -465,6 +470,7 @@ impl RaftServer {
             tx.send(RaftServerMessage::Proposal { proposal })
                 .await
                 .unwrap();
+            delay.tick().await;
         }
     }
 }

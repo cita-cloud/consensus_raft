@@ -133,19 +133,18 @@ async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
     let addr = addr_str.parse()?;
 
     let (tx, rx) = tokio::sync::mpsc::channel(100);
-    let is_leader = opts.grpc_port == "50001";
-    let raft_server = if is_leader {
-        info!("init leader");
-        peer::RaftServer::new(1, tx.clone(), controller_port, network_port)
-    } else {
-        info!("init follower");
-        peer::RaftServer::new(2, tx.clone(), controller_port, network_port)
-    };
+    let port = opts.grpc_port.parse::<u64>().unwrap();
+    let id = (port - 50001) / 1000 + 1;
+    let raft_server = peer::RaftServer::new(id, tx.clone(), controller_port, network_port);
 
     info!("start raft server");
     tokio::spawn(raft_server.clone().start(tx.clone(), rx));
-    if is_leader {
-        tokio::spawn(peer::RaftServer::add_follower(2, tx.clone()));
+    if id == 1 {
+        info!("init leader #{}", id);
+        tokio::spawn(peer::RaftServer::add_follower(5, tx.clone()));
+    }
+    else {
+        info!("init follower #{}", id);
     }
     info!("start grpc server!");
     Server::builder()
