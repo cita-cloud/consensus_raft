@@ -142,8 +142,7 @@ async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
     if id == 1 {
         info!("init leader #{}", id);
         tokio::spawn(peer::RaftServer::add_follower(5, tx.clone()));
-    }
-    else {
+    } else {
         info!("init follower #{}", id);
     }
     info!("start grpc server!");
