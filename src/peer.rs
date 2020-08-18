@@ -11,11 +11,12 @@ use raft::prelude::Ready;
 use raft::prelude::Snapshot;
 use raft::storage::MemStorage;
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use std::collections::HashMap;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::time;
 
@@ -42,21 +43,35 @@ pub enum Proposal {
 
 #[derive(Clone)]
 struct RaftGroup {
-    node: Arc<RwLock<Option<RawNode<MemStorage>>>>,
+    node: Arc<Mutex<Option<RawNode<MemStorage>>>>,
 }
 
 impl RaftGroup {
     fn new(raw_node: Option<RawNode<MemStorage>>) -> Self {
-        let node = Arc::new(RwLock::new(raw_node));
+        let node = Arc::new(Mutex::new(raw_node));
         Self { node }
     }
 
-    async fn is_initialized(&self) -> bool {
-        self.node.read().await.is_some()
+    async fn lock(&self) -> RaftGroupGuard {
+        RaftGroupGuard {
+            raft_group: self.node.clone().lock_owned().await,
+        }
+    }
+}
+
+use tokio::sync::OwnedMutexGuard;
+
+struct RaftGroupGuard {
+    raft_group: OwnedMutexGuard<Option<RawNode<MemStorage>>>,
+}
+
+impl RaftGroupGuard {
+    fn is_initialized(&self) -> bool {
+        self.raft_group.is_some()
     }
 
-    async fn propose(&self, hash: Vec<u8>) -> Result<()> {
-        if let Some(ref mut r) = *self.node.write().await {
+    fn propose(&mut self, hash: Vec<u8>) -> Result<()> {
+        if let Some(ref mut r) = *self.raft_group {
             r.propose(vec![], hash)?;
             Ok(())
         } else {
@@ -64,8 +79,8 @@ impl RaftGroup {
         }
     }
 
-    async fn propose_conf_change(&self, cc: ConfChange) -> Result<()> {
-        if let Some(ref mut r) = *self.node.write().await {
+    fn propose_conf_change(&mut self, cc: ConfChange) -> Result<()> {
+        if let Some(ref mut r) = *self.raft_group {
             r.propose_conf_change(vec![], cc)?;
             Ok(())
         } else {
@@ -73,16 +88,15 @@ impl RaftGroup {
         }
     }
 
-    async fn step(&mut self, msg: Message) -> Result<()> {
-        if !self.is_initialized().await {
-            self.initialize_raft_from_message(&msg).await?;
+    fn step(&mut self, msg: Message) -> Result<()> {
+        if !self.is_initialized() {
+            self.initialize_raft_from_message(&msg)?;
         }
-        let mut r = self.node.write().await;
-        r.as_mut().unwrap().step(msg)?;
+        self.raft_group.as_mut().unwrap().step(msg)?;
         Ok(())
     }
 
-    async fn initialize_raft_from_message(&mut self, msg: &Message) -> Result<()> {
+    fn initialize_raft_from_message(&mut self, msg: &Message) -> Result<()> {
         fn is_initial_msg(msg: &Message) -> bool {
             use raft::eraftpb::MessageType;
             let msg_type = msg.get_msg_type();
@@ -109,40 +123,40 @@ impl RaftGroup {
             cfg.id = msg.to;
             let logger = logger.new(o!("tag" => format!("peer_{}", msg.to)));
             let storage = MemStorage::new();
-            let r = RawNode::new(&cfg, storage, &logger)?;
-            self.node.write().await.replace(r);
+            let raw_node = RawNode::new(&cfg, storage, &logger)?;
+            self.raft_group.replace(raw_node);
             Ok(())
         } else {
             Err(Error::RaftGroupUninitialized)
         }
     }
 
-    async fn has_ready(&self) -> Result<bool> {
-        if let Some(ref r) = *self.node.read().await {
+    fn has_ready(&self) -> Result<bool> {
+        if let Some(ref r) = *self.raft_group {
             Ok(r.has_ready())
         } else {
             Err(Error::RaftGroupUninitialized)
         }
     }
 
-    async fn ready(&self) -> Result<Ready> {
-        if let Some(ref mut r) = *self.node.write().await {
+    fn ready(&mut self) -> Result<Ready> {
+        if let Some(ref mut r) = *self.raft_group {
             Ok(r.ready())
         } else {
             Err(Error::RaftGroupUninitialized)
         }
     }
 
-    async fn log_store(&self) -> Result<MemStorage> {
-        if let Some(ref r) = *self.node.read().await {
+    fn log_store(&self) -> Result<MemStorage> {
+        if let Some(ref r) = *self.raft_group {
             Ok(r.raft.raft_log.store.clone())
         } else {
             Err(Error::RaftGroupUninitialized)
         }
     }
 
-    async fn apply_snapshot(&self, snapshot: Snapshot) -> Result<()> {
-        if let Some(ref mut r) = *self.node.write().await {
+    fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<()> {
+        if let Some(ref mut r) = *self.raft_group {
             r.mut_store().wl().apply_snapshot(snapshot)?;
             Ok(())
         } else {
@@ -150,8 +164,8 @@ impl RaftGroup {
         }
     }
 
-    async fn append_entries(&self, ents: &[Entry]) -> Result<()> {
-        if let Some(ref mut r) = *self.node.write().await {
+    fn append_entries(&mut self, ents: &[Entry]) -> Result<()> {
+        if let Some(ref mut r) = *self.raft_group {
             r.mut_store().wl().append(ents)?;
             Ok(())
         } else {
@@ -159,8 +173,8 @@ impl RaftGroup {
         }
     }
 
-    async fn set_hardstate(&self, hs: HardState) -> Result<()> {
-        if let Some(ref mut r) = *self.node.write().await {
+    fn set_hardstate(&mut self, hs: HardState) -> Result<()> {
+        if let Some(ref mut r) = *self.raft_group {
             r.mut_store().wl().set_hardstate(hs);
             Ok(())
         } else {
@@ -168,16 +182,16 @@ impl RaftGroup {
         }
     }
 
-    async fn apply_conf_change(&self, cs: &ConfChange) -> Result<ConfState> {
-        if let Some(ref mut r) = *self.node.write().await {
+    fn apply_conf_change(&mut self, cs: &ConfChange) -> Result<ConfState> {
+        if let Some(ref mut r) = *self.raft_group {
             Ok(r.apply_conf_change(cs)?)
         } else {
             Err(Error::RaftGroupUninitialized)
         }
     }
 
-    async fn advance(&self, ready: Ready) -> Result<()> {
-        if let Some(ref mut r) = *self.node.write().await {
+    fn advance(&mut self, ready: Ready) -> Result<()> {
+        if let Some(ref mut r) = *self.raft_group {
             r.advance(ready);
             Ok(())
         } else {
@@ -185,8 +199,8 @@ impl RaftGroup {
         }
     }
 
-    async fn tick(&self) -> Result<bool> {
-        if let Some(ref mut r) = *self.node.write().await {
+    fn tick(&mut self) -> Result<bool> {
+        if let Some(ref mut r) = *self.raft_group {
             Ok(r.tick())
         } else {
             Err(Error::RaftGroupUninitialized)
@@ -199,7 +213,6 @@ pub struct Peer {
     raft_group: RaftGroup,
     network_manager: NetworkManager,
     config: Arc<RwLock<Option<ConsensusConfiguration>>>,
-    committed: HashSet<Vec<u8>>,
 }
 
 impl Peer {
@@ -216,7 +229,7 @@ impl Peer {
 
         let cfg = Config {
             id,
-            election_tick: 100,
+            election_tick: 30,
             heartbeat_tick: 3,
             check_quorum: true,
             ..Default::default()
@@ -232,23 +245,21 @@ impl Peer {
         let mut raw_node = RawNode::new(&cfg, storage, &logger).unwrap();
         raw_node.campaign().unwrap();
         let raft_group = RaftGroup::new(Some(raw_node));
-        let network_manager = NetworkManager::with_capacity(controller_port, network_port, 30);
+        let network_manager = NetworkManager::with_capacity(controller_port, network_port, 64);
         Self {
             raft_group,
             network_manager,
             config: Arc::new(RwLock::new(None)),
-            committed: HashSet::new(),
         }
     }
 
     fn create_follower(controller_port: u16, network_port: u16) -> Self {
         let raft_group = RaftGroup::new(None);
-        let network_manager = NetworkManager::with_capacity(controller_port, network_port, 30);
+        let network_manager = NetworkManager::with_capacity(controller_port, network_port, 64);
         Self {
             raft_group,
             network_manager,
             config: Arc::new(RwLock::new(None)),
-            committed: HashSet::new(),
         }
     }
 
@@ -256,58 +267,56 @@ impl Peer {
         info!("process proposal");
         match proposal {
             Proposal::Normal { hash } => {
-                if !self.committed.contains(&hash) {
-                    if self.network_manager.check_proposal(hash.clone()).await? {
-                        self.raft_group.propose(hash.clone()).await?;
-                    } else {
-                        info!("check porposal failed.");
-                    }
+                if self.network_manager.check_proposal(hash.clone()).await? {
+                    self.raft_group.lock().await.propose(hash)?;
                 } else {
-                    info!("proposal had already committed.");
+                    info!("check porposal failed.");
                 }
             }
             Proposal::ConfChange { cc } => {
-                self.raft_group.propose_conf_change(cc).await?;
+                self.raft_group.lock().await.propose_conf_change(cc)?;
             }
         }
         Ok(())
     }
 
     async fn on_ready(&mut self) -> Result<()> {
-        if !self.raft_group.has_ready().await? {
+        let mut raft_group = self.raft_group.lock().await;
+        if !raft_group.has_ready()? {
             return Ok(());
         }
-        let store = self.raft_group.log_store().await?;
-        let mut ready = self.raft_group.ready().await?;
+        let store = raft_group.log_store()?;
+        let mut ready = raft_group.ready()?;
 
         if !ready.snapshot().is_empty() {
             let s = ready.snapshot().clone();
-            if let Err(e) = self.raft_group.apply_snapshot(s).await {
+            if let Err(e) = raft_group.apply_snapshot(s) {
                 info!("apply snapshot failed: {:?}", e);
             }
         }
 
         if !ready.entries().is_empty() {
-            if let Err(e) = self.raft_group.append_entries(ready.entries()).await {
+            if let Err(e) = raft_group.append_entries(ready.entries()) {
                 info!("append entries failed: {:?}", e);
             }
         }
 
         if let Some(hs) = ready.hs() {
-            if let Err(e) = self.raft_group.set_hardstate(hs.clone()).await {
+            if let Err(e) = raft_group.set_hardstate(hs.clone()) {
                 info!("set hardstate failed: {:?}", e);
             }
         }
 
-        for msg in ready.messages.drain(..) {
-            info!("sending msg..");
-            let mut conn = self.network_manager.clone();
-            tokio::spawn(async move {
+        info!("sending msg..");
+        let messages = ready.messages.drain(..).collect::<Vec<_>>();
+        let mut conn = self.network_manager.clone();
+        tokio::spawn(async move {
+            for msg in messages {
                 if let Err(e) = conn.send_msg(msg).await {
                     info!("send msg failed: {:?}", e);
                 }
-            });
-        }
+            }
+        });
 
         if let Some(committed_entries) = ready.committed_entries.take() {
             for entry in &committed_entries {
@@ -318,13 +327,18 @@ impl Peer {
                     EntryType::EntryNormal => {
                         info!("commiting proposal..");
                         let proposal = entry.data.clone();
-                        self.network_manager.commit_block(proposal.clone()).await?;
-                        self.committed.insert(proposal);
+                        let mut network_manager = self.network_manager.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = network_manager.commit_block(proposal.clone()).await {
+                                warn!("commit block failed: {:?}", e);
+                            }
+                        });
                     }
                     EntryType::EntryConfChange => {
                         let mut cc = ConfChange::default();
                         cc.merge_from_bytes(&entry.data)?;
-                        let cs = self.raft_group.apply_conf_change(&cc).await?;
+                        let store = store.clone();
+                        let cs = raft_group.apply_conf_change(&cc)?;
                         store.wl().set_conf_state(cs);
                     }
                     EntryType::EntryConfChangeV2 => warn!("ConfChangeV2 unimplemented."),
@@ -336,8 +350,15 @@ impl Peer {
                 s.mut_hard_state().term = last_committed.term;
             }
         }
-        self.raft_group.advance(ready).await?;
-        Ok(())
+        raft_group.advance(ready)
+    }
+
+    async fn tick(&mut self) -> Result<bool> {
+        self.raft_group.lock().await.tick()
+    }
+
+    async fn step(&mut self, msg: Message) -> Result<()> {
+        self.raft_group.lock().await.step(msg)
     }
 }
 
@@ -371,21 +392,17 @@ impl RaftServer {
     ) -> Result<()> {
         tokio::spawn(self.clone().wait_proposal(tx));
         let mut tick_clock = Instant::now();
-        // let tick_interval = Duration::from_millis(100);
-        let tick_interval = Duration::from_millis(300);
+        let tick_interval = Duration::from_millis(100);
 
-        // let d = Duration::from_millis(10);
-        let d = Duration::from_millis(30);
+        let d = Duration::from_millis(10);
         let mut interval = time::interval(d);
         loop {
             match rx.try_recv() {
                 Ok(RaftServerMessage::Proposal { proposal }) => {
-                    // tokio::spawn(self.clone().raft_process_proposal(proposal));
-                    self.clone().raft_process_proposal(proposal).await;
+                    tokio::spawn(self.clone().raft_process_proposal(proposal));
                 }
                 Ok(RaftServerMessage::Raft { message }) => {
-                    // tokio::spawn(self.clone().raft_step(message));
-                    self.clone().raft_step(message).await;
+                    tokio::spawn(self.clone().raft_step(message));
                 }
                 Err(mpsc::error::TryRecvError::Empty) => (),
                 Err(mpsc::error::TryRecvError::Closed) => {
@@ -394,12 +411,10 @@ impl RaftServer {
                 }
             }
             if tick_clock.elapsed() >= tick_interval {
-                // tokio::spawn(self.clone().raft_tick());
-                self.clone().raft_tick().await;
+                tokio::spawn(self.clone().raft_tick());
                 tick_clock = Instant::now();
             }
-            // tokio::spawn(self.clone().raft_on_ready());
-            self.clone().raft_on_ready().await;
+            tokio::spawn(self.clone().raft_on_ready());
             interval.tick().await;
         }
     }
@@ -412,7 +427,7 @@ impl RaftServer {
 
     async fn raft_step(mut self, message: Message) {
         if message.to == self.id {
-            if let Err(e) = self.peer.raft_group.step(message).await {
+            if let Err(e) = self.peer.step(message).await {
                 warn!("raft group step message failed: {:?}", e);
             }
         } else {
@@ -420,11 +435,9 @@ impl RaftServer {
         }
     }
 
-    async fn raft_tick(self) {
-        if self.peer.raft_group.is_initialized().await {
-            if let Err(e) = self.peer.raft_group.tick().await {
-                warn!("raft group tick failed: {:?}", e);
-            }
+    async fn raft_tick(mut self) {
+        if let Err(e) = self.peer.tick().await {
+            warn!("raft group tick failed: {:?}", e);
         }
     }
 
@@ -440,7 +453,7 @@ impl RaftServer {
         loop {
             if block_clock.elapsed() >= block_interval {
                 if let Some(ref config) = *self.peer.config.read().await {
-                    block_interval = Duration::from_secs((config.block_interval) as u64);
+                    block_interval = Duration::from_secs((config.block_interval * 6) as u64);
                     if let Ok(hash) = self.peer.network_manager.get_proposal().await {
                         let proposal = Proposal::Normal { hash };
                         tx.send(RaftServerMessage::Proposal { proposal })
@@ -450,7 +463,7 @@ impl RaftServer {
                 }
                 block_clock = Instant::now();
             }
-            let mut interval = time::interval(block_interval);
+            let mut interval = time::interval(Duration::from_millis(500));
             interval.tick().await;
         }
     }
@@ -495,12 +508,16 @@ impl NetworkMsgHandlerService for RaftServer {
             let raft_msg: Message = protobuf::parse_from_bytes(msg.msg.as_slice()).unwrap();
             let origin = msg.origin;
             let from = raft_msg.from;
-            self.tx
-                .clone()
-                .send(RaftServerMessage::Raft { message: raft_msg })
-                .await
-                .unwrap();
-            self.peer.network_manager.update_table(from, origin).await;
+            let tx = self.tx.clone();
+            let network_manager = self.peer.network_manager.clone();
+            tokio::spawn(async move {
+                tx
+                    .clone()
+                    .send(RaftServerMessage::Raft { message: raft_msg })
+                    .await
+                    .unwrap();
+                network_manager.update_table(from, origin).await;
+            });
             let reply = SimpleResponse { is_success: true };
             Ok(tonic::Response::new(reply))
         }
