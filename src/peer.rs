@@ -14,7 +14,6 @@ use raft::storage::MemStorage;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
@@ -511,8 +510,7 @@ impl NetworkMsgHandlerService for RaftServer {
             let tx = self.tx.clone();
             let network_manager = self.peer.network_manager.clone();
             tokio::spawn(async move {
-                tx
-                    .clone()
+                tx.clone()
                     .send(RaftServerMessage::Raft { message: raft_msg })
                     .await
                     .unwrap();
