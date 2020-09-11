@@ -215,8 +215,8 @@ impl StorageEngine {
             .read(true)
             .write(true)
             .create(true);
-        let hard_state_file = opts.open("state.data").await.unwrap();
-        let conf_state_file = opts.open("state.data").await.unwrap();
+        let hard_state_file = opts.open("hard_state.data").await.unwrap();
+        let conf_state_file = opts.open("conf_state.data").await.unwrap();
         let snapshot_metadata_file = opts.open("snapshot_metadata.data").await.unwrap();
         let entry_file = opts.append(true).open("entry.data").await.unwrap();
         Self {
