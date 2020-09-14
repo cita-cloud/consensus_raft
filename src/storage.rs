@@ -1,27 +1,25 @@
-use raft::Storage;
-use raft::RaftState;
-use raft::Error;
-use raft::StorageError;
-use raft::prelude::Snapshot;
+use protobuf::Message;
 use raft::eraftpb::SnapshotMetadata;
+use raft::prelude::ConfState;
 use raft::prelude::Entry;
 use raft::prelude::HardState;
-use raft::prelude::ConfState;
+use raft::prelude::Snapshot;
+use raft::Error;
+use raft::RaftState;
+use raft::Result;
+use raft::Storage;
+use raft::StorageError;
+use std::io::SeekFrom;
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-use protobuf::Message;
-use std::io::SeekFrom;
-use raft::Result;
-
 
 pub struct RaftStorageCore {
     raft_state: RaftState,
     entries: Vec<Entry>,
     snapshot_metadata: SnapshotMetadata,
     engine: StorageEngine,
-    trigger_snap_unavailable: bool,
 }
 
 impl RaftStorageCore {
@@ -35,7 +33,6 @@ impl RaftStorageCore {
             entries,
             snapshot_metadata,
             engine,
-            trigger_snap_unavailable: false,
         }
     }
 
@@ -63,7 +60,9 @@ impl RaftStorageCore {
         }
 
         self.snapshot_metadata = meta.clone();
-        self.engine.set_snapshot_metadata(&self.snapshot_metadata).await;
+        self.engine
+            .set_snapshot_metadata(&self.snapshot_metadata)
+            .await;
 
         self.mut_hard_state().term = term;
         self.mut_hard_state().commit = index;
@@ -73,7 +72,9 @@ impl RaftStorageCore {
 
         // Update conf states.
         self.raft_state.conf_state = meta.take_conf_state();
-        self.engine.set_conf_state(&self.raft_state.conf_state).await;
+        self.engine
+            .set_conf_state(&self.raft_state.conf_state)
+            .await;
         Ok(())
     }
 
@@ -99,6 +100,11 @@ impl RaftStorageCore {
         Ok(())
     }
 
+    pub fn is_initialized(&self) -> bool {
+        self.raft_state.conf_state != ConfState::default()
+            || self.raft_state.hard_state != HardState::default()
+    }
+
     pub fn mut_hard_state(&mut self) -> &mut HardState {
         &mut self.raft_state.hard_state
     }
@@ -108,8 +114,10 @@ impl RaftStorageCore {
         self.sync_hard_state().await;
     }
 
-    pub async fn sync_hard_state(&mut self){
-        self.engine.set_hard_state(&self.raft_state.hard_state).await;
+    pub async fn sync_hard_state(&mut self) {
+        self.engine
+            .set_hard_state(&self.raft_state.hard_state)
+            .await;
     }
 
     pub async fn set_conf_state(&mut self, cs: ConfState) {
@@ -117,11 +125,11 @@ impl RaftStorageCore {
         self.sync_conf_state().await;
     }
 
-    pub async fn sync_conf_state(&mut self){
-        self.engine.set_conf_state(&self.raft_state.conf_state).await;
+    pub async fn sync_conf_state(&mut self) {
+        self.engine
+            .set_conf_state(&self.raft_state.conf_state)
+            .await;
     }
-
-
 }
 
 pub struct RaftStorage {
@@ -130,7 +138,9 @@ pub struct RaftStorage {
 
 impl RaftStorage {
     pub async fn new() -> Self {
-        Self{ core: RaftStorageCore::new().await }
+        Self {
+            core: RaftStorageCore::new().await,
+        }
     }
 }
 
@@ -141,7 +151,7 @@ impl Storage for RaftStorage {
 
     fn entries(&self, low: u64, high: u64, max_size: impl Into<Option<u64>>) -> Result<Vec<Entry>> {
         let max_size = max_size.into();
-        let ref core = self.core;
+        let core = &self.core;
         if low < core.first_index() {
             return Err(Error::Store(StorageError::Compacted));
         }
@@ -163,7 +173,7 @@ impl Storage for RaftStorage {
     }
 
     fn term(&self, idx: u64) -> Result<u64> {
-        let ref core = self.core;
+        let core = &self.core;
         if idx == core.snapshot_metadata.index {
             return Ok(core.snapshot_metadata.term);
         }
@@ -187,19 +197,17 @@ impl Storage for RaftStorage {
     /// Implements the Storage trait.
     fn last_index(&self) -> Result<u64> {
         Ok(self.core.last_index())
-    } 
+    }
 
     fn snapshot(&self, request_index: u64) -> Result<Snapshot> {
-        let ref core = self.core;
+        let core = &self.core;
         let mut snap = core.snapshot();
         if snap.get_metadata().index < request_index {
             snap.mut_metadata().index = request_index;
         }
         Ok(snap)
     }
-
 }
-
 
 pub struct StorageEngine {
     hard_state_file: File,
@@ -211,10 +219,7 @@ pub struct StorageEngine {
 impl StorageEngine {
     pub async fn new() -> Self {
         let mut opts = fs::OpenOptions::new();
-        let opts = opts
-            .read(true)
-            .write(true)
-            .create(true);
+        let opts = opts.read(true).write(true).create(true);
         let hard_state_file = opts.open("hard_state.data").await.unwrap();
         let conf_state_file = opts.open("conf_state.data").await.unwrap();
         let snapshot_metadata_file = opts.open("snapshot_metadata.data").await.unwrap();
@@ -227,27 +232,35 @@ impl StorageEngine {
         }
     }
 
-    pub async fn get_raft_state(&mut self) -> RaftState {
+    async fn get_raft_state(&mut self) -> RaftState {
         RaftState {
             hard_state: self.get_hard_state().await,
             conf_state: self.get_conf_state().await,
         }
     }
 
-    pub async fn get_hard_state(&mut self) -> HardState {
-        let ref mut f = self.hard_state_file;
+    async fn get_hard_state(&mut self) -> HardState {
+        let f = &mut self.hard_state_file;
         let mut buf = vec![];
         f.seek(SeekFrom::Start(0)).await.unwrap();
         f.read_to_end(&mut buf).await.unwrap();
-        protobuf::parse_from_bytes(&buf[..]).unwrap()
+        if buf.is_empty() {
+            HardState::default()
+        } else {
+            protobuf::parse_from_bytes(&buf[..]).unwrap()
+        }
     }
 
-    pub async fn get_conf_state(&mut self) -> ConfState {
-        let ref mut f = self.conf_state_file;
+    async fn get_conf_state(&mut self) -> ConfState {
+        let f = &mut self.conf_state_file;
         let mut buf = vec![];
         f.seek(SeekFrom::Start(0)).await.unwrap();
         f.read_to_end(&mut buf).await.unwrap();
-        protobuf::parse_from_bytes(&buf[..]).unwrap()
+        if buf.is_empty() {
+            ConfState::default()
+        } else {
+            protobuf::parse_from_bytes(&buf[..]).unwrap()
+        }
     }
 
     pub async fn get_entries(&mut self) -> Vec<Entry> {
@@ -263,7 +276,7 @@ impl StorageEngine {
     }
 
     pub async fn get_snapshot_metadata(&mut self) -> SnapshotMetadata {
-        let ref mut f = self.snapshot_metadata_file;
+        let f = &mut self.snapshot_metadata_file;
         let mut buf = vec![];
         f.seek(SeekFrom::Start(0)).await.unwrap();
         f.read_to_end(&mut buf).await.unwrap();
@@ -279,7 +292,7 @@ impl StorageEngine {
 
     pub async fn set_snapshot_metadata(&mut self, meta: &SnapshotMetadata) {
         let data = meta.write_to_bytes().unwrap();
-        let ref mut f = self.snapshot_metadata_file;
+        let f = &mut self.snapshot_metadata_file;
         f.set_len(0).await.unwrap();
         f.seek(SeekFrom::Start(0)).await.unwrap();
         f.write_all(&data[..]).await.unwrap();
@@ -288,7 +301,7 @@ impl StorageEngine {
 
     pub async fn set_hard_state(&mut self, state: &HardState) {
         let data = state.write_to_bytes().unwrap();
-        let ref mut f = self.hard_state_file;
+        let f = &mut self.hard_state_file;
         f.set_len(0).await.unwrap();
         f.seek(SeekFrom::Start(0)).await.unwrap();
         f.write_all(&data[..]).await.unwrap();
@@ -297,13 +310,12 @@ impl StorageEngine {
 
     pub async fn set_conf_state(&mut self, state: &ConfState) {
         let data = state.write_to_bytes().unwrap();
-        let ref mut f = self.conf_state_file;
+        let f = &mut self.conf_state_file;
         f.set_len(0).await.unwrap();
         f.seek(SeekFrom::Start(0)).await.unwrap();
         f.write_all(&data[..]).await.unwrap();
         f.sync_all().await.unwrap();
     }
-
 }
 
 fn limit_size<T: Message + Clone>(entries: &mut Vec<T>, max: Option<u64>) {

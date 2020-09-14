@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#![allow(dead_code)] // TODO: Remove this
 mod config;
 // mod error;
 // mod network;
@@ -142,8 +141,8 @@ async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     let mut mailbox = Mailbox::new(id, controller_port, network_port, msg_tx.clone()).await;
 
-    let mut peer = peer_dev::Peer::new(id, msg_tx, msg_rx, mailbox.control()).await;
-    let peer_control = peer.control();
+    let mut peer = peer_dev::Peer::new(id, 6, msg_tx, msg_rx, mailbox.control()).await;
+    let peer_control = peer.get_control();
     let raft_service = peer.get_service();
 
     info!("start raft");

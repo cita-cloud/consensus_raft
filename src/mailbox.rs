@@ -149,6 +149,7 @@ impl<T: Letter> MailboxControl<T> {
         reply_rx.await.unwrap()
     }
 
+    #[allow(unused)]
     pub async fn broadcast_message(&self, msg: T) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let mail = NetworkMail::BroadcastMessage { msg, reply_tx };
@@ -158,7 +159,7 @@ impl<T: Letter> MailboxControl<T> {
 
     // storage
 
-    // pub async fn 
+    // pub async fn
 }
 
 impl<T: Letter> Mailbox<T> {
@@ -175,7 +176,11 @@ impl<T: Letter> Mailbox<T> {
             5,
             controller_receiver,
         ));
-        tokio::spawn(Self::serve_network(network_port, 5, network_receiver));
+        tokio::spawn(Self::serve_network(
+            network_port,
+            5,
+            network_receiver
+        ));
         let (mail_put, mail_get) = mpsc::unbounded_channel();
         Self {
             local_addr,
@@ -240,7 +245,7 @@ impl<T: Letter> Mailbox<T> {
         worker_num: usize,
         mut controller_receiver: mpsc::UnboundedReceiver<ControllerMail>,
     ) {
-        let mail_queue = Arc::new(ArrayQueue::<ControllerMail>::new(worker_num * 5));
+        let mail_queue = Arc::new(ArrayQueue::<ControllerMail>::new(worker_num * 16));
         for _ in 0..worker_num {
             let mail_queue = mail_queue.clone();
             tokio::spawn(async move {
@@ -308,7 +313,7 @@ impl<T: Letter> Mailbox<T> {
         worker_num: usize,
         mut network_receiver: mpsc::UnboundedReceiver<NetworkMail<T>>,
     ) {
-        let mail_queue = Arc::new(ArrayQueue::<NetworkMail<T>>::new(worker_num * 5));
+        let mail_queue = Arc::new(ArrayQueue::<NetworkMail<T>>::new(worker_num * 16));
         for _ in 0..worker_num {
             let mail_queue = mail_queue.clone();
             tokio::spawn(async move {
