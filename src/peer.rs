@@ -10,6 +10,7 @@ use raft::prelude::RawNode;
 use raft::prelude::Ready;
 use raft::prelude::Snapshot;
 use raft::storage::MemStorage;
+use raft::StateRole;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -205,6 +206,14 @@ impl RaftGroupGuard {
             Err(Error::RaftGroupUninitialized)
         }
     }
+
+    fn is_leader(&self) -> Result<bool> {
+        if let Some(ref r) = *self.raft_group {
+            Ok(r.raft.state == StateRole::Leader)
+        } else {
+            Err(Error::RaftGroupUninitialized)
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -244,7 +253,7 @@ impl Peer {
         let mut raw_node = RawNode::new(&cfg, storage, &logger).unwrap();
         raw_node.campaign().unwrap();
         let raft_group = RaftGroup::new(Some(raw_node));
-        let network_manager = NetworkManager::with_capacity(controller_port, network_port, 64);
+        let network_manager = NetworkManager::with_capacity(controller_port, network_port, 16);
         Self {
             raft_group,
             network_manager,
@@ -254,7 +263,7 @@ impl Peer {
 
     fn create_follower(controller_port: u16, network_port: u16) -> Self {
         let raft_group = RaftGroup::new(None);
-        let network_manager = NetworkManager::with_capacity(controller_port, network_port, 64);
+        let network_manager = NetworkManager::with_capacity(controller_port, network_port, 16);
         Self {
             raft_group,
             network_manager,
@@ -266,7 +275,7 @@ impl Peer {
         info!("process proposal");
         match proposal {
             Proposal::Normal { hash } => {
-                if self.network_manager.check_proposal(hash.clone()).await? {
+                if self.check_proposal_hash(hash.clone()).await? {
                     self.raft_group.lock().await.propose(hash)?;
                 } else {
                     info!("check porposal failed.");
@@ -277,6 +286,10 @@ impl Peer {
             }
         }
         Ok(())
+    }
+
+    async fn check_proposal_hash(&mut self, hash: Vec<u8>) -> Result<bool> {
+        self.network_manager.check_proposal(hash.clone()).await
     }
 
     async fn on_ready(&mut self) -> Result<()> {
@@ -359,6 +372,10 @@ impl Peer {
     async fn step(&mut self, msg: Message) -> Result<()> {
         self.raft_group.lock().await.step(msg)
     }
+
+    async fn is_leader(&self) -> Result<bool> {
+        self.raft_group.lock().await.is_leader()
+    }
 }
 
 #[derive(Clone)]
@@ -426,8 +443,25 @@ impl RaftServer {
 
     async fn raft_step(mut self, message: Message) {
         if message.to == self.id {
-            if let Err(e) = self.peer.step(message).await {
-                warn!("raft group step message failed: {:?}", e);
+            use raft::eraftpb::MessageType::*;
+            let mut is_ok = true;
+            if let MsgAppend = message.msg_type {
+                for ent in message.entries.iter() {
+                    if let EntryType::EntryNormal = ent.entry_type {
+                        if let Ok(false) | Err(_) =
+                            self.peer.check_proposal_hash(ent.data.clone()).await
+                        {
+                            is_ok = false;
+                        }
+                    }
+                }
+            }
+            if is_ok {
+                if let Err(e) = self.peer.step(message).await {
+                    warn!("raft group step message failed: {:?}", e);
+                }
+            } else {
+                warn!("check block hash failed");
             }
         } else {
             warn!("#{} server ignore message to #{}", self.id, message.to);
@@ -452,12 +486,14 @@ impl RaftServer {
         loop {
             if block_clock.elapsed() >= block_interval {
                 if let Some(ref config) = *self.peer.config.read().await {
-                    block_interval = Duration::from_secs((config.block_interval * 6) as u64);
-                    if let Ok(hash) = self.peer.network_manager.get_proposal().await {
-                        let proposal = Proposal::Normal { hash };
-                        tx.send(RaftServerMessage::Proposal { proposal })
-                            .await
-                            .unwrap();
+                    block_interval = Duration::from_secs(config.block_interval as u64);
+                    if let Ok(true) = self.peer.is_leader().await {
+                        if let Ok(hash) = self.peer.network_manager.get_proposal().await {
+                            let proposal = Proposal::Normal { hash };
+                            tx.send(RaftServerMessage::Proposal { proposal })
+                                .await
+                                .unwrap();
+                        }
                     }
                 }
                 block_clock = Instant::now();
@@ -471,8 +507,8 @@ impl RaftServer {
         info!("add follower");
         let d = Duration::from_secs(5);
         let mut delay = time::interval(d);
-        delay.tick().await;
         for id in 2..=n {
+            delay.tick().await;
             let mut cc = ConfChange::default();
             cc.node_id = id;
             cc.set_change_type(ConfChangeType::AddNode);
@@ -480,7 +516,6 @@ impl RaftServer {
             tx.send(RaftServerMessage::Proposal { proposal })
                 .await
                 .unwrap();
-            delay.tick().await;
         }
     }
 }
@@ -507,15 +542,17 @@ impl NetworkMsgHandlerService for RaftServer {
             let raft_msg: Message = protobuf::parse_from_bytes(msg.msg.as_slice()).unwrap();
             let origin = msg.origin;
             let from = raft_msg.from;
-            let tx = self.tx.clone();
-            let network_manager = self.peer.network_manager.clone();
-            tokio::spawn(async move {
-                tx.clone()
+          
+            let to = raft_msg.to;
+            if to == self.id {
+                self.tx
+                    .clone()
                     .send(RaftServerMessage::Raft { message: raft_msg })
                     .await
                     .unwrap();
-                network_manager.update_table(from, origin).await;
-            });
+            }
+            let network_manager = self.peer.network_manager.clone();
+            network_manager.update_table(from, origin).await;
             let reply = SimpleResponse { is_success: true };
             Ok(tonic::Response::new(reply))
         }
