@@ -542,6 +542,7 @@ impl NetworkMsgHandlerService for RaftServer {
             let raft_msg: Message = protobuf::parse_from_bytes(msg.msg.as_slice()).unwrap();
             let origin = msg.origin;
             let from = raft_msg.from;
+          
             let to = raft_msg.to;
             if to == self.id {
                 self.tx

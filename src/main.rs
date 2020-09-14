@@ -26,7 +26,7 @@ const GIT_VERSION: &str = git_version!(
     args = ["--tags", "--always", "--dirty=-modified"],
     fallback = "unknown"
 );
-const GIT_HOMEPAGE: &str = "https://github.com/whfuyn";
+const GIT_HOMEPAGE: &str = "https://github.com/cita-cloud/consensus_raft";
 
 /// This doc string acts as a help message when the user runs '--help'
 /// as do all doc strings on fields
