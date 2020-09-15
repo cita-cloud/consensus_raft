@@ -95,6 +95,7 @@ async fn register_network_msg_handler(
 }
 
 use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServer;
+use cita_cloud_proto::consensus::ConsensusConfiguration;
 use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
 use cita_cloud_proto::network::network_service_client::NetworkServiceClient;
 use cita_cloud_proto::network::RegisterInfo;
@@ -140,10 +141,15 @@ async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
 
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     let mut mailbox = Mailbox::new(id, controller_port, network_port, msg_tx.clone()).await;
+    let mailbox_control = mailbox.control();
 
-    let mut peer = peer_dev::Peer::new(id, 6, msg_tx, msg_rx, mailbox.control()).await;
-    let peer_control = peer.get_control();
-    let raft_service = peer.get_service();
+    let config = ConsensusConfiguration {
+        block_interval: 6,
+        validators: vec![],
+    };
+    let mut peer = peer_dev::Peer::new(id, config, msg_tx, msg_rx, mailbox_control.clone()).await;
+    let peer_control = peer.control();
+    let raft_service = peer.service();
 
     info!("start raft");
     tokio::spawn(async move {
@@ -155,13 +161,32 @@ async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     if id == 1 {
+        let mut retry_interval = time::interval(Duration::from_secs(1));
+        let peer_count = loop {
+            retry_interval.tick().await;
+            match mailbox_control.get_network_status().await {
+                Ok(n) => break n,
+                Err(e) => info!("retry get_network_status: `{}`", e),
+            }
+        };
+
         let peer_control = peer_control.clone();
         tokio::spawn(async move {
             peer_control.init_leader();
             let mut ticker = time::interval(Duration::from_secs(2));
-            for i in 2..=5 {
+
+            use std::collections::HashSet;
+            let nodes: Vec<u64> = (1..=peer_count).collect();
+            loop {
                 ticker.tick().await;
-                peer_control.add_node(i);
+                let current_nodes: HashSet<u64> =
+                    peer_control.get_node_list().await.into_iter().collect();
+
+                if let Some(&node_id) = nodes.iter().find(|&id| !current_nodes.contains(id)) {
+                    peer_control.add_node(node_id);
+                } else {
+                    break;
+                }
             }
         });
     }

@@ -120,6 +120,10 @@ impl RaftStorageCore {
             .await;
     }
 
+    pub fn conf_state(&self) -> &ConfState {
+        &self.raft_state.conf_state
+    }
+
     pub async fn set_conf_state(&mut self, cs: ConfState) {
         self.raft_state.conf_state = cs;
         self.sync_conf_state().await;

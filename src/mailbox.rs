@@ -1,4 +1,5 @@
 use log::info;
+use log::warn;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +22,7 @@ use anyhow::Result;
 type ControllerClient = Consensus2ControllerServiceClient<Channel>;
 type NetworkClient = NetworkServiceClient<Channel>;
 
-pub trait Letter: Clone + Debug + Send + Sized + 'static {
+pub trait Letter: Clone + Debug + Send + Sized + Sync + 'static {
     type Address: std::hash::Hash + std::cmp::Eq;
     type ReadError: Debug;
     fn to(&self) -> Option<Self::Address>;
@@ -72,6 +73,9 @@ pub enum ControllerMail {
 
 #[derive(Debug)]
 pub enum NetworkMail<T: Letter> {
+    GetNetworkStatus {
+        reply_tx: oneshot::Sender<Result<u64>>,
+    },
     SendMessage {
         session_id: Option<u64>,
         msg: T,
@@ -94,11 +98,8 @@ impl<T: Letter> MailboxControl<T> {
     pub async fn put_mail(&self, origin: u64, msg: T) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let mail = MyMail::Normal { msg, reply_tx };
-        self.mail_put
-            .clone()
-            .send(Mail::ToMe { origin, mail })
-            .unwrap();
-        reply_rx.await.unwrap()
+        self.mail_put.clone().send(Mail::ToMe { origin, mail })?;
+        reply_rx.await?
     }
 
     // controller
@@ -107,36 +108,35 @@ impl<T: Letter> MailboxControl<T> {
         println!("get proposal..");
         let (reply_tx, reply_rx) = oneshot::channel();
         let mail = ControllerMail::GetProposal { reply_tx };
-        self.mail_put
-            .clone()
-            .send(Mail::ToController(mail))
-            .unwrap();
-        reply_rx.await.unwrap()
+        self.mail_put.clone().send(Mail::ToController(mail))?;
+        reply_rx.await?
     }
 
+    #[allow(unused)]
     pub async fn check_proposal(&self, proposal: Vec<u8>) -> Result<bool> {
         println!("check proposal..");
         let (reply_tx, reply_rx) = oneshot::channel();
         let mail = ControllerMail::CheckProposal { proposal, reply_tx };
-        self.mail_put
-            .clone()
-            .send(Mail::ToController(mail))
-            .unwrap();
-        reply_rx.await.unwrap()
+        self.mail_put.clone().send(Mail::ToController(mail))?;
+        reply_rx.await?
     }
 
     pub async fn commit_block(&self, pwp: ProposalWithProof) -> Result<()> {
         println!("commit block..");
         let (reply_tx, reply_rx) = oneshot::channel();
         let mail = ControllerMail::CommitBlock { pwp, reply_tx };
-        self.mail_put
-            .clone()
-            .send(Mail::ToController(mail))
-            .unwrap();
-        reply_rx.await.unwrap()
+        self.mail_put.clone().send(Mail::ToController(mail))?;
+        reply_rx.await?
     }
 
     // network
+
+    pub async fn get_network_status(&self) -> Result<u64> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mail = NetworkMail::GetNetworkStatus { reply_tx };
+        self.mail_put.clone().send(Mail::ToNetwork(mail))?;
+        reply_rx.await?
+    }
 
     pub async fn send_message(&self, msg: T) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -145,21 +145,17 @@ impl<T: Letter> MailboxControl<T> {
             msg,
             reply_tx,
         };
-        self.mail_put.clone().send(Mail::ToNetwork(mail)).unwrap();
-        reply_rx.await.unwrap()
+        self.mail_put.clone().send(Mail::ToNetwork(mail))?;
+        reply_rx.await?
     }
 
     #[allow(unused)]
     pub async fn broadcast_message(&self, msg: T) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let mail = NetworkMail::BroadcastMessage { msg, reply_tx };
-        self.mail_put.clone().send(Mail::ToNetwork(mail)).unwrap();
-        reply_rx.await.unwrap()
+        self.mail_put.clone().send(Mail::ToNetwork(mail))?;
+        reply_rx.await?
     }
-
-    // storage
-
-    // pub async fn
 }
 
 impl<T: Letter> Mailbox<T> {
@@ -173,14 +169,10 @@ impl<T: Letter> Mailbox<T> {
         let (network_sender, network_receiver) = mpsc::unbounded_channel();
         tokio::spawn(Self::serve_controller(
             controller_port,
-            5,
+            10,
             controller_receiver,
         ));
-        tokio::spawn(Self::serve_network(
-            network_port,
-            5,
-            network_receiver
-        ));
+        tokio::spawn(Self::serve_network(network_port, 10, network_receiver));
         let (mail_put, mail_get) = mpsc::unbounded_channel();
         Self {
             local_addr,
@@ -195,11 +187,13 @@ impl<T: Letter> Mailbox<T> {
 
     pub async fn run(&mut self) {
         while let Some(m) = self.mail_get.recv().await {
-            self.handle_mail(m);
+            if let Err(e) = self.handle_mail(m) {
+                warn!("handle mail failed: `{}`", e);
+            }
         }
     }
 
-    fn handle_mail(&mut self, mail: Mail<T>) {
+    fn handle_mail(&mut self, mail: Mail<T>) -> Result<()> {
         use Mail::*;
         // dbg!(&mail);
         match mail {
@@ -209,13 +203,13 @@ impl<T: Letter> Mailbox<T> {
                     let to = msg.to();
                     if to.is_none() || to.as_ref() == Some(&self.local_addr) {
                         self.mailbook.insert(from, origin);
-                        self.send_to.send(msg).unwrap();
+                        self.send_to.send(msg)?;
                     }
                     reply_tx.send(Ok(())).unwrap();
                 }
             },
             ToController(m) => {
-                self.controller_sender.send(m).unwrap();
+                self.controller_sender.send(m)?;
             }
             ToNetwork(mut m) => {
                 if let NetworkMail::SendMessage {
@@ -229,9 +223,10 @@ impl<T: Letter> Mailbox<T> {
                         *session_id = Some(origin);
                     }
                 }
-                self.network_sender.send(m).unwrap();
+                self.network_sender.send(m)?;
             }
         }
+        Ok(())
     }
 
     pub fn control(&self) -> MailboxControl<T> {
@@ -245,7 +240,7 @@ impl<T: Letter> Mailbox<T> {
         worker_num: usize,
         mut controller_receiver: mpsc::UnboundedReceiver<ControllerMail>,
     ) {
-        let mail_queue = Arc::new(ArrayQueue::<ControllerMail>::new(worker_num * 16));
+        let mail_queue = Arc::new(ArrayQueue::<ControllerMail>::new(worker_num * 32));
         for _ in 0..worker_num {
             let mail_queue = mail_queue.clone();
             tokio::spawn(async move {
@@ -264,12 +259,10 @@ impl<T: Letter> Mailbox<T> {
         mut controller: ControllerClient,
         mail_queue: Arc<ArrayQueue<ControllerMail>>,
     ) {
-        let mut interval = time::interval(Duration::from_millis(1));
+        let mut interval = time::interval(Duration::from_millis(3));
         loop {
             interval.tick().await;
             while let Ok(mail) = mail_queue.pop() {
-                use std::time::Instant;
-                let t = Instant::now();
                 use ControllerMail::*;
                 match mail {
                     GetProposal { reply_tx } => {
@@ -300,10 +293,6 @@ impl<T: Letter> Mailbox<T> {
                         let _ = reply_tx.send(response);
                     }
                 }
-                println!(
-                    "handle controller mail takes {} ms",
-                    t.elapsed().as_millis()
-                );
             }
         }
     }
@@ -313,7 +302,7 @@ impl<T: Letter> Mailbox<T> {
         worker_num: usize,
         mut network_receiver: mpsc::UnboundedReceiver<NetworkMail<T>>,
     ) {
-        let mail_queue = Arc::new(ArrayQueue::<NetworkMail<T>>::new(worker_num * 16));
+        let mail_queue = Arc::new(ArrayQueue::<NetworkMail<T>>::new(worker_num * 32));
         for _ in 0..worker_num {
             let mail_queue = mail_queue.clone();
             tokio::spawn(async move {
@@ -332,14 +321,23 @@ impl<T: Letter> Mailbox<T> {
         mut network: NetworkClient,
         network_mail_queue: Arc<ArrayQueue<NetworkMail<T>>>,
     ) {
-        let mut interval = time::interval(Duration::from_millis(1));
+        let mut interval = time::interval(Duration::from_millis(3));
         loop {
             interval.tick().await;
             while let Ok(mail) = network_mail_queue.pop() {
-                use std::time::Instant;
-                let t = Instant::now();
                 use NetworkMail::*;
                 match mail {
+                    GetNetworkStatus { reply_tx } => {
+                        let request = tonic::Request::new(Empty {});
+                        let resp = network
+                            .get_network_status(request)
+                            .await
+                            .map(|r| r.into_inner().peer_count)
+                            .map_err(|e| e.into());
+                        if let Err(e) = reply_tx.send(resp) {
+                            warn!("reply GetNetworkStatus failed: `{:?}`", e);
+                        }
+                    }
                     SendMessage {
                         session_id: Some(origin),
                         msg,
@@ -356,7 +354,9 @@ impl<T: Letter> Mailbox<T> {
                             .await
                             .map(|_resp| ())
                             .map_err(|e| e.into());
-                        let _ = reply_tx.send(resp);
+                        if let Err(e) = reply_tx.send(resp) {
+                            warn!("reply SendMessage failed: `{:?}`", e);
+                        }
                     }
                     SendMessage {
                         session_id: None,
@@ -375,10 +375,14 @@ impl<T: Letter> Mailbox<T> {
                             .await
                             .map(|_resp| ())
                             .map_err(|e| e.into());
-                        let _ = reply_tx.send(resp);
+                        if let Err(e) = reply_tx.send(resp) {
+                            warn!(
+                                "reply non-dest SendMessage or BroadcastMessage failed: `{:?}`",
+                                e
+                            );
+                        }
                     }
                 }
-                println!("handle network mail takes {} ms", t.elapsed().as_millis());
             }
         }
     }
