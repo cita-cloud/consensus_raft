@@ -130,14 +130,6 @@ impl Peer {
         let logger = slog::Logger::root(drain, o!());
         let logger = logger.new(o!("tag" => format!("peer_{}", id)));
 
-        let cfg = Config {
-            id,
-            election_tick: 30,
-            heartbeat_tick: 3,
-            check_quorum: true,
-            ..Default::default()
-        };
-
         let mut storage = RaftStorage::new().await;
         // This step is according to the example in raft-rs to initialize the leader.
         if id == 1 && !storage.core.is_initialized() {
@@ -148,6 +140,15 @@ impl Peer {
 
             storage.core.apply_snapshot(s).await.unwrap();
         }
+
+        let cfg = Config {
+            id,
+            election_tick: 30,
+            heartbeat_tick: 3,
+            check_quorum: true,
+            applied: storage.core.applied_index(),
+            ..Default::default()
+        };
 
         let raw_node = RawNode::new(&cfg, storage, &logger).unwrap();
 
@@ -432,6 +433,7 @@ impl Peer {
                 store.core.mut_hard_state().commit = last_committed.index;
                 store.core.mut_hard_state().term = last_committed.term;
                 store.core.sync_hard_state().await;
+                store.core.set_applied_index(last_committed.index).await;
             }
         }
         self.raft.advance(ready);
