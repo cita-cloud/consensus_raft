@@ -18,6 +18,7 @@ use tokio::io::AsyncWriteExt;
 pub struct RaftStorageCore {
     raft_state: RaftState,
     entries: Vec<Entry>,
+    applied_index: u64,
     snapshot_metadata: SnapshotMetadata,
     engine: StorageEngine,
 }
@@ -26,11 +27,13 @@ impl RaftStorageCore {
     pub async fn new() -> Self {
         let mut engine = StorageEngine::new().await;
         let raft_state = engine.get_raft_state().await;
+        let applied_index = engine.get_applied_index().await;
         let snapshot_metadata = engine.get_snapshot_metadata().await;
         let entries = engine.get_entries().await;
         Self {
             raft_state,
             entries,
+            applied_index,
             snapshot_metadata,
             engine,
         }
@@ -134,6 +137,19 @@ impl RaftStorageCore {
             .set_conf_state(&self.raft_state.conf_state)
             .await;
     }
+
+    pub fn applied_index(&self) -> u64 {
+        self.applied_index
+    }
+
+    pub async fn set_applied_index(&mut self, applied_index: u64) {
+        self.applied_index = applied_index;
+        self.sync_applied_index().await;
+    }
+
+    pub async fn sync_applied_index(&mut self) {
+        self.engine.set_applied_index(self.applied_index).await;
+    }
 }
 
 pub struct RaftStorage {
@@ -216,6 +232,7 @@ impl Storage for RaftStorage {
 pub struct StorageEngine {
     hard_state_file: File,
     conf_state_file: File,
+    applied_index_file: File,
     snapshot_metadata_file: File,
     entry_file: File,
 }
@@ -225,12 +242,14 @@ impl StorageEngine {
         let mut opts = fs::OpenOptions::new();
         let opts = opts.read(true).write(true).create(true);
         let hard_state_file = opts.open("hard_state.data").await.unwrap();
+        let applied_index_file = opts.open("applied_index.data").await.unwrap();
         let conf_state_file = opts.open("conf_state.data").await.unwrap();
         let snapshot_metadata_file = opts.open("snapshot_metadata.data").await.unwrap();
         let entry_file = opts.append(true).open("entry.data").await.unwrap();
         Self {
             hard_state_file,
             conf_state_file,
+            applied_index_file,
             snapshot_metadata_file,
             entry_file,
         }
@@ -265,6 +284,12 @@ impl StorageEngine {
         } else {
             protobuf::parse_from_bytes(&buf[..]).unwrap()
         }
+    }
+
+    pub async fn get_applied_index(&mut self) -> u64 {
+        let f = &mut self.applied_index_file;
+        f.seek(SeekFrom::Start(0)).await.unwrap();
+        f.read_u64().await.unwrap_or_default()
     }
 
     pub async fn get_entries(&mut self) -> Vec<Entry> {
@@ -318,6 +343,14 @@ impl StorageEngine {
         f.set_len(0).await.unwrap();
         f.seek(SeekFrom::Start(0)).await.unwrap();
         f.write_all(&data[..]).await.unwrap();
+        f.sync_all().await.unwrap();
+    }
+
+    pub async fn set_applied_index(&mut self, applied_index: u64) {
+        let f = &mut self.applied_index_file;
+        f.set_len(0).await.unwrap();
+        f.seek(SeekFrom::Start(0)).await.unwrap();
+        f.write_u64(applied_index).await.unwrap();
         f.sync_all().await.unwrap();
     }
 }
