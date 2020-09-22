@@ -16,6 +16,7 @@ use serde_derive::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RaftConfig {
+    pub node_id: u64,
     pub network_port: u16,
     pub controller_port: u16,
 }
@@ -31,14 +32,16 @@ mod tests {
     use super::RaftConfig;
 
     #[test]
-    fn basic_test() {
+    fn test_basic() {
         let toml_str = r#"
+        node_id = 1
         network_port = 50000
         controller_port = 50005
         "#;
 
         let config = RaftConfig::new(toml_str);
 
+        assert_eq!(config.node_id, 1);
         assert_eq!(config.network_port, 50000);
         assert_eq!(config.controller_port, 50005);
     }
