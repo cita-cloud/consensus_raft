@@ -13,7 +13,7 @@
 // limitations under the License.
 mod config;
 mod mailbox;
-mod peer_dev;
+mod peer;
 mod storage;
 
 use clap::Clap;
@@ -190,7 +190,7 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
         block_interval: 6,
         validators: vec![],
     };
-    let mut peer = peer_dev::Peer::new(
+    let mut peer = peer::Peer::new(
         node_id,
         config,
         msg_tx,
