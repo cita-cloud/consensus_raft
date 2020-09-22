@@ -1,331 +1,391 @@
 use raft::eraftpb::ConfChangeType;
-use raft::eraftpb::Message;
+use raft::eraftpb::Message as RaftMsg;
 use raft::prelude::ConfChange;
-use raft::prelude::ConfState;
 use raft::prelude::Config;
-use raft::prelude::Entry;
 use raft::prelude::EntryType;
-use raft::prelude::HardState;
 use raft::prelude::RawNode;
-use raft::prelude::Ready;
 use raft::prelude::Snapshot;
-use raft::storage::MemStorage;
 use raft::StateRole;
 
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
-use tokio::sync::RwLock;
 use tokio::time;
 
-use log::{info, warn};
-use protobuf::Message as _;
 use slog::o;
-use slog::Drain;
+use slog::Logger;
 
-use crate::error::{Error, Result};
-use crate::network::NetworkManager;
+use slog::info;
+use slog::trace;
+use slog::warn;
 
-#[derive(Debug)]
-pub enum RaftServerMessage {
-    Proposal { proposal: Proposal },
-    Raft { message: Message },
+use anyhow::Result;
+
+use protobuf::Message as _;
+
+use crate::mailbox::Letter;
+use crate::mailbox::MailboxControl;
+use crate::storage::RaftStorage;
+
+#[derive(Debug, Clone)]
+pub enum PeerMsg {
+    // Local message to control this peer.
+    Control(ControlMsg),
+    // Raft message to and from peers.
+    Normal(RaftMsg),
+    #[allow(unused)]
+    CheckedAppend(RaftMsg), // Checked MsgAppend
 }
 
-#[derive(Debug)]
-pub enum Proposal {
-    Normal { hash: Vec<u8> },
-    ConfChange { cc: ConfChange },
-    // TransferLeader,
-}
+impl Letter for PeerMsg {
+    type Address = u64;
+    type ReadError = anyhow::Error;
 
-#[derive(Clone)]
-struct RaftGroup {
-    node: Arc<Mutex<Option<RawNode<MemStorage>>>>,
-}
-
-impl RaftGroup {
-    fn new(raw_node: Option<RawNode<MemStorage>>) -> Self {
-        let node = Arc::new(Mutex::new(raw_node));
-        Self { node }
-    }
-
-    async fn lock(&self) -> RaftGroupGuard {
-        RaftGroupGuard {
-            raft_group: self.node.clone().lock_owned().await,
-        }
-    }
-}
-
-use tokio::sync::OwnedMutexGuard;
-
-struct RaftGroupGuard {
-    raft_group: OwnedMutexGuard<Option<RawNode<MemStorage>>>,
-}
-
-impl RaftGroupGuard {
-    fn is_initialized(&self) -> bool {
-        self.raft_group.is_some()
-    }
-
-    fn propose(&mut self, hash: Vec<u8>) -> Result<()> {
-        if let Some(ref mut r) = *self.raft_group {
-            r.propose(vec![], hash)?;
-            Ok(())
-        } else {
-            Err(Error::RaftGroupUninitialized)
+    fn to(&self) -> Option<Self::Address> {
+        match self {
+            PeerMsg::Normal(raft_msg) => Some(raft_msg.to),
+            PeerMsg::Control(_) | PeerMsg::CheckedAppend(_) => panic!("attempt to send local msg"),
         }
     }
 
-    fn propose_conf_change(&mut self, cc: ConfChange) -> Result<()> {
-        if let Some(ref mut r) = *self.raft_group {
-            r.propose_conf_change(vec![], cc)?;
-            Ok(())
-        } else {
-            Err(Error::RaftGroupUninitialized)
+    fn from(&self) -> Self::Address {
+        match self {
+            PeerMsg::Normal(raft_msg) => raft_msg.from,
+            PeerMsg::Control(_) | PeerMsg::CheckedAppend(_) => panic!("attempt to send local msg"),
         }
     }
 
-    fn step(&mut self, msg: Message) -> Result<()> {
-        if !self.is_initialized() {
-            self.initialize_raft_from_message(&msg)?;
-        }
-        self.raft_group.as_mut().unwrap().step(msg)?;
-        Ok(())
-    }
-
-    fn initialize_raft_from_message(&mut self, msg: &Message) -> Result<()> {
-        fn is_initial_msg(msg: &Message) -> bool {
-            use raft::eraftpb::MessageType;
-            let msg_type = msg.get_msg_type();
-            msg_type == MessageType::MsgRequestVote
-                || msg_type == MessageType::MsgRequestPreVote
-                || (msg_type == MessageType::MsgHeartbeat && msg.commit == 0)
-        }
-        if is_initial_msg(msg) {
-            let decorator = slog_term::TermDecorator::new().build();
-            let drain = slog_term::FullFormat::new(decorator).build().fuse();
-            let drain = slog_async::Async::new(drain)
-                .chan_size(4096)
-                .overflow_strategy(slog_async::OverflowStrategy::Block)
-                .build()
-                .fuse();
-            let logger = slog::Logger::root(drain, o!());
-
-            let mut cfg = Config {
-                election_tick: 30,
-                heartbeat_tick: 3,
-                check_quorum: true,
-                ..Default::default()
-            };
-            cfg.id = msg.to;
-            let logger = logger.new(o!("tag" => format!("peer_{}", msg.to)));
-            let storage = MemStorage::new();
-            let raw_node = RawNode::new(&cfg, storage, &logger)?;
-            self.raft_group.replace(raw_node);
-            Ok(())
-        } else {
-            Err(Error::RaftGroupUninitialized)
+    fn write_down(&self) -> Vec<u8> {
+        match self {
+            PeerMsg::Normal(raft_msg) => raft_msg.write_to_bytes().unwrap(),
+            PeerMsg::Control(_) | PeerMsg::CheckedAppend(_) => panic!("attempt to send local msg"),
         }
     }
 
-    fn has_ready(&self) -> Result<bool> {
-        if let Some(ref r) = *self.raft_group {
-            Ok(r.has_ready())
-        } else {
-            Err(Error::RaftGroupUninitialized)
-        }
-    }
-
-    fn ready(&mut self) -> Result<Ready> {
-        if let Some(ref mut r) = *self.raft_group {
-            Ok(r.ready())
-        } else {
-            Err(Error::RaftGroupUninitialized)
-        }
-    }
-
-    fn log_store(&self) -> Result<MemStorage> {
-        if let Some(ref r) = *self.raft_group {
-            Ok(r.raft.raft_log.store.clone())
-        } else {
-            Err(Error::RaftGroupUninitialized)
-        }
-    }
-
-    fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<()> {
-        if let Some(ref mut r) = *self.raft_group {
-            r.mut_store().wl().apply_snapshot(snapshot)?;
-            Ok(())
-        } else {
-            Err(Error::RaftGroupUninitialized)
-        }
-    }
-
-    fn append_entries(&mut self, ents: &[Entry]) -> Result<()> {
-        if let Some(ref mut r) = *self.raft_group {
-            r.mut_store().wl().append(ents)?;
-            Ok(())
-        } else {
-            Err(Error::RaftGroupUninitialized)
-        }
-    }
-
-    fn set_hardstate(&mut self, hs: HardState) -> Result<()> {
-        if let Some(ref mut r) = *self.raft_group {
-            r.mut_store().wl().set_hardstate(hs);
-            Ok(())
-        } else {
-            Err(Error::RaftGroupUninitialized)
-        }
-    }
-
-    fn apply_conf_change(&mut self, cs: &ConfChange) -> Result<ConfState> {
-        if let Some(ref mut r) = *self.raft_group {
-            Ok(r.apply_conf_change(cs)?)
-        } else {
-            Err(Error::RaftGroupUninitialized)
-        }
-    }
-
-    fn advance(&mut self, ready: Ready) -> Result<()> {
-        if let Some(ref mut r) = *self.raft_group {
-            r.advance(ready);
-            Ok(())
-        } else {
-            Err(Error::RaftGroupUninitialized)
-        }
-    }
-
-    fn tick(&mut self) -> Result<bool> {
-        if let Some(ref mut r) = *self.raft_group {
-            Ok(r.tick())
-        } else {
-            Err(Error::RaftGroupUninitialized)
-        }
-    }
-
-    fn is_leader(&self) -> Result<bool> {
-        if let Some(ref r) = *self.raft_group {
-            Ok(r.raft.state == StateRole::Leader)
-        } else {
-            Err(Error::RaftGroupUninitialized)
-        }
+    fn read_from(paper: &[u8]) -> std::result::Result<Self, Self::ReadError> {
+        Ok(PeerMsg::Normal(protobuf::parse_from_bytes(paper)?))
     }
 }
 
-#[derive(Clone)]
+// Use mpsc channel instead of oneshot since it requires Clone.
+#[derive(Debug, Clone)]
+pub enum ControlMsg {
+    Propose {
+        hash: Vec<u8>,
+    },
+    AddNode {
+        node_id: u64,
+    },
+    RemoveNode {
+        node_id: u64,
+    },
+    GetNodeList {
+        reply_tx: mpsc::UnboundedSender<Vec<u64>>,
+    },
+    ApplySnapshot {
+        snapshot: Snapshot,
+    },
+    GetBlockInterval {
+        reply_tx: mpsc::UnboundedSender<u32>,
+    },
+    SetConsensusConfig {
+        config: ConsensusConfiguration,
+        reply_tx: mpsc::UnboundedSender<()>,
+    },
+    CheckBlock {
+        pwp: ProposalWithProof,
+        reply_tx: mpsc::UnboundedSender<bool>,
+    },
+    IsLeader {
+        reply_tx: mpsc::UnboundedSender<bool>,
+    },
+    Campaign,
+    Tick,
+}
+
 pub struct Peer {
-    raft_group: RaftGroup,
-    network_manager: NetworkManager,
-    config: Arc<RwLock<Option<ConsensusConfiguration>>>,
+    raft: RawNode<RaftStorage>,
+    consensus_config: ConsensusConfiguration,
+
+    msg_tx: mpsc::UnboundedSender<PeerMsg>,
+    msg_rx: mpsc::UnboundedReceiver<PeerMsg>,
+    mailbox_control: MailboxControl<PeerMsg>,
+
+    logger: Logger,
 }
 
 impl Peer {
-    fn create_leader(id: u64, controller_port: u16, network_port: u16) -> Self {
-        let decorator = slog_term::TermDecorator::new().build();
-        let drain = slog_term::FullFormat::new(decorator).build().fuse();
-        let drain = slog_async::Async::new(drain)
-            .chan_size(4096)
-            .overflow_strategy(slog_async::OverflowStrategy::Block)
-            .build()
-            .fuse();
-        let logger = slog::Logger::root(drain, o!());
+    pub async fn new(
+        id: u64,
+        consensus_config: ConsensusConfiguration,
+        msg_tx: mpsc::UnboundedSender<PeerMsg>,
+        msg_rx: mpsc::UnboundedReceiver<PeerMsg>,
+        mailbox_control: MailboxControl<PeerMsg>,
+        init_leader_id: u64,
+        logger: Logger,
+    ) -> Self {
         let logger = logger.new(o!("tag" => format!("peer_{}", id)));
 
+        let mut storage = RaftStorage::new().await;
+        // This step is according to the example in raft-rs to initialize the leader.
+        if id == init_leader_id && !storage.core.is_initialized() {
+            let mut s = Snapshot::default();
+            s.mut_metadata().index = 1;
+            s.mut_metadata().term = 1;
+            s.mut_metadata().mut_conf_state().voters = vec![id];
+
+            storage.core.apply_snapshot(s).await.unwrap();
+        }
+
+        let applied = storage.core.applied_index();
         let cfg = Config {
             id,
             election_tick: 30,
             heartbeat_tick: 3,
             check_quorum: true,
+            applied,
             ..Default::default()
         };
 
-        let mut s = Snapshot::default();
-        s.mut_metadata().index = 1;
-        s.mut_metadata().term = 1;
-        s.mut_metadata().mut_conf_state().voters = vec![1];
-        let storage = MemStorage::new();
-        storage.wl().apply_snapshot(s).unwrap();
+        let raw_node = RawNode::new(&cfg, storage, &logger).unwrap();
 
-        let mut raw_node = RawNode::new(&cfg, storage, &logger).unwrap();
-        raw_node.campaign().unwrap();
-        let raft_group = RaftGroup::new(Some(raw_node));
-        let network_manager = NetworkManager::with_capacity(controller_port, network_port, 16);
         Self {
-            raft_group,
-            network_manager,
-            config: Arc::new(RwLock::new(None)),
+            raft: raw_node,
+            msg_tx,
+            msg_rx,
+            mailbox_control,
+            consensus_config,
+            logger,
         }
     }
 
-    fn create_follower(controller_port: u16, network_port: u16) -> Self {
-        let raft_group = RaftGroup::new(None);
-        let network_manager = NetworkManager::with_capacity(controller_port, network_port, 16);
-        Self {
-            raft_group,
-            network_manager,
-            config: Arc::new(RwLock::new(None)),
-        }
-    }
+    pub async fn run(&mut self) {
+        let mut started = false;
 
-    async fn process_proposal(&mut self, proposal: Proposal) -> Result<()> {
-        info!("process proposal");
-        match proposal {
-            Proposal::Normal { hash } => {
-                if self.check_proposal_hash(hash.clone()).await? {
-                    self.raft_group.lock().await.propose(hash)?;
+        while let Some(msg) = self.msg_rx.recv().await {
+            if !started {
+                // Leader should be started by campaign msg.
+                // Followers should be started by leader's msg.
+                // Don't start them when receives SetConsensusConfig msg.
+                if let PeerMsg::Control(ControlMsg::SetConsensusConfig { .. }) = &msg {
+                    // Do nothing.
                 } else {
-                    info!("check porposal failed.");
+                    // Try to get a proposal every block interval secs.
+                    tokio::spawn(Self::wait_proposal(self.service(), self.logger.clone()));
+                    // Send tick msg to raft periodically.
+                    tokio::spawn(Self::pacemaker(self.msg_tx.clone()));
+                    started = true;
                 }
             }
-            Proposal::ConfChange { cc } => {
-                self.raft_group.lock().await.propose_conf_change(cc)?;
+            self.handle_msg(msg).await;
+        }
+    }
+
+    fn id(&self) -> u64 {
+        self.raft.raft.r.id
+    }
+
+    async fn handle_msg(&mut self, msg: PeerMsg) {
+        match msg {
+            PeerMsg::Control(ControlMsg::Propose { hash }) => {
+                info!(self.logger, "propose"; "hash" => ?hash);
+                if let Err(e) = self.raft.propose(vec![], hash) {
+                    warn!(self.logger, "propose failed: `{}`", e);
+                }
+            }
+            PeerMsg::Control(ControlMsg::AddNode { node_id }) => {
+                let mut cc = ConfChange::default();
+                cc.node_id = node_id;
+                cc.set_change_type(ConfChangeType::AddNode);
+                if let Err(e) = self.raft.propose_conf_change(vec![], cc) {
+                    warn!(self.logger, "add node failed: `{}`", e);
+                }
+            }
+            PeerMsg::Control(ControlMsg::RemoveNode { node_id }) => {
+                let mut cc = ConfChange::default();
+                cc.node_id = node_id;
+                cc.set_change_type(ConfChangeType::RemoveNode);
+                if let Err(e) = self.raft.propose_conf_change(vec![], cc) {
+                    warn!(self.logger, "remove node failed: `{}`", e);
+                }
+            }
+            PeerMsg::Control(ControlMsg::GetNodeList { reply_tx }) => {
+                if let Err(e) = reply_tx.send(self.raft.store().core.conf_state().voters.clone()) {
+                    warn!(self.logger, "reply GetNodeList request failed: `{}`", e);
+                }
+            }
+            PeerMsg::Control(ControlMsg::ApplySnapshot { snapshot }) => {
+                if let Err(e) = self.raft.mut_store().core.apply_snapshot(snapshot).await {
+                    warn!(self.logger, "apply snapshot failed: `{}`", e);
+                }
+            }
+            PeerMsg::Control(ControlMsg::GetBlockInterval { reply_tx }) => {
+                if let Err(e) = reply_tx.send(self.consensus_config.block_interval) {
+                    warn!(
+                        self.logger,
+                        "reply GetBlockInterval request failed: `{}`", e
+                    );
+                }
+            }
+            // Reply true since we assume no byzantine faults.
+            PeerMsg::Control(ControlMsg::CheckBlock { pwp, reply_tx }) => {
+                trace!(self.logger, "check block"; "proposal with proof" => ?pwp);
+                if let Err(e) = reply_tx.send(true) {
+                    warn!(self.logger, "reply CheckBlock request failed: `{}`", e);
+                }
+            }
+            PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
+                trace!(self.logger, "change consensus config"; "new config" => ?config);
+                self.consensus_config = config;
+                if let Err(e) = reply_tx.send(()) {
+                    warn!(
+                        self.logger,
+                        "reply SetConsensusConfig request failed: `{}`", e
+                    );
+                }
+            }
+            PeerMsg::Control(ControlMsg::IsLeader { reply_tx }) => {
+                if let Err(e) = reply_tx.send(self.is_leader()) {
+                    warn!(self.logger, "reply IsLeader request failed: `{}`", e);
+                }
+            }
+            PeerMsg::Control(ControlMsg::Campaign) => {
+                if let Err(e) = self.raft.campaign() {
+                    warn!(self.logger, "campaign failed: `{}`", e);
+                }
+            }
+            PeerMsg::Control(ControlMsg::Tick) => {
+                self.raft.tick();
+            }
+            // Checked MsgAppend msg, steps it directly.
+            PeerMsg::CheckedAppend(raft_msg) => {
+                trace!(self.logger, "stepping verified MsgAppend"; "entries" => ?raft_msg.entries);
+                if let Err(e) = self.raft.step(raft_msg) {
+                    warn!(self.logger, "raft step verified msg failed: `{}`", e);
+                }
+            }
+            PeerMsg::Normal(raft_msg) => {
+                // // If the msg is to append entries, check it first.
+                // if let MessageType::MsgAppend = raft_msg.msg_type {
+                //     let msg_tx = self.msg_tx.clone();
+                //     let mailbox_control = self.mailbox_control.clone();
+                //     let logger = self.logger.clone();
+                //     tokio::spawn(async move {
+                //         let mut is_ok = true;
+                //         for ent in raft_msg.entries.iter() {
+                //             // Ignore empty entries.
+                //             if !ent.data.is_empty() {
+                //                 if let EntryType::EntryNormal = ent.entry_type {
+                //                     if let Ok(false) | Err(_) =
+                //                         mailbox_control.check_proposal(ent.data.clone()).await
+                //                     {
+                //                         warn!(logger, "check_proposal failed: `{:?}`", &ent.data);
+                //                         is_ok = false;
+                //                         break;
+                //                     }
+                //                 }
+                //             }
+                //         }
+                //         // Send the msg back to raft if all of its entries passes the check.
+                //         if is_ok {
+                //             let msg = PeerMsg::CheckedAppend(raft_msg);
+                //             msg_tx.send(msg).unwrap();
+                //         }
+                //     });
+                // } else if let Err(e) = self.raft.step(raft_msg) {
+                //     warn!(self.logger, "raft step failed: `{}`", e);
+                // }
+
+                // We don't check appending entires here, leaving the problem to commit_block.
+                if let Err(e) = self.raft.step(raft_msg) {
+                    warn!(self.logger, "raft step failed: `{}`", e);
+                }
             }
         }
-        Ok(())
+        if let Err(e) = self.handle_ready().await {
+            warn!(self.logger, "handle ready failed: `{}`", e);
+        }
     }
 
-    async fn check_proposal_hash(&mut self, hash: Vec<u8>) -> Result<bool> {
-        self.network_manager.check_proposal(hash.clone()).await
+    fn is_leader(&self) -> bool {
+        self.raft.raft.state == StateRole::Leader
     }
 
-    async fn on_ready(&mut self) -> Result<()> {
-        let mut raft_group = self.raft_group.lock().await;
-        if !raft_group.has_ready()? {
+    pub fn control(&self) -> PeerControl {
+        PeerControl {
+            id: self.id(),
+            msg_tx: self.msg_tx.clone(),
+        }
+    }
+
+    pub fn service(&self) -> RaftService<PeerMsg> {
+        RaftService {
+            mailbox_control: self.mailbox_control.clone(),
+            peer_control: self.control(),
+        }
+    }
+
+    async fn wait_proposal(service: RaftService<PeerMsg>, logger: Logger) {
+        let d = Duration::from_secs(1);
+        let mut ticker = time::interval(d);
+        let mut last_propose_time = Instant::now();
+        loop {
+            ticker.tick().await;
+            let block_interval = service.peer_control.get_block_interval().await;
+            if last_propose_time.elapsed().as_secs() >= block_interval as u64
+                && service.peer_control.is_leader().await
+            {
+                trace!(logger, "get propose");
+                last_propose_time = Instant::now();
+                match service.mailbox_control.get_proposal().await {
+                    Ok(hash) => service.peer_control.propose(hash),
+                    Err(e) => warn!(logger, "get proposal failed: `{}`", e),
+                }
+            }
+        }
+    }
+
+    async fn pacemaker(msg_tx: mpsc::UnboundedSender<PeerMsg>) {
+        let pace = Duration::from_millis(200);
+        let mut ticker = time::interval(pace);
+        loop {
+            ticker.tick().await;
+            msg_tx.send(PeerMsg::Control(ControlMsg::Tick)).unwrap();
+        }
+    }
+
+    async fn handle_ready(&mut self) -> Result<()> {
+        if !self.raft.has_ready() {
             return Ok(());
         }
-        let store = raft_group.log_store()?;
-        let mut ready = raft_group.ready()?;
+        let mut ready = self.raft.ready();
+        let store = self.raft.mut_store();
 
         if !ready.snapshot().is_empty() {
             let s = ready.snapshot().clone();
-            if let Err(e) = raft_group.apply_snapshot(s) {
-                info!("apply snapshot failed: {:?}", e);
+            if let Err(e) = store.core.apply_snapshot(s).await {
+                warn!(self.logger, "apply snapshot failed: {}", e);
             }
         }
 
         if !ready.entries().is_empty() {
-            if let Err(e) = raft_group.append_entries(ready.entries()) {
-                info!("append entries failed: {:?}", e);
+            if let Err(e) = store.core.append(ready.entries()).await {
+                warn!(self.logger, "append entries failed: {}", e);
             }
         }
 
         if let Some(hs) = ready.hs() {
-            if let Err(e) = raft_group.set_hardstate(hs.clone()) {
-                info!("set hardstate failed: {:?}", e);
-            }
+            store.core.set_hard_state(hs.clone()).await;
         }
 
-        info!("sending msg..");
         let messages = ready.messages.drain(..).collect::<Vec<_>>();
-        let mut conn = self.network_manager.clone();
+        let mailbox_control = self.mailbox_control.clone();
+        let logger_cloned = self.logger.clone();
         tokio::spawn(async move {
             for msg in messages {
-                if let Err(e) = conn.send_msg(msg).await {
-                    info!("send msg failed: {:?}", e);
+                let pm = PeerMsg::Normal(msg);
+                if let Err(e) = mailbox_control.send_message(pm).await {
+                    warn!(logger_cloned, "send msg failed: {}", e);
                 }
             }
         });
@@ -337,189 +397,135 @@ impl Peer {
                 }
                 match entry.get_entry_type() {
                     EntryType::EntryNormal => {
-                        info!("commiting proposal..");
+                        info!(self.logger, "commiting proposal"; "entry" => ?entry.data.clone());
                         let proposal = entry.data.clone();
-                        let mut network_manager = self.network_manager.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = network_manager.commit_block(proposal.clone()).await {
-                                warn!("commit block failed: {:?}", e);
-                            }
-                        });
+                        // Ignore any empty entries that may be produced by raft itself.
+                        if !proposal.is_empty() {
+                            let mailbox_control = self.mailbox_control.clone();
+                            let logger = self.logger.clone();
+                            tokio::spawn(async move {
+                                let pwp = ProposalWithProof {
+                                    proposal,
+                                    proof: vec![],
+                                };
+                                let mut retry_interval = time::interval(Duration::from_secs(3));
+                                while let Err(e) = mailbox_control.commit_block(pwp.clone()).await {
+                                    retry_interval.tick().await;
+                                    warn!(logger, "commit block failed: `{:?}`", e);
+                                }
+                            });
+                        }
                     }
                     EntryType::EntryConfChange => {
                         let mut cc = ConfChange::default();
                         cc.merge_from_bytes(&entry.data)?;
-                        let store = store.clone();
-                        let cs = raft_group.apply_conf_change(&cc)?;
-                        store.wl().set_conf_state(cs);
+                        let cs = self.raft.apply_conf_change(&cc)?;
+                        self.raft.mut_store().core.set_conf_state(cs).await;
+                        match cc.change_type {
+                            ConfChangeType::AddNode => {
+                                info!(self.logger, "add node #{}", cc.node_id);
+                            }
+                            ConfChangeType::RemoveNode => {
+                                info!(self.logger, "remove node #{}", cc.node_id);
+                            }
+                            ConfChangeType::AddLearnerNode => {
+                                warn!(self.logger, "AddLearnerNode unimplemented.")
+                            }
+                        }
                     }
-                    EntryType::EntryConfChangeV2 => warn!("ConfChangeV2 unimplemented."),
+                    EntryType::EntryConfChangeV2 => {
+                        warn!(self.logger, "ConfChangeV2 unimplemented.")
+                    }
                 }
             }
             if let Some(last_committed) = committed_entries.last() {
-                let mut s = store.wl();
-                s.mut_hard_state().commit = last_committed.index;
-                s.mut_hard_state().term = last_committed.term;
+                let store = self.raft.mut_store();
+                store.core.mut_hard_state().commit = last_committed.index;
+                store.core.mut_hard_state().term = last_committed.term;
+                store.core.sync_hard_state().await;
+                store.core.set_applied_index(last_committed.index).await;
             }
         }
-        raft_group.advance(ready)
-    }
-
-    async fn tick(&mut self) -> Result<bool> {
-        self.raft_group.lock().await.tick()
-    }
-
-    async fn step(&mut self, msg: Message) -> Result<()> {
-        self.raft_group.lock().await.step(msg)
-    }
-
-    async fn is_leader(&self) -> Result<bool> {
-        self.raft_group.lock().await.is_leader()
+        self.raft.advance(ready);
+        Ok(())
     }
 }
 
 #[derive(Clone)]
-pub struct RaftServer {
+pub struct PeerControl {
     id: u64,
-    peer: Peer,
-    tx: mpsc::Sender<RaftServerMessage>,
+    msg_tx: mpsc::UnboundedSender<PeerMsg>,
 }
 
-impl RaftServer {
-    pub fn new(
-        id: u64,
-        tx: mpsc::Sender<RaftServerMessage>,
-        controller_port: u16,
-        network_port: u16,
-    ) -> Self {
-        let peer = if id == 1 {
-            Peer::create_leader(id, controller_port, network_port)
-        } else {
-            Peer::create_follower(controller_port, network_port)
-        };
-
-        Self { id, peer, tx }
+impl PeerControl {
+    pub fn add_node(&self, node_id: u64) {
+        let msg = PeerMsg::Control(ControlMsg::AddNode { node_id });
+        self.msg_tx.send(msg).unwrap();
     }
 
-    pub async fn start(
-        self,
-        tx: mpsc::Sender<RaftServerMessage>,
-        mut rx: mpsc::Receiver<RaftServerMessage>,
-    ) -> Result<()> {
-        tokio::spawn(self.clone().wait_proposal(tx));
-        let mut tick_clock = Instant::now();
-        let tick_interval = Duration::from_millis(100);
-
-        let d = Duration::from_millis(10);
-        let mut interval = time::interval(d);
-        loop {
-            match rx.try_recv() {
-                Ok(RaftServerMessage::Proposal { proposal }) => {
-                    tokio::spawn(self.clone().raft_process_proposal(proposal));
-                }
-                Ok(RaftServerMessage::Raft { message }) => {
-                    tokio::spawn(self.clone().raft_step(message));
-                }
-                Err(mpsc::error::TryRecvError::Empty) => (),
-                Err(mpsc::error::TryRecvError::Closed) => {
-                    info!("Recv closed.");
-                    return Ok(());
-                }
-            }
-            if tick_clock.elapsed() >= tick_interval {
-                tokio::spawn(self.clone().raft_tick());
-                tick_clock = Instant::now();
-            }
-            tokio::spawn(self.clone().raft_on_ready());
-            interval.tick().await;
-        }
+    #[allow(unused)]
+    pub fn remove_node(&self, node_id: u64) {
+        let msg = PeerMsg::Control(ControlMsg::RemoveNode { node_id });
+        self.msg_tx.send(msg).unwrap();
     }
 
-    async fn raft_process_proposal(mut self, proposal: Proposal) {
-        if let Err(e) = self.peer.process_proposal(proposal).await {
-            warn!("process proposal failed: {:?}", e);
-        }
+    pub async fn get_node_list(&self) -> Vec<u64> {
+        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+        let msg = PeerMsg::Control(ControlMsg::GetNodeList { reply_tx });
+        self.msg_tx.send(msg).unwrap();
+        reply_rx.recv().await.unwrap()
     }
 
-    async fn raft_step(mut self, message: Message) {
-        if message.to == self.id {
-            use raft::eraftpb::MessageType::*;
-            let mut is_ok = true;
-            if let MsgAppend = message.msg_type {
-                for ent in message.entries.iter() {
-                    if let EntryType::EntryNormal = ent.entry_type {
-                        if let Ok(false) | Err(_) =
-                            self.peer.check_proposal_hash(ent.data.clone()).await
-                        {
-                            is_ok = false;
-                        }
-                    }
-                }
-            }
-            if is_ok {
-                if let Err(e) = self.peer.step(message).await {
-                    warn!("raft group step message failed: {:?}", e);
-                }
-            } else {
-                warn!("check block hash failed");
-            }
-        } else {
-            warn!("#{} server ignore message to #{}", self.id, message.to);
-        }
+    #[allow(unused)]
+    pub fn apply_snapshot(&self, snapshot: Snapshot) {
+        let msg = PeerMsg::Control(ControlMsg::ApplySnapshot { snapshot });
+        self.msg_tx.send(msg).unwrap();
     }
 
-    async fn raft_tick(mut self) {
-        if let Err(e) = self.peer.tick().await {
-            warn!("raft group tick failed: {:?}", e);
-        }
+    pub fn propose(&self, hash: Vec<u8>) {
+        let msg = PeerMsg::Control(ControlMsg::Propose { hash });
+        self.msg_tx.send(msg).unwrap();
     }
 
-    async fn raft_on_ready(mut self) {
-        if let Err(e) = self.peer.on_ready().await {
-            warn!("raft group on_ready failed: {:?}", e);
-        }
+    pub fn campaign(&self) {
+        let msg = PeerMsg::Control(ControlMsg::Campaign);
+        self.msg_tx.send(msg).unwrap();
     }
 
-    async fn wait_proposal(mut self, mut tx: mpsc::Sender<RaftServerMessage>) {
-        let mut block_clock = Instant::now();
-        let mut block_interval = Duration::from_millis(500);
-        loop {
-            if block_clock.elapsed() >= block_interval {
-                if let Some(ref config) = *self.peer.config.read().await {
-                    block_interval = Duration::from_secs(config.block_interval as u64);
-                    if let Ok(true) = self.peer.is_leader().await {
-                        if let Ok(hash) = self.peer.network_manager.get_proposal().await {
-                            let proposal = Proposal::Normal { hash };
-                            tx.send(RaftServerMessage::Proposal { proposal })
-                                .await
-                                .unwrap();
-                        }
-                    }
-                }
-                block_clock = Instant::now();
-            }
-            let mut interval = time::interval(Duration::from_millis(500));
-            interval.tick().await;
-        }
+    pub fn init_leader(&self) {
+        self.campaign();
     }
 
-    pub async fn add_follower(n: u64, mut tx: mpsc::Sender<RaftServerMessage>) {
-        info!("add follower");
-        let d = Duration::from_secs(5);
-        let mut delay = time::interval(d);
-        for id in 2..=n {
-            delay.tick().await;
-            let mut cc = ConfChange::default();
-            cc.node_id = id;
-            cc.set_change_type(ConfChangeType::AddNode);
-            let proposal = Proposal::ConfChange { cc };
-            tx.send(RaftServerMessage::Proposal { proposal })
-                .await
-                .unwrap();
-        }
+    pub async fn is_leader(&self) -> bool {
+        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+        let msg = PeerMsg::Control(ControlMsg::IsLeader { reply_tx });
+        self.msg_tx.send(msg).unwrap();
+        reply_rx.recv().await.unwrap()
+    }
+
+    pub async fn get_block_interval(&self) -> u32 {
+        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+        let msg = PeerMsg::Control(ControlMsg::GetBlockInterval { reply_tx });
+        self.msg_tx.send(msg).unwrap();
+        reply_rx.recv().await.unwrap()
+    }
+
+    pub async fn check_block(&self, pwp: ProposalWithProof) -> bool {
+        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+        let msg = PeerMsg::Control(ControlMsg::CheckBlock { pwp, reply_tx });
+        self.msg_tx.send(msg).unwrap();
+        reply_rx.recv().await.unwrap()
+    }
+
+    pub async fn set_consensus_config(&self, config: ConsensusConfiguration) {
+        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+        let msg = PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx });
+        self.msg_tx.send(msg).unwrap();
+        reply_rx.recv().await.unwrap()
     }
 }
 
+use cita_cloud_proto::common::ProposalWithProof;
 use cita_cloud_proto::common::SimpleResponse;
 use cita_cloud_proto::consensus::{
     consensus_service_server::ConsensusService, ConsensusConfiguration,
@@ -527,32 +533,27 @@ use cita_cloud_proto::consensus::{
 use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerService;
 use cita_cloud_proto::network::NetworkMsg;
 
+#[derive(Clone)]
+pub struct RaftService<T: Letter> {
+    pub mailbox_control: MailboxControl<T>,
+    pub peer_control: PeerControl,
+}
+
 #[tonic::async_trait]
-impl NetworkMsgHandlerService for RaftServer {
+impl<T: Letter> NetworkMsgHandlerService for RaftService<T> {
     async fn process_network_msg(
         &self,
         request: tonic::Request<NetworkMsg>,
     ) -> std::result::Result<tonic::Response<SimpleResponse>, tonic::Status> {
-        info!("process_network_msg request: {:?}", request);
-
         let msg = request.into_inner();
         if msg.module != "consensus" {
             Err(tonic::Status::invalid_argument("wrong module"))
         } else {
-            let raft_msg: Message = protobuf::parse_from_bytes(msg.msg.as_slice()).unwrap();
+            let letter = Letter::read_from(msg.msg.as_slice()).map_err(|e| {
+                tonic::Status::invalid_argument(format!("msg fail to decode: `{:?}`", e))
+            })?;
             let origin = msg.origin;
-            let from = raft_msg.from;
-          
-            let to = raft_msg.to;
-            if to == self.id {
-                self.tx
-                    .clone()
-                    .send(RaftServerMessage::Raft { message: raft_msg })
-                    .await
-                    .unwrap();
-            }
-            let network_manager = self.peer.network_manager.clone();
-            network_manager.update_table(from, origin).await;
+            self.mailbox_control.put_mail(origin, letter).await.unwrap();
             let reply = SimpleResponse { is_success: true };
             Ok(tonic::Response::new(reply))
         }
@@ -560,15 +561,24 @@ impl NetworkMsgHandlerService for RaftServer {
 }
 
 #[tonic::async_trait]
-impl ConsensusService for RaftServer {
+impl<T: Letter> ConsensusService for RaftService<T> {
     async fn reconfigure(
         &self,
         request: tonic::Request<ConsensusConfiguration>,
     ) -> std::result::Result<tonic::Response<SimpleResponse>, tonic::Status> {
-        info!("reconfigure request: {:?}", request);
-        let new_config = request.into_inner();
-        self.peer.config.write().await.replace(new_config);
+        let config = request.into_inner();
+        self.peer_control.set_consensus_config(config).await;
         let reply = SimpleResponse { is_success: true };
+        Ok(tonic::Response::new(reply))
+    }
+
+    async fn check_block(
+        &self,
+        request: tonic::Request<ProposalWithProof>,
+    ) -> Result<tonic::Response<SimpleResponse>, tonic::Status> {
+        let pwp = request.into_inner();
+        let is_success = self.peer_control.check_block(pwp).await;
+        let reply = SimpleResponse { is_success };
         Ok(tonic::Response::new(reply))
     }
 }
