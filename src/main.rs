@@ -12,15 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 mod config;
-// mod error;
-// mod network;
 mod mailbox;
 mod peer_dev;
 mod storage;
 
 use clap::Clap;
 use git_version::git_version;
-use log::{info, warn};
+
+use std::fs::OpenOptions;
+
+use slog::error;
+use slog::info;
+use slog::o;
+use slog::trace;
+use slog::Drain;
+use slog::Logger;
 
 const GIT_VERSION: &str = git_version!(
     args = ["--tags", "--always", "--dirty=-modified"],
@@ -68,10 +74,39 @@ fn main() {
             println!("homepage: {}", GIT_HOMEPAGE);
         }
         SubCommand::Run(opts) => {
-            // init log4rs
-            log4rs::init_file("consensus-log4rs.yaml", Default::default()).unwrap();
-            info!("grpc port of this service: {}", opts.grpc_port);
-            let _ = run(opts);
+            // Terminal log
+            let decorator = slog_term::TermDecorator::new().build();
+            let terminal_drain = slog_term::FullFormat::new(decorator).build().fuse();
+            let terminal_drain = slog_async::Async::new(terminal_drain)
+                .chan_size(4096)
+                .overflow_strategy(slog_async::OverflowStrategy::Block)
+                .build();
+
+            // File log
+            let log_path = "./logs/consensus_service.log";
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(log_path)
+                .unwrap();
+
+            let decorator = slog_term::PlainDecorator::new(file);
+            let file_drain = slog_term::FullFormat::new(decorator).build().fuse();
+            let file_drain = slog_async::Async::new(file_drain).build();
+
+            let logger = slog::Logger::root(
+                slog::Duplicate::new(terminal_drain, file_drain).fuse(),
+                o!(),
+            );
+
+            info!(logger, "server start, grpc port: {}", opts.grpc_port);
+
+            if let Err(e) = run(opts, logger.clone()) {
+                error!(logger, "server shutdown with error: {}", e);
+            }
+
+            info!(logger, "server end");
         }
     }
 }
@@ -107,28 +142,32 @@ use tokio::time;
 use tonic::{transport::Server, Request};
 
 #[tokio::main]
-async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Error>> {
     // read consensus-config.toml
     let buffer = std::fs::read_to_string("consensus-config.toml")
         .unwrap_or_else(|err| panic!("Error while loading config: [{}]", err));
     let config = config::RaftConfig::new(&buffer);
 
+    // ID starts from 1 since RawNode's ID can't be 0.
+    let node_id = config.node_id + 1;
     let network_port = config.network_port;
     let controller_port = config.controller_port;
 
     let grpc_port_clone = opts.grpc_port.clone();
+    let logger_cloned = logger.clone();
     tokio::spawn(async move {
+        let logger = logger_cloned;
         let mut interval = time::interval(Duration::from_secs(3));
         loop {
             // register endpoint
             {
                 let ret = register_network_msg_handler(network_port, grpc_port_clone.clone()).await;
                 if ret.is_ok() && ret.unwrap() {
-                    info!("register network msg handler success!");
+                    info!(logger, "register network msg handler success!");
                     break;
                 }
             }
-            warn!("register network msg handler failed! Retrying");
+            trace!(logger, "register network msg handler failed! Retrying");
             interval.tick().await;
         }
     });
@@ -136,22 +175,35 @@ async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
     let addr_str = format!("127.0.0.1:{}", opts.grpc_port);
     let addr = addr_str.parse()?;
 
-    let port = opts.grpc_port.parse::<u64>().unwrap();
-    let id = (port - 50001) / 1000 + 1;
-
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-    let mut mailbox = Mailbox::new(id, controller_port, network_port, msg_tx.clone()).await;
+    let mut mailbox = Mailbox::new(
+        node_id,
+        controller_port,
+        network_port,
+        msg_tx.clone(),
+        logger.clone(),
+    )
+    .await;
     let mailbox_control = mailbox.control();
 
     let config = ConsensusConfiguration {
         block_interval: 6,
         validators: vec![],
     };
-    let mut peer = peer_dev::Peer::new(id, config, msg_tx, msg_rx, mailbox_control.clone()).await;
+    let mut peer = peer_dev::Peer::new(
+        node_id,
+        config,
+        msg_tx,
+        msg_rx,
+        mailbox_control.clone(),
+        1,
+        logger.clone(),
+    )
+    .await;
     let peer_control = peer.control();
     let raft_service = peer.service();
 
-    info!("start raft");
+    info!(logger, "start raft");
     tokio::spawn(async move {
         mailbox.run().await;
     });
@@ -160,13 +212,13 @@ async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
         peer.run().await;
     });
 
-    if id == 1 {
+    if node_id == 1 {
         let mut retry_interval = time::interval(Duration::from_secs(1));
         let peer_count = loop {
             retry_interval.tick().await;
             match mailbox_control.get_network_status().await {
                 Ok(n) => break n,
-                Err(e) => info!("retry get_network_status: `{}`", e),
+                Err(e) => trace!(logger, "retry get_network_status: `{}`", e),
             }
         };
 
@@ -191,7 +243,7 @@ async fn run(opts: RunOpts) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    info!("start grpc server!");
+    info!(logger, "start grpc server!");
     Server::builder()
         .add_service(ConsensusServiceServer::new(raft_service.clone()))
         .add_service(NetworkMsgHandlerServiceServer::new(raft_service.clone()))

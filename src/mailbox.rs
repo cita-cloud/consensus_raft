@@ -1,5 +1,6 @@
-use log::info;
-use log::warn;
+use slog::info;
+use slog::warn;
+use slog::Logger;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,16 +30,6 @@ pub trait Letter: Clone + Debug + Send + Sized + Sync + 'static {
     fn from(&self) -> Self::Address;
     fn write_down(&self) -> Vec<u8>;
     fn read_from(paper: &[u8]) -> Result<Self, Self::ReadError>;
-}
-
-pub struct Mailbox<T: Letter> {
-    local_addr: T::Address,
-    mail_put: mpsc::UnboundedSender<Mail<T>>,
-    mail_get: mpsc::UnboundedReceiver<Mail<T>>,
-    mailbook: HashMap<T::Address, u64>,
-    controller_sender: mpsc::UnboundedSender<ControllerMail>,
-    network_sender: mpsc::UnboundedSender<NetworkMail<T>>,
-    send_to: mpsc::UnboundedSender<T>,
 }
 
 #[derive(Debug)]
@@ -105,16 +96,13 @@ impl<T: Letter> MailboxControl<T> {
     // controller
 
     pub async fn get_proposal(&self) -> Result<Vec<u8>> {
-        println!("get proposal..");
         let (reply_tx, reply_rx) = oneshot::channel();
         let mail = ControllerMail::GetProposal { reply_tx };
         self.mail_put.clone().send(Mail::ToController(mail))?;
         reply_rx.await?
     }
 
-    #[allow(unused)]
     pub async fn check_proposal(&self, proposal: Vec<u8>) -> Result<bool> {
-        println!("check proposal..");
         let (reply_tx, reply_rx) = oneshot::channel();
         let mail = ControllerMail::CheckProposal { proposal, reply_tx };
         self.mail_put.clone().send(Mail::ToController(mail))?;
@@ -122,7 +110,6 @@ impl<T: Letter> MailboxControl<T> {
     }
 
     pub async fn commit_block(&self, pwp: ProposalWithProof) -> Result<()> {
-        println!("commit block..");
         let (reply_tx, reply_rx) = oneshot::channel();
         let mail = ControllerMail::CommitBlock { pwp, reply_tx };
         self.mail_put.clone().send(Mail::ToController(mail))?;
@@ -158,12 +145,29 @@ impl<T: Letter> MailboxControl<T> {
     }
 }
 
+pub struct Mailbox<T: Letter> {
+    local_addr: T::Address,
+
+    mail_put: mpsc::UnboundedSender<Mail<T>>,
+    mail_get: mpsc::UnboundedReceiver<Mail<T>>,
+
+    mailbook: HashMap<T::Address, u64>,
+
+    controller_sender: mpsc::UnboundedSender<ControllerMail>,
+    network_sender: mpsc::UnboundedSender<NetworkMail<T>>,
+
+    send_to: mpsc::UnboundedSender<T>,
+
+    logger: Logger,
+}
+
 impl<T: Letter> Mailbox<T> {
     pub async fn new(
         local_addr: T::Address,
         controller_port: u16,
         network_port: u16,
         send_to: mpsc::UnboundedSender<T>,
+        logger: Logger,
     ) -> Self {
         let (controller_sender, controller_receiver) = mpsc::unbounded_channel();
         let (network_sender, network_receiver) = mpsc::unbounded_channel();
@@ -171,8 +175,14 @@ impl<T: Letter> Mailbox<T> {
             controller_port,
             10,
             controller_receiver,
+            logger.clone(),
         ));
-        tokio::spawn(Self::serve_network(network_port, 10, network_receiver));
+        tokio::spawn(Self::serve_network(
+            network_port,
+            10,
+            network_receiver,
+            logger.clone(),
+        ));
         let (mail_put, mail_get) = mpsc::unbounded_channel();
         Self {
             local_addr,
@@ -182,20 +192,20 @@ impl<T: Letter> Mailbox<T> {
             controller_sender,
             network_sender,
             send_to,
+            logger,
         }
     }
 
     pub async fn run(&mut self) {
         while let Some(m) = self.mail_get.recv().await {
             if let Err(e) = self.handle_mail(m) {
-                warn!("handle mail failed: `{}`", e);
+                warn!(self.logger, "handle mail failed: `{}`", e);
             }
         }
     }
 
     fn handle_mail(&mut self, mail: Mail<T>) -> Result<()> {
         use Mail::*;
-        // dbg!(&mail);
         match mail {
             ToMe { origin, mail } => match mail {
                 MyMail::Normal { msg, reply_tx } => {
@@ -239,18 +249,20 @@ impl<T: Letter> Mailbox<T> {
         controller_port: u16,
         worker_num: usize,
         mut controller_receiver: mpsc::UnboundedReceiver<ControllerMail>,
+        logger: Logger,
     ) {
         let mail_queue = Arc::new(ArrayQueue::<ControllerMail>::new(worker_num * 32));
         for _ in 0..worker_num {
             let mail_queue = mail_queue.clone();
+            let logger = logger.clone();
             tokio::spawn(async move {
-                let controller = Self::connect_controller(controller_port).await;
+                let controller = Self::connect_controller(controller_port, logger).await;
                 Self::handle_controller_mail(controller, mail_queue).await;
             });
         }
         while let Some(mail) = controller_receiver.recv().await {
             if mail_queue.push(mail).is_err() {
-                println!("controller task queue is full, discard mail");
+                warn!(logger, "controller task queue is full, discard mail");
             }
         }
     }
@@ -301,18 +313,20 @@ impl<T: Letter> Mailbox<T> {
         network_port: u16,
         worker_num: usize,
         mut network_receiver: mpsc::UnboundedReceiver<NetworkMail<T>>,
+        logger: Logger,
     ) {
         let mail_queue = Arc::new(ArrayQueue::<NetworkMail<T>>::new(worker_num * 32));
         for _ in 0..worker_num {
             let mail_queue = mail_queue.clone();
+            let logger = logger.clone();
             tokio::spawn(async move {
-                let network = Self::connect_network(network_port).await;
-                Self::handle_network_mail(network, mail_queue).await;
+                let network = Self::connect_network(network_port, logger.clone()).await;
+                Self::handle_network_mail(network, mail_queue, logger).await;
             });
         }
         while let Some(mail) = network_receiver.recv().await {
             if mail_queue.push(mail).is_err() {
-                println!("network mail queue is full, discard mail");
+                warn!(logger, "network mail queue is full, discard mail");
             }
         }
     }
@@ -320,6 +334,7 @@ impl<T: Letter> Mailbox<T> {
     async fn handle_network_mail(
         mut network: NetworkClient,
         network_mail_queue: Arc<ArrayQueue<NetworkMail<T>>>,
+        logger: Logger,
     ) {
         let mut interval = time::interval(Duration::from_millis(3));
         loop {
@@ -335,7 +350,7 @@ impl<T: Letter> Mailbox<T> {
                             .map(|r| r.into_inner().peer_count)
                             .map_err(|e| e.into());
                         if let Err(e) = reply_tx.send(resp) {
-                            warn!("reply GetNetworkStatus failed: `{:?}`", e);
+                            warn!(logger, "reply GetNetworkStatus failed: `{:?}`", e);
                         }
                     }
                     SendMessage {
@@ -355,7 +370,7 @@ impl<T: Letter> Mailbox<T> {
                             .map(|_resp| ())
                             .map_err(|e| e.into());
                         if let Err(e) = reply_tx.send(resp) {
-                            warn!("reply SendMessage failed: `{:?}`", e);
+                            warn!(logger, "reply SendMessage failed: `{:?}`", e);
                         }
                     }
                     SendMessage {
@@ -377,8 +392,8 @@ impl<T: Letter> Mailbox<T> {
                             .map_err(|e| e.into());
                         if let Err(e) = reply_tx.send(resp) {
                             warn!(
-                                "reply non-dest SendMessage or BroadcastMessage failed: `{:?}`",
-                                e
+                                logger,
+                                "reply non-dest SendMessage or BroadcastMessage failed: `{:?}`", e
                             );
                         }
                     }
@@ -387,37 +402,37 @@ impl<T: Letter> Mailbox<T> {
         }
     }
 
-    async fn connect_controller(controller_port: u16) -> ControllerClient {
+    async fn connect_controller(controller_port: u16, logger: Logger) -> ControllerClient {
         let d = Duration::from_secs(1);
         let mut interval = time::interval(d);
         let controller_addr = format!("http://127.0.0.1:{}", controller_port);
-        info!("connecting to controller...");
+        info!(logger, "connecting to controller...");
         loop {
             interval.tick().await;
             match Consensus2ControllerServiceClient::connect(controller_addr.clone()).await {
                 Ok(client) => return client,
                 Err(e) => {
-                    info!("connect to controller failed: `{}`", e);
+                    info!(logger, "connect to controller failed: `{}`", e);
                 }
             }
-            info!("Retrying to connect controller");
+            info!(logger, "Retrying to connect controller");
         }
     }
 
-    async fn connect_network(network_port: u16) -> NetworkClient {
+    async fn connect_network(network_port: u16, logger: Logger) -> NetworkClient {
         let d = Duration::from_secs(1);
         let mut interval = time::interval(d);
         let network_addr = format!("http://127.0.0.1:{}", network_port);
-        info!("connecting to network...");
+        info!(logger, "connecting to network...");
         loop {
             interval.tick().await;
             match NetworkServiceClient::connect(network_addr.clone()).await {
                 Ok(client) => return client,
                 Err(e) => {
-                    info!("connect to network failed: `{}`", e);
+                    info!(logger, "connect to network failed: `{}`", e);
                 }
             }
-            info!("Retrying to connect network");
+            info!(logger, "Retrying to connect network");
         }
     }
 }
