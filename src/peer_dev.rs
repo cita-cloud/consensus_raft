@@ -1,13 +1,10 @@
 use raft::eraftpb::ConfChangeType;
 use raft::eraftpb::Message as RaftMsg;
-#[allow(unused)]
-use raft::eraftpb::MessageType;
 use raft::prelude::ConfChange;
 use raft::prelude::Config;
 use raft::prelude::EntryType;
 use raft::prelude::RawNode;
 use raft::prelude::Snapshot;
-// use raft::storage::MemStorage;
 use raft::StateRole;
 
 use std::time::Duration;
@@ -16,7 +13,11 @@ use tokio::sync::mpsc;
 use tokio::time;
 
 use slog::o;
-use slog::Drain;
+use slog::Logger;
+
+use slog::info;
+use slog::trace;
+use slog::warn;
 
 use anyhow::Result;
 
@@ -25,16 +26,15 @@ use protobuf::Message as _;
 use crate::mailbox::Letter;
 use crate::mailbox::MailboxControl;
 use crate::storage::RaftStorage;
-use log::{info, warn};
 
 #[derive(Debug, Clone)]
 pub enum PeerMsg {
     // Local message to control this peer.
     Control(ControlMsg),
     // Raft message to and from peers.
-    #[allow(unused)]
-    Verified(RaftMsg), // Verified MsgAppend
     Normal(RaftMsg),
+    #[allow(unused)]
+    CheckedAppend(RaftMsg), // Checked MsgAppend
 }
 
 impl Letter for PeerMsg {
@@ -44,21 +44,21 @@ impl Letter for PeerMsg {
     fn to(&self) -> Option<Self::Address> {
         match self {
             PeerMsg::Normal(raft_msg) => Some(raft_msg.to),
-            PeerMsg::Control(_) | PeerMsg::Verified(_) => panic!("attempt to send local msg"),
+            PeerMsg::Control(_) | PeerMsg::CheckedAppend(_) => panic!("attempt to send local msg"),
         }
     }
 
     fn from(&self) -> Self::Address {
         match self {
             PeerMsg::Normal(raft_msg) => raft_msg.from,
-            PeerMsg::Control(_) | PeerMsg::Verified(_) => panic!("attempt to send local msg"),
+            PeerMsg::Control(_) | PeerMsg::CheckedAppend(_) => panic!("attempt to send local msg"),
         }
     }
 
     fn write_down(&self) -> Vec<u8> {
         match self {
             PeerMsg::Normal(raft_msg) => raft_msg.write_to_bytes().unwrap(),
-            PeerMsg::Control(_) | PeerMsg::Verified(_) => panic!("attempt to send local msg"),
+            PeerMsg::Control(_) | PeerMsg::CheckedAppend(_) => panic!("attempt to send local msg"),
         }
     }
 
@@ -110,6 +110,8 @@ pub struct Peer {
     msg_tx: mpsc::UnboundedSender<PeerMsg>,
     msg_rx: mpsc::UnboundedReceiver<PeerMsg>,
     mailbox_control: MailboxControl<PeerMsg>,
+
+    logger: Logger,
 }
 
 impl Peer {
@@ -119,20 +121,14 @@ impl Peer {
         msg_tx: mpsc::UnboundedSender<PeerMsg>,
         msg_rx: mpsc::UnboundedReceiver<PeerMsg>,
         mailbox_control: MailboxControl<PeerMsg>,
+        init_leader_id: u64,
+        logger: Logger,
     ) -> Self {
-        let decorator = slog_term::TermDecorator::new().build();
-        let drain = slog_term::FullFormat::new(decorator).build().fuse();
-        let drain = slog_async::Async::new(drain)
-            .chan_size(4096)
-            .overflow_strategy(slog_async::OverflowStrategy::Block)
-            .build()
-            .fuse();
-        let logger = slog::Logger::root(drain, o!());
         let logger = logger.new(o!("tag" => format!("peer_{}", id)));
 
         let mut storage = RaftStorage::new().await;
         // This step is according to the example in raft-rs to initialize the leader.
-        if id == 1 && !storage.core.is_initialized() {
+        if id == init_leader_id && !storage.core.is_initialized() {
             let mut s = Snapshot::default();
             s.mut_metadata().index = 1;
             s.mut_metadata().term = 1;
@@ -141,12 +137,13 @@ impl Peer {
             storage.core.apply_snapshot(s).await.unwrap();
         }
 
+        let applied = storage.core.applied_index();
         let cfg = Config {
             id,
             election_tick: 30,
             heartbeat_tick: 3,
             check_quorum: true,
-            applied: storage.core.applied_index(),
+            applied,
             ..Default::default()
         };
 
@@ -158,6 +155,7 @@ impl Peer {
             msg_rx,
             mailbox_control,
             consensus_config,
+            logger,
         }
     }
 
@@ -173,7 +171,7 @@ impl Peer {
                     // Do nothing.
                 } else {
                     // Try to get a proposal every block interval secs.
-                    tokio::spawn(Self::wait_proposal(self.service()));
+                    tokio::spawn(Self::wait_proposal(self.service(), self.logger.clone()));
                     // Send tick msg to raft periodically.
                     tokio::spawn(Self::pacemaker(self.msg_tx.clone()));
                     started = true;
@@ -190,8 +188,9 @@ impl Peer {
     async fn handle_msg(&mut self, msg: PeerMsg) {
         match msg {
             PeerMsg::Control(ControlMsg::Propose { hash }) => {
+                info!(self.logger, "propose"; "hash" => ?hash);
                 if let Err(e) = self.raft.propose(vec![], hash) {
-                    warn!("propose failed: `{}`", e);
+                    warn!(self.logger, "propose failed: `{}`", e);
                 }
             }
             PeerMsg::Control(ControlMsg::AddNode { node_id }) => {
@@ -199,7 +198,7 @@ impl Peer {
                 cc.node_id = node_id;
                 cc.set_change_type(ConfChangeType::AddNode);
                 if let Err(e) = self.raft.propose_conf_change(vec![], cc) {
-                    warn!("add node failed: `{}`", e);
+                    warn!(self.logger, "add node failed: `{}`", e);
                 }
             }
             PeerMsg::Control(ControlMsg::RemoveNode { node_id }) => {
@@ -207,97 +206,104 @@ impl Peer {
                 cc.node_id = node_id;
                 cc.set_change_type(ConfChangeType::RemoveNode);
                 if let Err(e) = self.raft.propose_conf_change(vec![], cc) {
-                    warn!("remove node failed: `{}`", e);
+                    warn!(self.logger, "remove node failed: `{}`", e);
                 }
             }
             PeerMsg::Control(ControlMsg::GetNodeList { reply_tx }) => {
                 if let Err(e) = reply_tx.send(self.raft.store().core.conf_state().voters.clone()) {
-                    warn!("reply GetNodeList request failed: `{}`", e);
+                    warn!(self.logger, "reply GetNodeList request failed: `{}`", e);
                 }
             }
             PeerMsg::Control(ControlMsg::ApplySnapshot { snapshot }) => {
                 if let Err(e) = self.raft.mut_store().core.apply_snapshot(snapshot).await {
-                    warn!("apply snapshot failed: `{}`", e);
+                    warn!(self.logger, "apply snapshot failed: `{}`", e);
                 }
             }
             PeerMsg::Control(ControlMsg::GetBlockInterval { reply_tx }) => {
                 if let Err(e) = reply_tx.send(self.consensus_config.block_interval) {
-                    warn!("reply GetBlockInterval request failed: `{}`", e);
+                    warn!(
+                        self.logger,
+                        "reply GetBlockInterval request failed: `{}`", e
+                    );
                 }
             }
             // Reply true since we assume no byzantine faults.
-            PeerMsg::Control(ControlMsg::CheckBlock {
-                pwp: _pwp,
-                reply_tx,
-            }) => {
+            PeerMsg::Control(ControlMsg::CheckBlock { pwp, reply_tx }) => {
+                trace!(self.logger, "check block"; "proposal with proof" => ?pwp);
                 if let Err(e) = reply_tx.send(true) {
-                    warn!("reply CheckBlock request failed: `{}`", e);
+                    warn!(self.logger, "reply CheckBlock request failed: `{}`", e);
                 }
             }
             PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
+                trace!(self.logger, "change consensus config"; "new config" => ?config);
                 self.consensus_config = config;
                 if let Err(e) = reply_tx.send(()) {
-                    warn!("reply SetConsensusConfig request failed: `{}`", e);
+                    warn!(
+                        self.logger,
+                        "reply SetConsensusConfig request failed: `{}`", e
+                    );
                 }
             }
             PeerMsg::Control(ControlMsg::IsLeader { reply_tx }) => {
                 if let Err(e) = reply_tx.send(self.is_leader()) {
-                    warn!("reply IsLeader request failed: `{}`", e);
+                    warn!(self.logger, "reply IsLeader request failed: `{}`", e);
                 }
             }
             PeerMsg::Control(ControlMsg::Campaign) => {
                 if let Err(e) = self.raft.campaign() {
-                    warn!("campaign failed: `{}`", e);
+                    warn!(self.logger, "campaign failed: `{}`", e);
                 }
             }
             PeerMsg::Control(ControlMsg::Tick) => {
                 self.raft.tick();
             }
             // Checked MsgAppend msg, steps it directly.
-            PeerMsg::Verified(raft_msg) => {
+            PeerMsg::CheckedAppend(raft_msg) => {
+                trace!(self.logger, "stepping verified MsgAppend"; "entries" => ?raft_msg.entries);
                 if let Err(e) = self.raft.step(raft_msg) {
-                    warn!("raft step verified msg failed: `{}`", e);
+                    warn!(self.logger, "raft step verified msg failed: `{}`", e);
                 }
             }
             PeerMsg::Normal(raft_msg) => {
-                // TODO: maybe check proposal when controller can sync lost blocks.
-                if let Err(e) = self.raft.step(raft_msg) {
-                    warn!("raft step normal msg failed: `{}`", e);
-                }
                 // // If the msg is to append entries, check it first.
                 // if let MessageType::MsgAppend = raft_msg.msg_type {
                 //     let msg_tx = self.msg_tx.clone();
                 //     let mailbox_control = self.mailbox_control.clone();
+                //     let logger = self.logger.clone();
                 //     tokio::spawn(async move {
                 //         let mut is_ok = true;
                 //         for ent in raft_msg.entries.iter() {
-                //             // It sometimes receives emtpy entries with EntryNormal type.
+                //             // Ignore empty entries.
                 //             if !ent.data.is_empty() {
                 //                 if let EntryType::EntryNormal = ent.entry_type {
                 //                     if let Ok(false) | Err(_) =
                 //                         mailbox_control.check_proposal(ent.data.clone()).await
                 //                     {
-                //                         info!("check_proposal failed: `{:?}`", &ent.data);
+                //                         warn!(logger, "check_proposal failed: `{:?}`", &ent.data);
                 //                         is_ok = false;
+                //                         break;
                 //                     }
                 //                 }
                 //             }
                 //         }
                 //         // Send the msg back to raft if all of its entries passes the check.
                 //         if is_ok {
-                //             let msg = PeerMsg::Verified(raft_msg);
+                //             let msg = PeerMsg::CheckedAppend(raft_msg);
                 //             msg_tx.send(msg).unwrap();
-                //         } else {
-                //             info!("check proposal failed");
                 //         }
                 //     });
                 // } else if let Err(e) = self.raft.step(raft_msg) {
-                //     warn!("raft step failed: `{}`", e);
+                //     warn!(self.logger, "raft step failed: `{}`", e);
                 // }
+
+                // We don't check appending entires here, leaving the problem to commit_block.
+                if let Err(e) = self.raft.step(raft_msg) {
+                    warn!(self.logger, "raft step failed: `{}`", e);
+                }
             }
         }
         if let Err(e) = self.handle_ready().await {
-            warn!("handle ready failed: `{}`", e);
+            warn!(self.logger, "handle ready failed: `{}`", e);
         }
     }
 
@@ -319,7 +325,7 @@ impl Peer {
         }
     }
 
-    async fn wait_proposal(service: RaftService<PeerMsg>) {
+    async fn wait_proposal(service: RaftService<PeerMsg>, logger: Logger) {
         let d = Duration::from_secs(1);
         let mut ticker = time::interval(d);
         let mut last_propose_time = Instant::now();
@@ -329,18 +335,18 @@ impl Peer {
             if last_propose_time.elapsed().as_secs() >= block_interval as u64
                 && service.peer_control.is_leader().await
             {
-                println!("start propose");
+                trace!(logger, "get propose");
                 last_propose_time = Instant::now();
                 match service.mailbox_control.get_proposal().await {
                     Ok(hash) => service.peer_control.propose(hash),
-                    Err(e) => warn!("get proposal failed: `{}`", e),
+                    Err(e) => warn!(logger, "get proposal failed: `{}`", e),
                 }
             }
         }
     }
 
     async fn pacemaker(msg_tx: mpsc::UnboundedSender<PeerMsg>) {
-        let pace = Duration::from_millis(100);
+        let pace = Duration::from_millis(200);
         let mut ticker = time::interval(pace);
         loop {
             ticker.tick().await;
@@ -358,13 +364,13 @@ impl Peer {
         if !ready.snapshot().is_empty() {
             let s = ready.snapshot().clone();
             if let Err(e) = store.core.apply_snapshot(s).await {
-                warn!("apply snapshot failed: {:?}", e);
+                warn!(self.logger, "apply snapshot failed: {}", e);
             }
         }
 
         if !ready.entries().is_empty() {
             if let Err(e) = store.core.append(ready.entries()).await {
-                warn!("append entries failed: {:?}", e);
+                warn!(self.logger, "append entries failed: {}", e);
             }
         }
 
@@ -374,11 +380,12 @@ impl Peer {
 
         let messages = ready.messages.drain(..).collect::<Vec<_>>();
         let mailbox_control = self.mailbox_control.clone();
+        let logger_cloned = self.logger.clone();
         tokio::spawn(async move {
             for msg in messages {
                 let pm = PeerMsg::Normal(msg);
                 if let Err(e) = mailbox_control.send_message(pm).await {
-                    warn!("send msg failed: {:?}", e);
+                    warn!(logger_cloned, "send msg failed: {}", e);
                 }
             }
         });
@@ -390,20 +397,21 @@ impl Peer {
                 }
                 match entry.get_entry_type() {
                     EntryType::EntryNormal => {
-                        info!("commiting proposal..");
+                        info!(self.logger, "commiting proposal"; "entry" => ?entry.data.clone());
                         let proposal = entry.data.clone();
                         // Ignore any empty entries that may be produced by raft itself.
                         if !proposal.is_empty() {
                             let mailbox_control = self.mailbox_control.clone();
+                            let logger = self.logger.clone();
                             tokio::spawn(async move {
                                 let pwp = ProposalWithProof {
                                     proposal,
                                     proof: vec![],
                                 };
-                                let mut retry_interval = time::interval(Duration::from_secs(1));
+                                let mut retry_interval = time::interval(Duration::from_secs(3));
                                 while let Err(e) = mailbox_control.commit_block(pwp.clone()).await {
-                                    warn!("commit block failed: {:?}", e);
                                     retry_interval.tick().await;
+                                    warn!(logger, "commit block failed: `{:?}`", e);
                                 }
                             });
                         }
@@ -415,17 +423,19 @@ impl Peer {
                         self.raft.mut_store().core.set_conf_state(cs).await;
                         match cc.change_type {
                             ConfChangeType::AddNode => {
-                                info!("{} add node #{}", cc.id, cc.node_id);
+                                info!(self.logger, "add node #{}", cc.node_id);
                             }
                             ConfChangeType::RemoveNode => {
-                                info!("{} remove node #{}", cc.id, cc.node_id);
+                                info!(self.logger, "remove node #{}", cc.node_id);
                             }
                             ConfChangeType::AddLearnerNode => {
-                                warn!("AddLearnerNode unimplemented.")
+                                warn!(self.logger, "AddLearnerNode unimplemented.")
                             }
                         }
                     }
-                    EntryType::EntryConfChangeV2 => warn!("ConfChangeV2 unimplemented."),
+                    EntryType::EntryConfChangeV2 => {
+                        warn!(self.logger, "ConfChangeV2 unimplemented.")
+                    }
                 }
             }
             if let Some(last_committed) = committed_entries.last() {

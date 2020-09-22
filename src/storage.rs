@@ -19,6 +19,9 @@ pub struct RaftStorageCore {
     raft_state: RaftState,
     entries: Vec<Entry>,
     applied_index: u64,
+    // We don't take snapshot of the controller (as the state machine)
+    // which has its own sync mechanism. So, we only have metadata for
+    // raft itself here.
     snapshot_metadata: SnapshotMetadata,
     engine: StorageEngine,
 }
