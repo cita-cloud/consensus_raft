@@ -1,4 +1,5 @@
 use slog::info;
+use slog::trace;
 use slog::warn;
 use slog::Logger;
 use std::collections::HashMap;
@@ -254,11 +255,11 @@ impl<T: Letter> Mailbox<T> {
         logger: Logger,
     ) {
         let mail_queue = Arc::new(ArrayQueue::<ControllerMail>::new(worker_num * 32));
+        let controller = Self::connect_controller(controller_port, logger.clone()).await;
         for _ in 0..worker_num {
             let mail_queue = mail_queue.clone();
-            let logger = logger.clone();
+            let controller = controller.clone();
             tokio::spawn(async move {
-                let controller = Self::connect_controller(controller_port, logger).await;
                 Self::handle_controller_mail(controller, mail_queue).await;
             });
         }
@@ -318,11 +319,12 @@ impl<T: Letter> Mailbox<T> {
         logger: Logger,
     ) {
         let mail_queue = Arc::new(ArrayQueue::<NetworkMail<T>>::new(worker_num * 32));
+        let network = Self::connect_network(network_port, logger.clone()).await;
         for _ in 0..worker_num {
             let mail_queue = mail_queue.clone();
             let logger = logger.clone();
+            let network = network.clone();
             tokio::spawn(async move {
-                let network = Self::connect_network(network_port, logger.clone()).await;
                 Self::handle_network_mail(network, mail_queue, logger).await;
             });
         }
@@ -414,10 +416,10 @@ impl<T: Letter> Mailbox<T> {
             match Consensus2ControllerServiceClient::connect(controller_addr.clone()).await {
                 Ok(client) => return client,
                 Err(e) => {
-                    info!(logger, "connect to controller failed: `{}`", e);
+                    trace!(logger, "connect to controller failed: `{}`", e);
                 }
             }
-            info!(logger, "Retrying to connect controller");
+            trace!(logger, "Retrying to connect controller");
         }
     }
 
@@ -431,10 +433,10 @@ impl<T: Letter> Mailbox<T> {
             match NetworkServiceClient::connect(network_addr.clone()).await {
                 Ok(client) => return client,
                 Err(e) => {
-                    info!(logger, "connect to network failed: `{}`", e);
+                    trace!(logger, "connect to network failed: `{}`", e);
                 }
             }
-            info!(logger, "Retrying to connect network");
+            trace!(logger, "Retrying to connect network");
         }
     }
 }
