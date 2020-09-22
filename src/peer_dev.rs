@@ -1,6 +1,5 @@
 use raft::eraftpb::ConfChangeType;
 use raft::eraftpb::Message as RaftMsg;
-use raft::eraftpb::MessageType;
 use raft::prelude::ConfChange;
 use raft::prelude::Config;
 use raft::prelude::EntryType;
@@ -33,8 +32,9 @@ pub enum PeerMsg {
     // Local message to control this peer.
     Control(ControlMsg),
     // Raft message to and from peers.
-    Verified(RaftMsg), // Verified MsgAppend
     Normal(RaftMsg),
+    #[allow(unused)]
+    CheckedAppend(RaftMsg), // Checked MsgAppend
 }
 
 impl Letter for PeerMsg {
@@ -44,21 +44,21 @@ impl Letter for PeerMsg {
     fn to(&self) -> Option<Self::Address> {
         match self {
             PeerMsg::Normal(raft_msg) => Some(raft_msg.to),
-            PeerMsg::Control(_) | PeerMsg::Verified(_) => panic!("attempt to send local msg"),
+            PeerMsg::Control(_) | PeerMsg::CheckedAppend(_) => panic!("attempt to send local msg"),
         }
     }
 
     fn from(&self) -> Self::Address {
         match self {
             PeerMsg::Normal(raft_msg) => raft_msg.from,
-            PeerMsg::Control(_) | PeerMsg::Verified(_) => panic!("attempt to send local msg"),
+            PeerMsg::Control(_) | PeerMsg::CheckedAppend(_) => panic!("attempt to send local msg"),
         }
     }
 
     fn write_down(&self) -> Vec<u8> {
         match self {
             PeerMsg::Normal(raft_msg) => raft_msg.write_to_bytes().unwrap(),
-            PeerMsg::Control(_) | PeerMsg::Verified(_) => panic!("attempt to send local msg"),
+            PeerMsg::Control(_) | PeerMsg::CheckedAppend(_) => panic!("attempt to send local msg"),
         }
     }
 
@@ -171,10 +171,7 @@ impl Peer {
                     // Do nothing.
                 } else {
                     // Try to get a proposal every block interval secs.
-                    let logger = self
-                        .logger
-                        .new(o!("init_block_interval" => self.consensus_config.block_interval));
-                    tokio::spawn(Self::wait_proposal(self.service(), logger));
+                    tokio::spawn(Self::wait_proposal(self.service(), self.logger.clone()));
                     // Send tick msg to raft periodically.
                     tokio::spawn(Self::pacemaker(self.msg_tx.clone()));
                     started = true;
@@ -191,6 +188,7 @@ impl Peer {
     async fn handle_msg(&mut self, msg: PeerMsg) {
         match msg {
             PeerMsg::Control(ControlMsg::Propose { hash }) => {
+                info!(self.logger, "propose"; "hash" => ?hash);
                 if let Err(e) = self.raft.propose(vec![], hash) {
                     warn!(self.logger, "propose failed: `{}`", e);
                 }
@@ -230,15 +228,14 @@ impl Peer {
                 }
             }
             // Reply true since we assume no byzantine faults.
-            PeerMsg::Control(ControlMsg::CheckBlock {
-                pwp: _pwp,
-                reply_tx,
-            }) => {
+            PeerMsg::Control(ControlMsg::CheckBlock { pwp, reply_tx }) => {
+                trace!(self.logger, "check block"; "proposal with proof" => ?pwp);
                 if let Err(e) = reply_tx.send(true) {
                     warn!(self.logger, "reply CheckBlock request failed: `{}`", e);
                 }
             }
             PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
+                trace!(self.logger, "change consensus config"; "new config" => ?config);
                 self.consensus_config = config;
                 if let Err(e) = reply_tx.send(()) {
                     warn!(
@@ -261,41 +258,46 @@ impl Peer {
                 self.raft.tick();
             }
             // Checked MsgAppend msg, steps it directly.
-            PeerMsg::Verified(raft_msg) => {
+            PeerMsg::CheckedAppend(raft_msg) => {
                 trace!(self.logger, "stepping verified MsgAppend"; "entries" => ?raft_msg.entries);
                 if let Err(e) = self.raft.step(raft_msg) {
                     warn!(self.logger, "raft step verified msg failed: `{}`", e);
                 }
             }
             PeerMsg::Normal(raft_msg) => {
-                // If the msg is to append entries, check it first.
-                if let MessageType::MsgAppend = raft_msg.msg_type {
-                    let msg_tx = self.msg_tx.clone();
-                    let mailbox_control = self.mailbox_control.clone();
-                    let logger = self.logger.clone();
-                    tokio::spawn(async move {
-                        let mut is_ok = true;
-                        for ent in raft_msg.entries.iter() {
-                            // Ignore empty entries.
-                            if !ent.data.is_empty() {
-                                if let EntryType::EntryNormal = ent.entry_type {
-                                    if let Ok(false) | Err(_) =
-                                        mailbox_control.check_proposal(ent.data.clone()).await
-                                    {
-                                        warn!(logger, "check_proposal failed: `{:?}`", &ent.data);
-                                        is_ok = false;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        // Send the msg back to raft if all of its entries passes the check.
-                        if is_ok {
-                            let msg = PeerMsg::Verified(raft_msg);
-                            msg_tx.send(msg).unwrap();
-                        }
-                    });
-                } else if let Err(e) = self.raft.step(raft_msg) {
+                // // If the msg is to append entries, check it first.
+                // if let MessageType::MsgAppend = raft_msg.msg_type {
+                //     let msg_tx = self.msg_tx.clone();
+                //     let mailbox_control = self.mailbox_control.clone();
+                //     let logger = self.logger.clone();
+                //     tokio::spawn(async move {
+                //         let mut is_ok = true;
+                //         for ent in raft_msg.entries.iter() {
+                //             // Ignore empty entries.
+                //             if !ent.data.is_empty() {
+                //                 if let EntryType::EntryNormal = ent.entry_type {
+                //                     if let Ok(false) | Err(_) =
+                //                         mailbox_control.check_proposal(ent.data.clone()).await
+                //                     {
+                //                         warn!(logger, "check_proposal failed: `{:?}`", &ent.data);
+                //                         is_ok = false;
+                //                         break;
+                //                     }
+                //                 }
+                //             }
+                //         }
+                //         // Send the msg back to raft if all of its entries passes the check.
+                //         if is_ok {
+                //             let msg = PeerMsg::CheckedAppend(raft_msg);
+                //             msg_tx.send(msg).unwrap();
+                //         }
+                //     });
+                // } else if let Err(e) = self.raft.step(raft_msg) {
+                //     warn!(self.logger, "raft step failed: `{}`", e);
+                // }
+
+                // We don't check appending entires here, leaving the problem to commit_block.
+                if let Err(e) = self.raft.step(raft_msg) {
                     warn!(self.logger, "raft step failed: `{}`", e);
                 }
             }
@@ -327,16 +329,13 @@ impl Peer {
         let d = Duration::from_secs(1);
         let mut ticker = time::interval(d);
         let mut last_propose_time = Instant::now();
-        for _ in 0..16 {
-            ticker.tick().await;
-        }
         loop {
             ticker.tick().await;
             let block_interval = service.peer_control.get_block_interval().await;
             if last_propose_time.elapsed().as_secs() >= block_interval as u64
                 && service.peer_control.is_leader().await
             {
-                info!(logger, "start propose");
+                trace!(logger, "get propose");
                 last_propose_time = Instant::now();
                 match service.mailbox_control.get_proposal().await {
                     Ok(hash) => service.peer_control.propose(hash),
@@ -347,7 +346,7 @@ impl Peer {
     }
 
     async fn pacemaker(msg_tx: mpsc::UnboundedSender<PeerMsg>) {
-        let pace = Duration::from_millis(100);
+        let pace = Duration::from_millis(200);
         let mut ticker = time::interval(pace);
         loop {
             ticker.tick().await;
@@ -398,7 +397,7 @@ impl Peer {
                 }
                 match entry.get_entry_type() {
                     EntryType::EntryNormal => {
-                        info!(self.logger, "commiting proposal..");
+                        info!(self.logger, "commiting proposal"; "entry" => ?entry.data.clone());
                         let proposal = entry.data.clone();
                         // Ignore any empty entries that may be produced by raft itself.
                         if !proposal.is_empty() {
