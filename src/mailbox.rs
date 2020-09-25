@@ -24,6 +24,9 @@ use anyhow::Result;
 type ControllerClient = Consensus2ControllerServiceClient<Channel>;
 type NetworkClient = NetworkServiceClient<Channel>;
 
+/// This part is for handling communication with controller, network,
+/// and msgs coming from other peers.
+
 pub trait Letter: Clone + Debug + Send + Sized + Sync + 'static {
     type Address: std::hash::Hash + std::cmp::Eq;
     type ReadError: Debug;
@@ -66,6 +69,7 @@ pub enum ControllerMail {
 
 #[derive(Debug)]
 pub enum NetworkMail<T: Letter> {
+    #[allow(unused)]
     GetNetworkStatus {
         reply_tx: oneshot::Sender<Result<u64>>,
     },
@@ -121,6 +125,7 @@ impl<T: Letter> MailboxControl<T> {
 
     // network
 
+    #[allow(unused)]
     pub async fn get_network_status(&self) -> Result<u64> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let mail = NetworkMail::GetNetworkStatus { reply_tx };

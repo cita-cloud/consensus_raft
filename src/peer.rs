@@ -7,6 +7,7 @@ use raft::prelude::RawNode;
 use raft::prelude::Snapshot;
 use raft::StateRole;
 
+use std::collections::HashSet;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -167,8 +168,10 @@ impl Peer {
                 // Leader should be started by campaign msg.
                 // Followers should be started by leader's msg.
                 // Don't start them when receives SetConsensusConfig msg.
-                if let PeerMsg::Control(ControlMsg::SetConsensusConfig { .. }) = &msg {
-                    // Do nothing.
+                if let PeerMsg::Control(ControlMsg::SetConsensusConfig { reply_tx, .. }) = &msg {
+                    // Ignore it since we haven't started yet.
+                    reply_tx.send(()).unwrap();
+                    continue;
                 } else {
                     // Try to get a proposal every block interval secs.
                     tokio::spawn(Self::wait_proposal(self.service(), self.logger.clone()));
@@ -188,7 +191,7 @@ impl Peer {
     async fn handle_msg(&mut self, msg: PeerMsg) {
         match msg {
             PeerMsg::Control(ControlMsg::Propose { hash }) => {
-                info!(self.logger, "propose"; "hash" => ?hash);
+                info!(self.logger, "propose"; "hash" => hex::encode(&hash));
                 if let Err(e) = self.raft.propose(vec![], hash) {
                     warn!(self.logger, "propose failed: `{}`", e);
                 }
@@ -236,7 +239,35 @@ impl Peer {
             }
             PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
                 trace!(self.logger, "change consensus config"; "new config" => ?config);
-                self.consensus_config = config;
+                self.consensus_config = config.clone();
+                let voters = &self.raft.store().core.conf_state().voters;
+                let current_peer_count = voters.len() as u64;
+                let new_peer_count = config.validators.len() as u64;
+                let peer_control = self.control();
+                if current_peer_count < new_peer_count {
+                    info!(
+                        self.logger, "sync peer";
+                        "current_peer_cnt" => current_peer_count,
+                        "new_peer_cnt" => new_peer_count,
+                    );
+                    tokio::spawn(async move {
+                        let mut ticker = time::interval(Duration::from_secs(2));
+                        let nodes: Vec<u64> = (1..=new_peer_count).collect();
+                        loop {
+                            ticker.tick().await;
+                            let current_nodes: HashSet<u64> =
+                                peer_control.get_node_list().await.into_iter().collect();
+
+                            if let Some(&node_id) =
+                                nodes.iter().find(|&id| !current_nodes.contains(id))
+                            {
+                                peer_control.add_node(node_id);
+                            } else {
+                                break;
+                            }
+                        }
+                    });
+                }
                 if let Err(e) = reply_tx.send(()) {
                     warn!(
                         self.logger,
@@ -397,7 +428,7 @@ impl Peer {
                 }
                 match entry.get_entry_type() {
                     EntryType::EntryNormal => {
-                        info!(self.logger, "commiting proposal"; "entry" => ?entry.data.clone());
+                        info!(self.logger, "commiting proposal"; "entry" => hex::encode(entry.data.clone()));
                         let proposal = entry.data.clone();
                         // Ignore any empty entries that may be produced by raft itself.
                         if !proposal.is_empty() {
@@ -490,10 +521,6 @@ impl PeerControl {
     pub fn campaign(&self) {
         let msg = PeerMsg::Control(ControlMsg::Campaign);
         self.msg_tx.send(msg).unwrap();
-    }
-
-    pub fn init_leader(&self) {
-        self.campaign();
     }
 
     pub async fn is_leader(&self) -> bool {
