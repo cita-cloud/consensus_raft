@@ -186,6 +186,7 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
     .await;
     let mailbox_control = mailbox.control();
 
+    let init_leader_id = 1;
     let config = ConsensusConfiguration {
         block_interval: 6,
         validators: vec![],
@@ -196,7 +197,7 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
         msg_tx,
         msg_rx,
         mailbox_control.clone(),
-        1,
+        init_leader_id,
         logger.clone(),
     )
     .await;
@@ -212,35 +213,8 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
         peer.run().await;
     });
 
-    if node_id == 1 {
-        let mut retry_interval = time::interval(Duration::from_secs(1));
-        let peer_count = loop {
-            retry_interval.tick().await;
-            match mailbox_control.get_network_status().await {
-                Ok(n) => break n,
-                Err(e) => trace!(logger, "retry get_network_status: `{}`", e),
-            }
-        };
-
-        let peer_control = peer_control.clone();
-        tokio::spawn(async move {
-            peer_control.init_leader();
-            let mut ticker = time::interval(Duration::from_secs(2));
-
-            use std::collections::HashSet;
-            let nodes: Vec<u64> = (1..=peer_count).collect();
-            loop {
-                ticker.tick().await;
-                let current_nodes: HashSet<u64> =
-                    peer_control.get_node_list().await.into_iter().collect();
-
-                if let Some(&node_id) = nodes.iter().find(|&id| !current_nodes.contains(id)) {
-                    peer_control.add_node(node_id);
-                } else {
-                    break;
-                }
-            }
-        });
+    if node_id == init_leader_id {
+        peer_control.campaign();
     }
 
     info!(logger, "start grpc server!");

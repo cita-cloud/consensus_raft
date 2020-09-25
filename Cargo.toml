@@ -25,3 +25,4 @@ slog-stdlog = { version = "4" }
 slog-term = { version = "2.4.0" }
 slog-async = "2.3.0"
 crossbeam = "0.7"
+hex = "0.4.2"
