@@ -45,14 +45,8 @@ impl RaftStorageCore {
     pub fn snapshot(&self) -> Snapshot {
         let mut snapshot = Snapshot::default();
 
-        // Use the latest applied_idx to construct the snapshot.
-        let applied_idx = self.raft_state.hard_state.commit;
-        let term = self.raft_state.hard_state.term;
         let meta = snapshot.mut_metadata();
-        meta.index = applied_idx;
-        meta.term = term;
-
-        meta.set_conf_state(self.raft_state.conf_state.clone());
+        *meta = self.snapshot_metadata.clone();
         snapshot
     }
 
@@ -152,6 +146,26 @@ impl RaftStorageCore {
 
     pub async fn sync_applied_index(&mut self) {
         self.engine.set_applied_index(self.applied_index).await;
+    }
+
+    pub async fn update_snapshot_metadata(&mut self) {
+        // Use the latest applied_idx to construct the snapshot.
+        let applied_idx = self.raft_state.hard_state.commit;
+        let term = self.raft_state.hard_state.term;
+
+        let meta = &mut self.snapshot_metadata;
+
+        meta.index = applied_idx;
+        meta.term = term;
+        meta.set_conf_state(self.raft_state.conf_state.clone());
+
+        self.sync_snapshot_metadata().await;
+    }
+
+    pub async fn sync_snapshot_metadata(&mut self) {
+        self.engine
+            .set_snapshot_metadata(&self.snapshot_metadata)
+            .await;
     }
 }
 

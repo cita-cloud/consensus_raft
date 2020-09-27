@@ -471,10 +471,14 @@ impl Peer {
             }
             if let Some(last_committed) = committed_entries.last() {
                 let store = self.raft.mut_store();
+
                 store.core.mut_hard_state().commit = last_committed.index;
                 store.core.mut_hard_state().term = last_committed.term;
                 store.core.sync_hard_state().await;
+
                 store.core.set_applied_index(last_committed.index).await;
+
+                store.core.update_snapshot_metadata().await;
             }
         }
         self.raft.advance(ready);
