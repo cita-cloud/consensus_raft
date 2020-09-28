@@ -14,6 +14,7 @@ use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use std::path::Path;
 
 pub struct RaftStorageCore {
     raft_state: RaftState,
@@ -27,8 +28,8 @@ pub struct RaftStorageCore {
 }
 
 impl RaftStorageCore {
-    pub async fn new() -> Self {
-        let mut engine = StorageEngine::new().await;
+    pub async fn new<P: AsRef<Path>>(data_dir: P) -> Self {
+        let mut engine = StorageEngine::new(data_dir).await;
         let raft_state = engine.get_raft_state().await;
         let applied_index = engine.get_applied_index().await;
         let snapshot_metadata = engine.get_snapshot_metadata().await;
@@ -160,9 +161,9 @@ pub struct RaftStorage {
 }
 
 impl RaftStorage {
-    pub async fn new() -> Self {
+    pub async fn new<P: AsRef<Path>>(data_dir: P) -> Self {
         Self {
-            core: RaftStorageCore::new().await,
+            core: RaftStorageCore::new(data_dir).await,
         }
     }
 }
@@ -224,11 +225,12 @@ impl Storage for RaftStorage {
 
     fn snapshot(&self, request_index: u64) -> Result<Snapshot> {
         let core = &self.core;
-        let mut snap = core.snapshot();
+        let snap = core.snapshot();
         if snap.get_metadata().index < request_index {
-            snap.mut_metadata().index = request_index;
+            Err(Error::Store(StorageError::SnapshotTemporarilyUnavailable))
+        } else {
+            Ok(snap)
         }
-        Ok(snap)
     }
 }
 
@@ -241,14 +243,21 @@ pub struct StorageEngine {
 }
 
 impl StorageEngine {
-    pub async fn new() -> Self {
+    pub async fn new<P: AsRef<Path>>(data_dir: P) -> Self {
+        let data_dir: &Path = data_dir.as_ref();
+        let hard_state_path = data_dir.join("hard_state.data");
+        let conf_state_path = data_dir.join("conf_state.data");
+        let applied_index_path = data_dir.join("applied_index.data");
+        let snapshot_metadata_path = data_dir.join("snapshot_metadata.data");
+        let entry_path = data_dir.join("entry.data");
+
         let mut opts = fs::OpenOptions::new();
         let opts = opts.read(true).write(true).create(true);
-        let hard_state_file = opts.open("hard_state.data").await.unwrap();
-        let applied_index_file = opts.open("applied_index.data").await.unwrap();
-        let conf_state_file = opts.open("conf_state.data").await.unwrap();
-        let snapshot_metadata_file = opts.open("snapshot_metadata.data").await.unwrap();
-        let entry_file = opts.append(true).open("entry.data").await.unwrap();
+        let hard_state_file = opts.open(hard_state_path).await.unwrap();
+        let conf_state_file = opts.open(conf_state_path).await.unwrap();
+        let applied_index_file = opts.open(applied_index_path).await.unwrap();
+        let snapshot_metadata_file = opts.open(snapshot_metadata_path).await.unwrap();
+        let entry_file = opts.append(true).open(entry_path).await.unwrap();
         Self {
             hard_state_file,
             conf_state_file,
@@ -298,9 +307,11 @@ impl StorageEngine {
     pub async fn get_entries(&mut self) -> Vec<Entry> {
         let mut buf = vec![];
         let mut entries = vec![];
-        while let Ok(n) = self.entry_file.read_u64().await {
+        let f = &mut self.entry_file;
+        f.seek(SeekFrom::Start(0)).await.unwrap();
+        while let Ok(n) = f.read_u64().await {
             buf.resize_with(n as usize, Default::default);
-            self.entry_file.read_exact(&mut buf[..]).await.unwrap();
+            f.read_exact(&mut buf[..]).await.unwrap();
             let entry = protobuf::parse_from_bytes(&buf[..]).unwrap();
             entries.push(entry);
         }
@@ -382,4 +393,65 @@ fn limit_size<T: Message + Clone>(entries: &mut Vec<T>, max: Option<u64>) {
         .count();
 
     entries.truncate(limit);
+}
+
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_store_engine() {
+        let temp_dir = std::env::temp_dir();
+        let test_dir = temp_dir.join("CITA-CLOUD-RAFT-TEST");
+        let mut engine = StorageEngine::new(test_dir).await;
+        {
+            let len = engine.get_entries().await.len();
+            let ent = Entry::default();
+            engine.append(&ent).await;
+            assert_eq!(engine.get_entries().await.len(), len + 1);
+        }
+        {
+            let mut cs = ConfState::default();
+            cs.mut_voters().push(20209281816);
+            engine.set_conf_state(&cs).await;
+
+            let raft_state = engine.get_raft_state().await;
+            assert!(
+                raft_state.conf_state.voters
+                    .iter()
+                    .find(|&v| v == &20209281816)
+                    .is_some()
+            );
+        }
+        {
+            let mut hs = HardState::default();
+            hs.term = 1;
+            hs.vote = 2;
+            hs.commit = 3;
+            engine.set_hard_state(&hs).await;
+
+            let raft_state = engine.get_raft_state().await;
+            let hard_state = raft_state.hard_state;
+            assert_eq!(hard_state.term, 1);
+            assert_eq!(hard_state.vote, 2);
+            assert_eq!(hard_state.commit, 3);
+        }
+        {
+            use protobuf::SingularPtrField;
+
+            let mut meta = SnapshotMetadata::default();
+            meta.index = 4;
+            meta.term = 5;
+            let mut cs = ConfState::default();
+            cs.mut_learners().push(20209281824);
+            meta.conf_state = SingularPtrField::some(cs.clone());
+            engine.set_snapshot_metadata(&meta).await;
+
+            let neta = engine.get_snapshot_metadata().await;
+            assert_eq!(neta.index, 4);
+            assert_eq!(neta.term, 5);
+            assert_eq!(neta.conf_state.unwrap(), cs);
+        }
+    }
 }
