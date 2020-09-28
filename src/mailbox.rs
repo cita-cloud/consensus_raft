@@ -445,3 +445,153 @@ impl<T: Letter> Mailbox<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Letty {
+        to: u32,
+        from: u32,
+    }
+
+    impl Letter for Letty {
+        type Address = u32;
+        type ReadError = ();
+
+        fn to(&self) -> Option<Self::Address> {
+            if self.to > 0 {
+                Some(self.to)
+            } else {
+                None
+            }
+        }
+
+        fn from(&self) -> Self::Address {
+            self.from
+        }
+
+        fn write_down(&self) -> Vec<u8> {
+            [self.to.to_be_bytes(), self.from.to_be_bytes()].concat()
+        }
+
+        fn read_from(paper: &[u8]) -> Result<Self, Self::ReadError> {
+            use std::convert::TryInto;
+            if paper.len() != 8 {
+                Err(())
+            } else {
+                let to = u32::from_be_bytes(paper[..4].try_into().unwrap());
+                let from = u32::from_be_bytes(paper[4..8].try_into().unwrap());
+                Ok(Self { to, from })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mail_control() {
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let control = MailboxControl { mail_put: tx };
+
+        let handle = tokio::spawn(async move {
+            while let Some(m) = rx.recv().await {
+                match m {
+                    Mail::ToMe {
+                        origin,
+                        mail: MyMail::Normal { msg, reply_tx },
+                    } => {
+                        assert_eq!(origin, 0);
+                        assert_eq!(msg, Letty { to: 1024, from: 42 });
+                        reply_tx.send(Ok(())).unwrap();
+                    }
+                    Mail::ToController(ControllerMail::GetProposal { reply_tx }) => {
+                        reply_tx
+                            .send(Ok(b"The quick brown fox jumps over the lazy dog"[..].into()))
+                            .unwrap();
+                    }
+                    Mail::ToController(ControllerMail::CheckProposal { proposal, reply_tx }) => {
+                        assert_eq!(proposal, b"hello world");
+                        reply_tx.send(Ok(true)).unwrap();
+                    }
+                    Mail::ToController(ControllerMail::CommitBlock { pwp, reply_tx }) => {
+                        assert!(!pwp.proposal.is_empty());
+                        assert!(!pwp.proof.is_empty());
+                        reply_tx.send(Ok(())).unwrap();
+                    }
+                    Mail::ToNetwork(NetworkMail::GetNetworkStatus { reply_tx }) => {
+                        reply_tx.send(Ok(42)).unwrap();
+                    }
+                    Mail::ToNetwork(NetworkMail::SendMessage {
+                        session_id,
+                        msg,
+                        reply_tx,
+                    }) => {
+                        assert_eq!(session_id, None);
+                        assert_eq!(
+                            msg,
+                            Letty {
+                                to: 12345,
+                                from: 54321
+                            }
+                        );
+                        reply_tx.send(Ok(())).unwrap();
+                    }
+                    Mail::ToNetwork(NetworkMail::BroadcastMessage { msg, reply_tx }) => {
+                        assert_eq!(
+                            msg,
+                            Letty {
+                                to: 12345,
+                                from: 54321
+                            }
+                        );
+                        reply_tx.send(Ok(())).unwrap();
+                    }
+                }
+            }
+        });
+
+        control
+            .put_mail(0, Letty { to: 1024, from: 42 })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            control.get_proposal().await.unwrap(),
+            &b"The quick brown fox jumps over the lazy dog"[..],
+        );
+        assert_eq!(control.get_network_status().await.unwrap(), 42);
+        assert_eq!(
+            control
+                .check_proposal(b"hello world"[..].into())
+                .await
+                .unwrap(),
+            true,
+        );
+        control.commit_block(
+            ProposalWithProof {
+                proposal:
+                    b"No three positive integers a, b, and c satisfy the equation a^n + b^n = c^n (for n > 2)"[..].into(),
+                proof:
+                    b"I have discovered a truly marvelous proof of this, which this margin is too narrow to contain."[..].into(),
+            }
+        ).await.unwrap();
+
+        control
+            .send_message(Letty {
+                to: 12345,
+                from: 54321,
+            })
+            .await
+            .unwrap();
+        control
+            .broadcast_message(Letty {
+                to: 12345,
+                from: 54321,
+            })
+            .await
+            .unwrap();
+        drop(control);
+        handle.await.unwrap();
+    }
+}

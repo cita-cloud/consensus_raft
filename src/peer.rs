@@ -127,7 +127,7 @@ impl Peer {
     ) -> Self {
         let logger = logger.new(o!("tag" => format!("peer_{}", id)));
 
-        let mut storage = RaftStorage::new().await;
+        let mut storage = RaftStorage::new(std::env::current_dir().unwrap()).await;
         // This step is according to the example in raft-rs to initialize the leader.
         if id == init_leader_id && !storage.core.is_initialized() {
             let mut s = Snapshot::default();
