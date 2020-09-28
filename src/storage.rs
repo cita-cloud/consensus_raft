@@ -10,11 +10,11 @@ use raft::Result;
 use raft::Storage;
 use raft::StorageError;
 use std::io::SeekFrom;
+use std::path::Path;
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-use std::path::Path;
 
 pub struct RaftStorageCore {
     raft_state: RaftState,
@@ -395,7 +395,6 @@ fn limit_size<T: Message + Clone>(entries: &mut Vec<T>, max: Option<u64>) {
     entries.truncate(limit);
 }
 
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -417,12 +416,12 @@ mod test {
             engine.set_conf_state(&cs).await;
 
             let raft_state = engine.get_raft_state().await;
-            assert!(
-                raft_state.conf_state.voters
-                    .iter()
-                    .find(|&v| v == &20209281816)
-                    .is_some()
-            );
+            assert!(raft_state
+                .conf_state
+                .voters
+                .iter()
+                .find(|&v| v == &20209281816)
+                .is_some());
         }
         {
             let mut hs = HardState::default();
