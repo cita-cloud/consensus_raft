@@ -1,0 +1,19 @@
+language: rust
+
+rust:
+  - stable
+  - nightly
+
+env:
+  global:
+    - RUST_BACKTRACE=1
+    - RUSTFLAGS="-D warnings"
+
+install:
+  - if [[ $TRAVIS_RUST_VERSION == "stable"]]; then rustup component add rustfmt; fi
+  - if [[ $TRAVIS_RUST_VERSION == "stable"]]; then rustup component add clippy; fi
+
+script:
+  - if [[ $TRAVIS_RUST_VERSION == "stable"]]; then cargo fmt --all -- --check; fi
+  - if [[ $TRAVIS_RUST_VERSION == "stable"]]; then cargo clippy --all --all-targets -- -D clippy::all; fi
+  - cargo test --all -- --nocapture
