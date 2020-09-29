@@ -32,17 +32,34 @@ mod tests {
     use super::RaftConfig;
 
     #[test]
-    fn test_basic() {
-        let toml_str = r#"
-        node_id = 1
-        network_port = 50000
-        controller_port = 50005
-        "#;
+    fn test_read_raft_config() {
+        {
+            let toml_str = r#"
+            node_id = 1
+            network_port = 50000
+            controller_port = 50005
+            "#;
 
-        let config = RaftConfig::new(toml_str);
+            let config = RaftConfig::new(toml_str);
 
-        assert_eq!(config.node_id, 1);
-        assert_eq!(config.network_port, 50000);
-        assert_eq!(config.controller_port, 50005);
+            assert_eq!(config.node_id, 1);
+            assert_eq!(config.network_port, 50000);
+            assert_eq!(config.controller_port, 50005);
+        }
+        {
+            // raft-rs treats 0 as invalid id,
+            // but we allow it here, and +1 when pass it to raft.
+            let toml_str = r#"
+            node_id = 0
+            network_port = 50000
+            controller_port = 50005
+            "#;
+
+            let config = RaftConfig::new(toml_str);
+
+            assert_eq!(config.node_id, 0);
+            assert_eq!(config.network_port, 50000);
+            assert_eq!(config.controller_port, 50005);
+        }
     }
 }
