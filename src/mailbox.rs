@@ -1,5 +1,5 @@
-use slog::info;
 use slog::debug;
+use slog::info;
 use slog::warn;
 use slog::Logger;
 use std::collections::HashMap;

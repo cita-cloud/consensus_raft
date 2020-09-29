@@ -8,9 +8,9 @@ use raft::prelude::Snapshot;
 use raft::StateRole;
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
-use std::path::Path;
 use tokio::sync::mpsc;
 use tokio::time;
 
@@ -117,6 +117,8 @@ pub struct Peer {
 }
 
 impl Peer {
+    // TODO: reduce arguments.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         id: u64,
         consensus_config: ConsensusConfiguration,
@@ -575,49 +577,48 @@ impl<T: Letter> ConsensusService for RaftService<T> {
     }
 }
 
-
 #[cfg(test)]
 mod test {
     use super::*;
     #[tokio::test]
     async fn test_peer_control() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let control = PeerControl{ id: 1, msg_tx: tx };
+        let control = PeerControl { id: 1, msg_tx: tx };
 
         let handle = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 match msg {
-                    PeerMsg::Control(ControlMsg::AddNode{ node_id: 666 })
-                     | PeerMsg::Control(ControlMsg::RemoveNode{ node_id: 666 })
-                        => continue,
-                    PeerMsg::Control(ControlMsg::GetNodeList{ reply_tx }) => {
+                    PeerMsg::Control(ControlMsg::AddNode { node_id: 666 })
+                    | PeerMsg::Control(ControlMsg::RemoveNode { node_id: 666 }) => continue,
+                    PeerMsg::Control(ControlMsg::GetNodeList { reply_tx }) => {
                         reply_tx.send(vec![20, 20, 9, 29]).unwrap();
                     }
-                    PeerMsg::Control(ControlMsg::ApplySnapshot{ snapshot }) => {
+                    PeerMsg::Control(ControlMsg::ApplySnapshot { snapshot }) => {
                         assert_eq!(snapshot, Snapshot::default());
                     }
-                    PeerMsg::Control(ControlMsg::Propose{ hash }) => {
+                    PeerMsg::Control(ControlMsg::Propose { hash }) => {
                         assert_eq!(&hash[..], b"Akari!");
                     }
                     PeerMsg::Control(ControlMsg::Campaign) => continue,
-                    PeerMsg::Control(ControlMsg::IsLeader{ reply_tx }) => {
+                    PeerMsg::Control(ControlMsg::IsLeader { reply_tx }) => {
                         reply_tx.send(true).unwrap();
                     }
-                    PeerMsg::Control(ControlMsg::GetBlockInterval{ reply_tx }) => {
+                    PeerMsg::Control(ControlMsg::GetBlockInterval { reply_tx }) => {
                         reply_tx.send(6).unwrap();
                     }
-                    PeerMsg::Control(
-                        ControlMsg::CheckBlock{
-                            pwp: ProposalWithProof{ proposal, proof },
-                            reply_tx,
-                        }
-                    ) => {
-                        assert_eq!(&proposal[..], &b"For any integer n > 2, exists prime p, q that n = p + q"[..]);
+                    PeerMsg::Control(ControlMsg::CheckBlock {
+                        pwp: ProposalWithProof { proposal, proof },
+                        reply_tx,
+                    }) => {
+                        assert_eq!(
+                            &proposal[..],
+                            &b"For any integer n > 2, exists prime p, q that n = p + q"[..]
+                        );
                         assert_eq!(&proof[..], &b"I think it's obivious."[..]);
                         reply_tx.send(true).unwrap();
                     }
-                    PeerMsg::Control(ControlMsg::SetConsensusConfig{ config, reply_tx }) => {
-                        let ConsensusConfiguration{
+                    PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
+                        let ConsensusConfiguration {
                             block_interval,
                             validators,
                         } = config;
@@ -627,7 +628,6 @@ mod test {
                     }
                     msg => panic!("unexpected msg: `{:?}`", msg),
                 }
-
             }
         });
 
@@ -639,10 +639,14 @@ mod test {
         control.campaign();
         assert!(control.is_leader().await);
         assert_eq!(control.get_block_interval().await, 6);
-        assert!(control.check_block(ProposalWithProof{
-            proposal: b"For any integer n > 2, exists prime p, q that n = p + q"[..].into(),
-            proof: b"I think it's obivious."[..].into()
-        }).await);
+        assert!(
+            control
+                .check_block(ProposalWithProof {
+                    proposal: b"For any integer n > 2, exists prime p, q that n = p + q"[..].into(),
+                    proof: b"I think it's obivious."[..].into()
+                })
+                .await
+        );
         let config = ConsensusConfiguration {
             block_interval: 6,
             validators: vec![vec![1, 2, 3]],

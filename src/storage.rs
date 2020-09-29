@@ -268,9 +268,11 @@ impl StorageEngine {
     }
 
     async fn get_raft_state(&mut self) -> RaftState {
+        let hard_state = self.get_hard_state().await;
+        let conf_state = self.get_conf_state().await;
         RaftState {
-            hard_state: self.get_hard_state().await,
-            conf_state: self.get_conf_state().await,
+            hard_state,
+            conf_state,
         }
     }
 
@@ -401,9 +403,10 @@ mod test {
 
     #[tokio::test]
     async fn test_store_engine() {
-        let temp_dir = std::env::temp_dir();
-        let test_dir = temp_dir.join("CITA-CLOUD-RAFT-TEST");
-        let mut engine = StorageEngine::new(test_dir).await;
+        let temp_dir = std::env::current_dir().unwrap();
+        let test_dir = temp_dir.join(".CITA-CLOUD-RAFT-TEST");
+        fs::create_dir(&test_dir).await.unwrap();
+        let mut engine = StorageEngine::new(&test_dir).await;
         {
             let len = engine.get_entries().await.len();
             let ent = Entry::default();
@@ -420,8 +423,7 @@ mod test {
                 .conf_state
                 .voters
                 .iter()
-                .find(|&v| v == &20209281816)
-                .is_some());
+                .any(|&v| v == 20209281816));
         }
         {
             let mut hs = HardState::default();
@@ -452,5 +454,6 @@ mod test {
             assert_eq!(neta.term, 5);
             assert_eq!(neta.conf_state.unwrap(), cs);
         }
+        fs::remove_dir_all(test_dir).await.unwrap();
     }
 }
