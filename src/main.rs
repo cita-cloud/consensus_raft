@@ -191,6 +191,7 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
         block_interval: 6,
         validators: vec![],
     };
+    let data_dir = std::env::current_dir()?;
     let mut peer = peer::Peer::new(
         node_id,
         config,
@@ -198,6 +199,7 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
         msg_rx,
         mailbox_control.clone(),
         init_leader_id,
+        data_dir,
         logger.clone(),
     )
     .await;

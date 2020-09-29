@@ -10,6 +10,7 @@ use raft::StateRole;
 use std::collections::HashSet;
 use std::time::Duration;
 use std::time::Instant;
+use std::path::Path;
 use tokio::sync::mpsc;
 use tokio::time;
 
@@ -28,14 +29,13 @@ use crate::mailbox::Letter;
 use crate::mailbox::MailboxControl;
 use crate::storage::RaftStorage;
 
+// Unified msg
 #[derive(Debug, Clone)]
 pub enum PeerMsg {
     // Local message to control this peer.
     Control(ControlMsg),
     // Raft message to and from peers.
     Normal(RaftMsg),
-    #[allow(unused)]
-    CheckedAppend(RaftMsg), // Checked MsgAppend
 }
 
 impl Letter for PeerMsg {
@@ -45,21 +45,21 @@ impl Letter for PeerMsg {
     fn to(&self) -> Option<Self::Address> {
         match self {
             PeerMsg::Normal(raft_msg) => Some(raft_msg.to),
-            PeerMsg::Control(_) | PeerMsg::CheckedAppend(_) => panic!("attempt to send local msg"),
+            PeerMsg::Control(_) => panic!("attempt to send local msg"),
         }
     }
 
     fn from(&self) -> Self::Address {
         match self {
             PeerMsg::Normal(raft_msg) => raft_msg.from,
-            PeerMsg::Control(_) | PeerMsg::CheckedAppend(_) => panic!("attempt to send local msg"),
+            PeerMsg::Control(_) => panic!("attempt to send local msg"),
         }
     }
 
     fn write_down(&self) -> Vec<u8> {
         match self {
             PeerMsg::Normal(raft_msg) => raft_msg.write_to_bytes().unwrap(),
-            PeerMsg::Control(_) | PeerMsg::CheckedAppend(_) => panic!("attempt to send local msg"),
+            PeerMsg::Control(_) => panic!("attempt to send local msg"),
         }
     }
 
@@ -68,7 +68,8 @@ impl Letter for PeerMsg {
     }
 }
 
-// Use mpsc channel instead of oneshot since it requires Clone.
+// Control msg to interact with the peer.
+// Use mpsc channel for `reply_tx` instead of oneshot since it requires Clone.
 #[derive(Debug, Clone)]
 pub enum ControlMsg {
     Propose {
@@ -123,11 +124,12 @@ impl Peer {
         msg_rx: mpsc::UnboundedReceiver<PeerMsg>,
         mailbox_control: MailboxControl<PeerMsg>,
         init_leader_id: u64,
+        data_dir: impl AsRef<Path>,
         logger: Logger,
     ) -> Self {
         let logger = logger.new(o!("tag" => format!("peer_{}", id)));
 
-        let mut storage = RaftStorage::new(std::env::current_dir().unwrap()).await;
+        let mut storage = RaftStorage::new(data_dir).await;
         // This step is according to the example in raft-rs to initialize the leader.
         if id == init_leader_id && !storage.core.is_initialized() {
             let mut s = Snapshot::default();
@@ -288,45 +290,7 @@ impl Peer {
             PeerMsg::Control(ControlMsg::Tick) => {
                 self.raft.tick();
             }
-            // Checked MsgAppend msg, steps it directly.
-            PeerMsg::CheckedAppend(raft_msg) => {
-                trace!(self.logger, "stepping verified MsgAppend"; "entries" => ?raft_msg.entries);
-                if let Err(e) = self.raft.step(raft_msg) {
-                    warn!(self.logger, "raft step verified msg failed: `{}`", e);
-                }
-            }
             PeerMsg::Normal(raft_msg) => {
-                // // If the msg is to append entries, check it first.
-                // if let MessageType::MsgAppend = raft_msg.msg_type {
-                //     let msg_tx = self.msg_tx.clone();
-                //     let mailbox_control = self.mailbox_control.clone();
-                //     let logger = self.logger.clone();
-                //     tokio::spawn(async move {
-                //         let mut is_ok = true;
-                //         for ent in raft_msg.entries.iter() {
-                //             // Ignore empty entries.
-                //             if !ent.data.is_empty() {
-                //                 if let EntryType::EntryNormal = ent.entry_type {
-                //                     if let Ok(false) | Err(_) =
-                //                         mailbox_control.check_proposal(ent.data.clone()).await
-                //                     {
-                //                         warn!(logger, "check_proposal failed: `{:?}`", &ent.data);
-                //                         is_ok = false;
-                //                         break;
-                //                     }
-                //                 }
-                //             }
-                //         }
-                //         // Send the msg back to raft if all of its entries passes the check.
-                //         if is_ok {
-                //             let msg = PeerMsg::CheckedAppend(raft_msg);
-                //             msg_tx.send(msg).unwrap();
-                //         }
-                //     });
-                // } else if let Err(e) = self.raft.step(raft_msg) {
-                //     warn!(self.logger, "raft step failed: `{}`", e);
-                // }
-
                 // We don't check appending entires here, leaving the problem to commit_block.
                 if let Err(e) = self.raft.step(raft_msg) {
                     warn!(self.logger, "raft step failed: `{}`", e);
@@ -376,6 +340,7 @@ impl Peer {
         }
     }
 
+    // Tick raft's logical clock.
     async fn pacemaker(msg_tx: mpsc::UnboundedSender<PeerMsg>) {
         let pace = Duration::from_millis(200);
         let mut ticker = time::interval(pace);
@@ -607,5 +572,83 @@ impl<T: Letter> ConsensusService for RaftService<T> {
         let is_success = self.peer_control.check_block(pwp).await;
         let reply = SimpleResponse { is_success };
         Ok(tonic::Response::new(reply))
+    }
+}
+
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[tokio::test]
+    async fn test_peer_control() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let control = PeerControl{ id: 1, msg_tx: tx };
+
+        let handle = tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    PeerMsg::Control(ControlMsg::AddNode{ node_id: 666 })
+                     | PeerMsg::Control(ControlMsg::RemoveNode{ node_id: 666 })
+                        => continue,
+                    PeerMsg::Control(ControlMsg::GetNodeList{ reply_tx }) => {
+                        reply_tx.send(vec![20, 20, 9, 29]).unwrap();
+                    }
+                    PeerMsg::Control(ControlMsg::ApplySnapshot{ snapshot }) => {
+                        assert_eq!(snapshot, Snapshot::default());
+                    }
+                    PeerMsg::Control(ControlMsg::Propose{ hash }) => {
+                        assert_eq!(&hash[..], b"Akari!");
+                    }
+                    PeerMsg::Control(ControlMsg::Campaign) => continue,
+                    PeerMsg::Control(ControlMsg::IsLeader{ reply_tx }) => {
+                        reply_tx.send(true).unwrap();
+                    }
+                    PeerMsg::Control(ControlMsg::GetBlockInterval{ reply_tx }) => {
+                        reply_tx.send(6).unwrap();
+                    }
+                    PeerMsg::Control(
+                        ControlMsg::CheckBlock{
+                            pwp: ProposalWithProof{ proposal, proof },
+                            reply_tx,
+                        }
+                    ) => {
+                        assert_eq!(&proposal[..], &b"For any integer n > 2, exists prime p, q that n = p + q"[..]);
+                        assert_eq!(&proof[..], &b"I think it's obivious."[..]);
+                        reply_tx.send(true).unwrap();
+                    }
+                    PeerMsg::Control(ControlMsg::SetConsensusConfig{ config, reply_tx }) => {
+                        let ConsensusConfiguration{
+                            block_interval,
+                            validators,
+                        } = config;
+                        assert_eq!(block_interval, 6);
+                        assert_eq!(validators, vec![vec![1, 2, 3]]);
+                        reply_tx.send(()).unwrap();
+                    }
+                    msg => panic!("unexpected msg: `{:?}`", msg),
+                }
+
+            }
+        });
+
+        control.add_node(666);
+        control.remove_node(666);
+        assert_eq!(control.get_node_list().await, vec![20, 20, 9, 29]);
+        control.apply_snapshot(Snapshot::default());
+        control.propose(b"Akari!"[..].into());
+        control.campaign();
+        assert!(control.is_leader().await);
+        assert_eq!(control.get_block_interval().await, 6);
+        assert!(control.check_block(ProposalWithProof{
+            proposal: b"For any integer n > 2, exists prime p, q that n = p + q"[..].into(),
+            proof: b"I think it's obivious."[..].into()
+        }).await);
+        let config = ConsensusConfiguration {
+            block_interval: 6,
+            validators: vec![vec![1, 2, 3]],
+        };
+        control.set_consensus_config(config).await;
+        drop(control);
+        handle.await.unwrap();
     }
 }

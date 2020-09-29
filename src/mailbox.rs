@@ -1,5 +1,5 @@
 use slog::info;
-use slog::trace;
+use slog::debug;
 use slog::warn;
 use slog::Logger;
 use std::collections::HashMap;
@@ -264,8 +264,9 @@ impl<T: Letter> Mailbox<T> {
         for _ in 0..worker_num {
             let mail_queue = mail_queue.clone();
             let controller = controller.clone();
+            let logger = logger.clone();
             tokio::spawn(async move {
-                Self::handle_controller_mail(controller, mail_queue).await;
+                Self::handle_controller_mail(controller, mail_queue, logger).await;
             });
         }
         while let Some(mail) = controller_receiver.recv().await {
@@ -278,6 +279,7 @@ impl<T: Letter> Mailbox<T> {
     async fn handle_controller_mail(
         mut controller: ControllerClient,
         mail_queue: Arc<ArrayQueue<ControllerMail>>,
+        logger: Logger,
     ) {
         let mut interval = time::interval(Duration::from_millis(3));
         loop {
@@ -292,7 +294,9 @@ impl<T: Letter> Mailbox<T> {
                             .await
                             .map(|resp| resp.into_inner().hash)
                             .map_err(|e| e.into());
-                        let _ = reply_tx.send(response);
+                        if let Err(e) = reply_tx.send(response) {
+                            warn!(logger, "send `GetProposal` reply failed: `{:?}`", e);
+                        }
                     }
                     CheckProposal { proposal, reply_tx } => {
                         let request = tonic::Request::new(Hash { hash: proposal });
@@ -301,7 +305,9 @@ impl<T: Letter> Mailbox<T> {
                             .await
                             .map(|resp| resp.into_inner().is_success)
                             .map_err(|e| e.into());
-                        let _ = reply_tx.send(response);
+                        if let Err(e) = reply_tx.send(response) {
+                            warn!(logger, "send `CheckProposal` reply failed: `{:?}`", e);
+                        }
                     }
                     CommitBlock { pwp, reply_tx } => {
                         let request = tonic::Request::new(pwp);
@@ -310,7 +316,9 @@ impl<T: Letter> Mailbox<T> {
                             .await
                             .map(|_resp| ())
                             .map_err(|e| e.into());
-                        let _ = reply_tx.send(response);
+                        if let Err(e) = reply_tx.send(response) {
+                            warn!(logger, "send `CommitBlock` reply failed: `{:?}`", e);
+                        }
                     }
                 }
             }
@@ -359,7 +367,7 @@ impl<T: Letter> Mailbox<T> {
                             .map(|r| r.into_inner().peer_count)
                             .map_err(|e| e.into());
                         if let Err(e) = reply_tx.send(resp) {
-                            warn!(logger, "reply GetNetworkStatus failed: `{:?}`", e);
+                            warn!(logger, "send `GetNetworkStatus` reply failed: `{:?}`", e);
                         }
                     }
                     SendMessage {
@@ -379,7 +387,7 @@ impl<T: Letter> Mailbox<T> {
                             .map(|_resp| ())
                             .map_err(|e| e.into());
                         if let Err(e) = reply_tx.send(resp) {
-                            warn!(logger, "reply SendMessage failed: `{:?}`", e);
+                            warn!(logger, "send `SendMessage` reply failed: `{:?}`", e);
                         }
                     }
                     SendMessage {
@@ -402,7 +410,7 @@ impl<T: Letter> Mailbox<T> {
                         if let Err(e) = reply_tx.send(resp) {
                             warn!(
                                 logger,
-                                "reply non-dest SendMessage or BroadcastMessage failed: `{:?}`", e
+                                "send `SendMessageWithoutSessionId` or `BroadcastMessage` reply failed: `{:?}`", e
                             );
                         }
                     }
@@ -421,10 +429,10 @@ impl<T: Letter> Mailbox<T> {
             match Consensus2ControllerServiceClient::connect(controller_addr.clone()).await {
                 Ok(client) => return client,
                 Err(e) => {
-                    trace!(logger, "connect to controller failed: `{}`", e);
+                    debug!(logger, "connect to controller failed: `{}`", e);
                 }
             }
-            trace!(logger, "Retrying to connect controller");
+            debug!(logger, "Retrying to connect controller");
         }
     }
 
@@ -438,10 +446,10 @@ impl<T: Letter> Mailbox<T> {
             match NetworkServiceClient::connect(network_addr.clone()).await {
                 Ok(client) => return client,
                 Err(e) => {
-                    trace!(logger, "connect to network failed: `{}`", e);
+                    debug!(logger, "connect to network failed: `{}`", e);
                 }
             }
-            trace!(logger, "Retrying to connect network");
+            debug!(logger, "Retrying to connect network");
         }
     }
 }
