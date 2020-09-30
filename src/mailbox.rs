@@ -234,6 +234,7 @@ impl<T: Letter> Mailbox<T> {
                     let from = msg.from();
                     let to = msg.to();
                     if to.is_none() || to.as_ref() == Some(&self.local_addr) {
+                        // Record the mapping from logical addr to the network addr
                         self.mailbook.insert(from, origin);
                         self.send_to.send(msg)?;
                     }
@@ -251,6 +252,8 @@ impl<T: Letter> Mailbox<T> {
                     let to = msg.to();
                     assert!(to.is_some(), "Mail dest must exist. To broadcast, use NetworkMail::BroadcastMessage instead.");
                     let to = to.unwrap();
+                    // Get the network addr from the record.
+                    // If None, it will fall back to broadcast.
                     if let Some(&origin) = self.mailbook.get(&to) {
                         *session_id = Some(origin);
                     }
