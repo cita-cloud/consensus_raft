@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 mod config;
 mod mailbox;
 mod peer;
@@ -153,6 +154,7 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
     let network_port = config.network_port;
     let controller_port = config.controller_port;
 
+    // register `network_msg_handler` to the network.
     let grpc_port_clone = opts.grpc_port.clone();
     let logger_cloned = logger.clone();
     tokio::spawn(async move {
@@ -172,6 +174,7 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
         }
     });
 
+    // mailbox
     let addr_str = format!("127.0.0.1:{}", opts.grpc_port);
     let addr = addr_str.parse()?;
 
@@ -186,6 +189,7 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
     .await;
     let mailbox_control = mailbox.control();
 
+    // peer
     let init_leader_id = 1;
     let config = ConsensusConfiguration {
         block_interval: 6,
@@ -203,6 +207,8 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
         logger.clone(),
     )
     .await;
+
+    // run
     let peer_control = peer.control();
     let raft_service = peer.service();
 
