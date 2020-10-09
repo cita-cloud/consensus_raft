@@ -19,13 +19,14 @@ docker build -t citacloud/consensus_raft .
 
 ## Build your own consensus service
 
-Please check the [consensus.proto](https://github.com/cita-cloud/cita_cloud_proto/blob/master/protos/consensus.proto)
+Please check the [`ConsensusService`](https://github.com/cita-cloud/cita_cloud_proto/blob/master/protos/consensus.proto#L12)
+and [`Consensus2ControllerService`](https://github.com/cita-cloud/cita_cloud_proto/blob/master/protos/controller.proto#L53)
 in [cita_cloud_proto](https://github.com/cita-cloud/cita_cloud_proto)
 which defines the service that consensus should implement.
 
 To communicate with other peers, you need to:
 1. Implement the [`NetworkMsgHandlerService`](https://github.com/cita-cloud/cita_cloud_proto/blob/master/protos/network.proto#L39)
-which handles the message from peers.
+which handles the messages from peers.
 2. Register your service to the network by [`RegisterNetworkMsgHandler`](https://github.com/cita-cloud/cita_cloud_proto/blob/master/protos/network.proto#L35),
 which tells the network to forward the messages you are concerned about.
 
