@@ -6,9 +6,9 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1.0"
-clap = { git = "https://github.com/clap-rs/clap/" }
+clap = "3.0.0-beta.1"
 git-version = "0.3.4"
-cita_cloud_proto = { git = "https://github.com/cita-cloud/cita_cloud_proto" }
+cita_cloud_proto = { git = "https://github.com/cita-cloud/cita_cloud_proto", tag = "v0.1.0" }
 tonic = "0.2.0"
 prost = "0.6"
 bytes = "0.5"
