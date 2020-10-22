@@ -1,3 +1,17 @@
+// Copyright Rivtower Technologies LLC.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use raft::eraftpb::ConfChangeType;
 use raft::eraftpb::Message as RaftMsg;
 use raft::prelude::ConfChange;
@@ -29,7 +43,8 @@ use crate::mailbox::Letter;
 use crate::mailbox::MailboxControl;
 use crate::storage::RaftStorage;
 
-// Unified msg
+/// An unified msg type for both local control messages
+/// and raft internal messages. It's used by the mailbox.
 #[derive(Debug, Clone)]
 pub enum PeerMsg {
     // Local message to control this peer.
@@ -68,10 +83,10 @@ impl Letter for PeerMsg {
     }
 }
 
-// Control msg to interact with the peer.
-// Use mpsc channel for `reply_tx` instead of oneshot since it requires Clone.
+/// Control msg to interact with the peer.
 #[derive(Debug, Clone)]
 pub enum ControlMsg {
+    // Use mpsc channel for `reply_tx` instead of oneshot since we requires the msg to be Clone.
     Propose {
         hash: Vec<u8>,
     },
@@ -117,6 +132,15 @@ pub struct Peer {
 }
 
 impl Peer {
+    /// Arguments:
+    /// - id: current peer's id, can't be 0
+    /// - consensus_config: block interval and validators
+    /// - msg_tx: a sender that send msg to msg_rx
+    /// - msg_rx: a recevier that recv msg from msg_tx
+    /// - mailbox_control: handle the communication with controller, network, and other peers
+    /// - init_leader_id: the initial leader's id
+    /// - data_dir: a path to where the data is stored
+    /// - logger: slog's logger
     // TODO: reduce arguments.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -142,6 +166,7 @@ impl Peer {
             storage.core.apply_snapshot(s).await.unwrap();
         }
 
+        // Load applied index from stable storage.
         let applied = storage.core.applied_index();
         let cfg = Config {
             id,
@@ -241,12 +266,17 @@ impl Peer {
                     warn!(self.logger, "reply CheckBlock request failed: `{}`", e);
                 }
             }
+            // Changing config is to change:
+            //   1. block interval
+            //   2. membership of peers (For now, only adding node is supported)
             PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
                 trace!(self.logger, "change consensus config"; "new config" => ?config);
                 self.consensus_config = config.clone();
                 let voters = &self.raft.store().core.conf_state().voters;
+
                 let current_peer_count = voters.len() as u64;
                 let new_peer_count = config.validators.len() as u64;
+
                 let peer_control = self.control();
                 if current_peer_count < new_peer_count {
                     info!(
@@ -322,6 +352,8 @@ impl Peer {
         }
     }
 
+    // The current leader will get proposal
+    // from controller every block interval secs.
     async fn wait_proposal(service: RaftService<PeerMsg>, logger: Logger) {
         let d = Duration::from_secs(1);
         let mut ticker = time::interval(d);
@@ -352,12 +384,15 @@ impl Peer {
         }
     }
 
+    // Handle the ready state produced by raft.
     async fn handle_ready(&mut self) -> Result<()> {
         if !self.raft.has_ready() {
             return Ok(());
         }
         let mut ready = self.raft.ready();
         let store = self.raft.mut_store();
+
+        // Save raft states to stable storage.
 
         if !ready.snapshot().is_empty() {
             let s = ready.snapshot().clone();
@@ -376,6 +411,7 @@ impl Peer {
             store.core.set_hard_state(hs.clone()).await;
         }
 
+        // Send messages to other peers.
         let messages = ready.messages.drain(..).collect::<Vec<_>>();
         let mailbox_control = self.mailbox_control.clone();
         let logger_cloned = self.logger.clone();
@@ -388,6 +424,9 @@ impl Peer {
             }
         });
 
+        // Handle the committed entries:
+        // - executing config changes.
+        // - commit blocks to controller.
         if let Some(committed_entries) = ready.committed_entries.take() {
             for entry in &committed_entries {
                 if entry.data.is_empty() {
@@ -404,6 +443,7 @@ impl Peer {
                             tokio::spawn(async move {
                                 let pwp = ProposalWithProof {
                                     proposal,
+                                    // Empty proof for non-BFT consensus.
                                     proof: vec![],
                                 };
                                 let mut retry_interval = time::interval(Duration::from_secs(3));
@@ -436,6 +476,7 @@ impl Peer {
                     }
                 }
             }
+            // Save the committed state.
             if let Some(last_committed) = committed_entries.last() {
                 let store = self.raft.mut_store();
 
@@ -448,11 +489,13 @@ impl Peer {
                 store.core.update_snapshot_metadata().await;
             }
         }
+        // Tell the raft that this ready state has benn processed.
         self.raft.advance(ready);
         Ok(())
     }
 }
 
+// Helper to interact with peers.
 #[derive(Clone)]
 pub struct PeerControl {
     id: u64,

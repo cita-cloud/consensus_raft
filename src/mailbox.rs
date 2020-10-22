@@ -1,3 +1,17 @@
+// Copyright Rivtower Technologies LLC.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use slog::debug;
 use slog::info;
 use slog::warn;
@@ -220,6 +234,7 @@ impl<T: Letter> Mailbox<T> {
                     let from = msg.from();
                     let to = msg.to();
                     if to.is_none() || to.as_ref() == Some(&self.local_addr) {
+                        // Record the mapping from logical addr to the network addr
                         self.mailbook.insert(from, origin);
                         self.send_to.send(msg)?;
                     }
@@ -237,6 +252,8 @@ impl<T: Letter> Mailbox<T> {
                     let to = msg.to();
                     assert!(to.is_some(), "Mail dest must exist. To broadcast, use NetworkMail::BroadcastMessage instead.");
                     let to = to.unwrap();
+                    // Get the network addr from the record.
+                    // If None, it will fall back to broadcast.
                     if let Some(&origin) = self.mailbook.get(&to) {
                         *session_id = Some(origin);
                     }
@@ -247,6 +264,7 @@ impl<T: Letter> Mailbox<T> {
         Ok(())
     }
 
+    /// Get `MailboxControl`.
     pub fn control(&self) -> MailboxControl<T> {
         MailboxControl {
             mail_put: self.mail_put.clone(),
@@ -419,6 +437,7 @@ impl<T: Letter> Mailbox<T> {
         }
     }
 
+    // Connect to the controller. Retry on failure.
     async fn connect_controller(controller_port: u16, logger: Logger) -> ControllerClient {
         let d = Duration::from_secs(1);
         let mut interval = time::interval(d);
@@ -436,6 +455,7 @@ impl<T: Letter> Mailbox<T> {
         }
     }
 
+    // Connect to the network. Retry on failure.
     async fn connect_network(network_port: u16, logger: Logger) -> NetworkClient {
         let d = Duration::from_secs(1);
         let mut interval = time::interval(d);
