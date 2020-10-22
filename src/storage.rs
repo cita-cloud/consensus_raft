@@ -232,7 +232,6 @@ impl Storage for RaftStorage {
         Ok(self.core.first_index())
     }
 
-    /// Implements the Storage trait.
     fn last_index(&self) -> Result<u64> {
         Ok(self.core.last_index())
     }

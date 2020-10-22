@@ -24,6 +24,15 @@ and [`Consensus2ControllerService`](https://github.com/cita-cloud/cita_cloud_pro
 in [cita_cloud_proto](https://github.com/cita-cloud/cita_cloud_proto)
 which defines the service that consensus should implement.
 
+The main workflow for consensus service is as follow:
+1. Get proposal either from the local controller or from other remote consensus peers.
+2. If the proposal comes from peers, ask the local controller to check it first.
+3. Achieve consensus over the given proposal.
+4. Commit the proposal with its proof to the local controller.
+
+The proof, for example, is the nonce for POW consensus, and is empty for non-byzantine consensus like this raft implementation.
+It will be used later by peers' controller to validate the corresponding block when they sync the missing blocks from others.
+
 To communicate with other peers, you need to:
 1. Implement the [`NetworkMsgHandlerService`](https://github.com/cita-cloud/cita_cloud_proto/blob/master/protos/network.proto#L39)
 which handles the messages from peers.

@@ -264,6 +264,7 @@ impl<T: Letter> Mailbox<T> {
         Ok(())
     }
 
+    /// Get `MailboxControl`.
     pub fn control(&self) -> MailboxControl<T> {
         MailboxControl {
             mail_put: self.mail_put.clone(),
@@ -436,6 +437,7 @@ impl<T: Letter> Mailbox<T> {
         }
     }
 
+    // Connect to the controller. Retry on failure.
     async fn connect_controller(controller_port: u16, logger: Logger) -> ControllerClient {
         let d = Duration::from_secs(1);
         let mut interval = time::interval(d);
@@ -453,6 +455,7 @@ impl<T: Letter> Mailbox<T> {
         }
     }
 
+    // Connect to the network. Retry on failure.
     async fn connect_network(network_port: u16, logger: Logger) -> NetworkClient {
         let d = Duration::from_secs(1);
         let mut interval = time::interval(d);
