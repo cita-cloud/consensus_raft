@@ -79,7 +79,7 @@ impl Letter for PeerMsg {
     }
 
     fn read_from(paper: &[u8]) -> std::result::Result<Self, Self::ReadError> {
-        Ok(PeerMsg::Normal(protobuf::parse_from_bytes(paper)?))
+        Ok(PeerMsg::Normal(RaftMsg::parse_from_bytes(paper)?))
     }
 }
 
@@ -226,17 +226,21 @@ impl Peer {
                 }
             }
             PeerMsg::Control(ControlMsg::AddNode { node_id }) => {
-                let mut cc = ConfChange::default();
-                cc.node_id = node_id;
-                cc.set_change_type(ConfChangeType::AddNode);
+                let cc = ConfChange {
+                    change_type: ConfChangeType::AddNode,
+                    node_id,
+                    ..Default::default()
+                };
                 if let Err(e) = self.raft.propose_conf_change(vec![], cc) {
                     warn!(self.logger, "add node failed: `{}`", e);
                 }
             }
             PeerMsg::Control(ControlMsg::RemoveNode { node_id }) => {
-                let mut cc = ConfChange::default();
-                cc.node_id = node_id;
-                cc.set_change_type(ConfChangeType::RemoveNode);
+                let cc = ConfChange {
+                    change_type: ConfChangeType::RemoveNode,
+                    node_id,
+                    ..Default::default()
+                };
                 if let Err(e) = self.raft.propose_conf_change(vec![], cc) {
                     warn!(self.logger, "remove node failed: `{}`", e);
                 }
@@ -412,14 +416,16 @@ impl Peer {
         }
 
         // Send messages to other peers.
-        let messages = ready.messages.drain(..).collect::<Vec<_>>();
+        let messages = ready.take_messages();
         let mailbox_control = self.mailbox_control.clone();
         let logger_cloned = self.logger.clone();
         tokio::spawn(async move {
-            for msg in messages {
-                let pm = PeerMsg::Normal(msg);
-                if let Err(e) = mailbox_control.send_message(pm).await {
-                    warn!(logger_cloned, "send msg failed: {}", e);
+            for vec_msg in messages {
+                for msg in vec_msg {
+                    let pm = PeerMsg::Normal(msg);
+                    if let Err(e) = mailbox_control.send_message(pm).await {
+                        warn!(logger_cloned, "send msg failed: {}", e);
+                    }
                 }
             }
         });
@@ -427,67 +433,66 @@ impl Peer {
         // Handle the committed entries:
         // - executing config changes.
         // - commit blocks to controller.
-        if let Some(committed_entries) = ready.committed_entries.take() {
-            for entry in &committed_entries {
-                if entry.data.is_empty() {
-                    continue;
-                }
-                match entry.get_entry_type() {
-                    EntryType::EntryNormal => {
-                        info!(self.logger, "commiting proposal"; "entry" => hex::encode(entry.data.clone()));
-                        let proposal = entry.data.clone();
-                        // Ignore any empty entries that may be produced by raft itself.
-                        if !proposal.is_empty() {
-                            let mailbox_control = self.mailbox_control.clone();
-                            let logger = self.logger.clone();
-                            tokio::spawn(async move {
-                                let pwp = ProposalWithProof {
-                                    proposal,
-                                    // Empty proof for non-BFT consensus.
-                                    proof: vec![],
-                                };
-                                let mut retry_interval = time::interval(Duration::from_secs(3));
-                                while let Err(e) = mailbox_control.commit_block(pwp.clone()).await {
-                                    retry_interval.tick().await;
-                                    warn!(logger, "commit block failed: `{:?}`", e);
-                                }
-                            });
-                        }
-                    }
-                    EntryType::EntryConfChange => {
-                        let mut cc = ConfChange::default();
-                        cc.merge_from_bytes(&entry.data)?;
-                        let cs = self.raft.apply_conf_change(&cc)?;
-                        self.raft.mut_store().core.set_conf_state(cs).await;
-                        match cc.change_type {
-                            ConfChangeType::AddNode => {
-                                info!(self.logger, "add node #{}", cc.node_id);
+        let committed_entries = ready.take_committed_entries();
+        for entry in &committed_entries {
+            if entry.data.is_empty() {
+                continue;
+            }
+            match entry.get_entry_type() {
+                EntryType::EntryNormal => {
+                    info!(self.logger, "commiting proposal"; "entry" => hex::encode(entry.data.clone()));
+                    let proposal = entry.data.clone();
+                    // Ignore any empty entries that may be produced by raft itself.
+                    if !proposal.is_empty() {
+                        let mailbox_control = self.mailbox_control.clone();
+                        let logger = self.logger.clone();
+                        tokio::spawn(async move {
+                            let pwp = ProposalWithProof {
+                                proposal,
+                                // Empty proof for non-BFT consensus.
+                                proof: vec![],
+                            };
+                            let mut retry_interval = time::interval(Duration::from_secs(3));
+                            while let Err(e) = mailbox_control.commit_block(pwp.clone()).await {
+                                retry_interval.tick().await;
+                                warn!(logger, "commit block failed: `{:?}`", e);
                             }
-                            ConfChangeType::RemoveNode => {
-                                info!(self.logger, "remove node #{}", cc.node_id);
-                            }
-                            ConfChangeType::AddLearnerNode => {
-                                warn!(self.logger, "AddLearnerNode unimplemented.")
-                            }
-                        }
-                    }
-                    EntryType::EntryConfChangeV2 => {
-                        warn!(self.logger, "ConfChangeV2 unimplemented.")
+                        });
                     }
                 }
+                EntryType::EntryConfChange => {
+                    let mut cc = ConfChange::default();
+                    cc.merge_from_bytes(&entry.data)?;
+                    let cs = self.raft.apply_conf_change(&cc)?;
+                    self.raft.mut_store().core.set_conf_state(cs).await;
+                    match cc.change_type {
+                        ConfChangeType::AddNode => {
+                            info!(self.logger, "add node #{}", cc.node_id);
+                        }
+                        ConfChangeType::RemoveNode => {
+                            info!(self.logger, "remove node #{}", cc.node_id);
+                        }
+                        ConfChangeType::AddLearnerNode => {
+                            warn!(self.logger, "AddLearnerNode unimplemented.")
+                        }
+                    }
+                }
+                EntryType::EntryConfChangeV2 => {
+                    warn!(self.logger, "ConfChangeV2 unimplemented.")
+                }
             }
-            // Save the committed state.
-            if let Some(last_committed) = committed_entries.last() {
-                let store = self.raft.mut_store();
+        }
+        // Save the committed state.
+        if let Some(last_committed) = committed_entries.last() {
+            let store = self.raft.mut_store();
 
-                store.core.mut_hard_state().commit = last_committed.index;
-                store.core.mut_hard_state().term = last_committed.term;
-                store.core.sync_hard_state().await;
+            store.core.mut_hard_state().commit = last_committed.index;
+            store.core.mut_hard_state().term = last_committed.term;
+            store.core.sync_hard_state().await;
 
-                store.core.set_applied_index(last_committed.index).await;
+            store.core.set_applied_index(last_committed.index).await;
 
-                store.core.update_snapshot_metadata().await;
-            }
+            store.core.update_snapshot_metadata().await;
         }
         // Tell the raft that this ready state has benn processed.
         self.raft.advance(ready);

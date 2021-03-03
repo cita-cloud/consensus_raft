@@ -302,7 +302,7 @@ impl<T: Letter> Mailbox<T> {
         let mut interval = time::interval(Duration::from_millis(3));
         loop {
             interval.tick().await;
-            while let Ok(mail) = mail_queue.pop() {
+            while let Some(mail) = mail_queue.pop() {
                 use ControllerMail::*;
                 match mail {
                     GetProposal { reply_tx } => {
@@ -374,7 +374,7 @@ impl<T: Letter> Mailbox<T> {
         let mut interval = time::interval(Duration::from_millis(3));
         loop {
             interval.tick().await;
-            while let Ok(mail) = network_mail_queue.pop() {
+            while let Some(mail) = network_mail_queue.pop() {
                 use NetworkMail::*;
                 match mail {
                     GetNetworkStatus { reply_tx } => {

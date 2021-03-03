@@ -28,6 +28,7 @@ use std::path::Path;
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncSeekExt;
 use tokio::io::AsyncWriteExt;
 
 pub struct RaftStorageCore {
@@ -311,7 +312,7 @@ impl StorageEngine {
         if buf.is_empty() {
             HardState::default()
         } else {
-            protobuf::parse_from_bytes(&buf[..]).unwrap()
+            HardState::parse_from_bytes(&buf[..]).unwrap()
         }
     }
 
@@ -323,7 +324,7 @@ impl StorageEngine {
         if buf.is_empty() {
             ConfState::default()
         } else {
-            protobuf::parse_from_bytes(&buf[..]).unwrap()
+            ConfState::parse_from_bytes(&buf[..]).unwrap()
         }
     }
 
@@ -341,7 +342,7 @@ impl StorageEngine {
         while let Ok(n) = f.read_u64().await {
             buf.resize_with(n as usize, Default::default);
             f.read_exact(&mut buf[..]).await.unwrap();
-            let entry = protobuf::parse_from_bytes(&buf[..]).unwrap();
+            let entry = Entry::parse_from_bytes(&buf[..]).unwrap();
             entries.push(entry);
         }
         entries
@@ -352,7 +353,7 @@ impl StorageEngine {
         let mut buf = vec![];
         f.seek(SeekFrom::Start(0)).await.unwrap();
         f.read_to_end(&mut buf).await.unwrap();
-        protobuf::parse_from_bytes(&buf[..]).unwrap()
+        SnapshotMetadata::parse_from_bytes(&buf[..]).unwrap()
     }
 
     pub async fn append(&mut self, entry: &Entry) {
@@ -453,10 +454,12 @@ mod test {
                 .any(|&v| v == 20209281816));
         }
         {
-            let mut hs = HardState::default();
-            hs.term = 1;
-            hs.vote = 2;
-            hs.commit = 3;
+            let hs = HardState {
+                term: 1,
+                vote: 2,
+                commit: 3,
+                ..Default::default()
+            };
             engine.set_hard_state(&hs).await;
 
             let raft_state = engine.get_raft_state().await;
@@ -468,11 +471,15 @@ mod test {
         {
             use protobuf::SingularPtrField;
 
-            let mut meta = SnapshotMetadata::default();
-            meta.index = 4;
-            meta.term = 5;
-            let mut cs = ConfState::default();
-            cs.mut_learners().push(20209281824);
+            let mut meta = SnapshotMetadata {
+                index: 4,
+                term: 5,
+                ..Default::default()
+            };
+            let cs = ConfState {
+                learners: vec![202103031437],
+                ..Default::default()
+            };
             meta.conf_state = SingularPtrField::some(cs.clone());
             engine.set_snapshot_metadata(&meta).await;
 

@@ -5,24 +5,24 @@ authors = ["whfuyn <whfuyn@outlook.com>"]
 edition = "2018"
 
 [dependencies]
-anyhow = "1.0"
-clap = { git = "https://github.com/clap-rs/clap/" }
-git-version = "0.3.4"
+anyhow = "*"
+clap = "3.0.0-beta.2"
+git-version = "*"
 cita_cloud_proto = { git = "https://github.com/cita-cloud/cita_cloud_proto" }
-tonic = "0.2.0"
-prost = "0.6"
-bytes = "0.5"
-protobuf = { version = "2.8", features = ["with-bytes"] }
-tokio = { version = "0.2", features = ["full"] }
-rand = "0.7"
-serde = "1.0.114"
-serde_derive = "1.0.114"
-toml = "0.5"
+tonic = "*"
+prost = "*"
+bytes = "*"
+protobuf = { version = "*", features = ["with-bytes"] }
+tokio = { version = "*", features = ["full"] }
+rand = "*"
+serde = "*"
+serde_derive = "*"
+toml = "*"
 raft = { git = "https://github.com/tikv/raft-rs", version = "0.6.0-alpha"}
-slog = "2.2"
-slog-envlogger = { version = "2.1.0" }
-slog-stdlog = { version = "4" }
-slog-term = { version = "2.4.0" }
-slog-async = "2.3.0"
-crossbeam = "0.7"
-hex = "0.4.2"
+slog = "*"
+slog-envlogger = { version = "*" }
+slog-stdlog = { version = "*" }
+slog-term = { version = "*" }
+slog-async = "*"
+crossbeam = "*"
+hex = "*"
