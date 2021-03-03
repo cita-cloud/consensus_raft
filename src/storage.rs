@@ -454,10 +454,12 @@ mod test {
                 .any(|&v| v == 20209281816));
         }
         {
-            let mut hs = HardState::default();
-            hs.term = 1;
-            hs.vote = 2;
-            hs.commit = 3;
+            let hs = HardState {
+                term: 1,
+                vote: 2,
+                commit: 3,
+                ..Default::default()
+            };
             engine.set_hard_state(&hs).await;
 
             let raft_state = engine.get_raft_state().await;
@@ -469,11 +471,15 @@ mod test {
         {
             use protobuf::SingularPtrField;
 
-            let mut meta = SnapshotMetadata::default();
-            meta.index = 4;
-            meta.term = 5;
-            let mut cs = ConfState::default();
-            cs.mut_learners().push(20209281824);
+            let mut meta = SnapshotMetadata {
+                index: 4,
+                term: 5,
+                ..Default::default()
+            };
+            let cs = ConfState {
+                learners: vec![202103031437],
+                ..Default::default()
+            };
             meta.conf_state = SingularPtrField::some(cs.clone());
             engine.set_snapshot_metadata(&meta).await;
 
