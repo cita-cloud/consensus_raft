@@ -20,10 +20,9 @@ before_cache:
   - rm -rf /home/travis/.cargo/registry
 
 install:
-  - if [[ $TRAVIS_RUST_VERSION == "stable" ]]; then rustup component add rustfmt; fi
-  - if [[ $TRAVIS_RUST_VERSION == "stable" ]]; then rustup component add clippy; fi
+  - rustup component add rustfmt clippy
 
 script:
-  - if [[ $TRAVIS_RUST_VERSION == "stable" ]]; then cargo fmt --all -- --check; fi
-  - if [[ $TRAVIS_RUST_VERSION == "stable" ]]; then cargo clippy --all --all-targets -- -D clippy::all; fi
+  - cargo fmt --all -- --check
+  - cargo clippy --all --all-targets -- -D clippy::all
   - cargo test --all -- --nocapture
