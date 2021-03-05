@@ -16,11 +16,11 @@ use raft::eraftpb::ConfChangeType;
 use raft::eraftpb::Message as RaftMsg;
 use raft::prelude::ConfChange;
 use raft::prelude::Config;
+use raft::prelude::Entry;
 use raft::prelude::EntryType;
+use raft::prelude::Message;
 use raft::prelude::RawNode;
 use raft::prelude::Snapshot;
-use raft::prelude::Message;
-use raft::prelude::Entry;
 use raft::StateRole;
 
 use std::collections::HashSet;
@@ -37,8 +37,8 @@ use slog::info;
 use slog::trace;
 use slog::warn;
 
-use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::Result;
 
 use protobuf::Message as _;
 
@@ -401,7 +401,11 @@ impl Peer {
         let mut ready = self.raft.ready();
 
         // Send out the message come from the node.
-        Self::send_messages(ready.take_messages(), self.mailbox_control.clone(), self.logger.clone());
+        Self::send_messages(
+            ready.take_messages(),
+            self.mailbox_control.clone(),
+            self.logger.clone(),
+        );
 
         // Apply the snapshot.
         if *ready.snapshot() != Snapshot::default() {
@@ -415,7 +419,8 @@ impl Peer {
         // Apply committed_entries, this includes:
         //   1. Commit block to controller
         //   2. Apply raft config change
-        self.handle_committed_entries(ready.take_committed_entries()).await?;
+        self.handle_committed_entries(ready.take_committed_entries())
+            .await?;
 
         // Persistent raft logs.
         if !ready.entries().is_empty() {
@@ -441,10 +446,15 @@ impl Peer {
         }
 
         // Send out the messages.
-        Self::send_messages(light_rd.take_messages(), self.mailbox_control.clone(), self.logger.clone());
+        Self::send_messages(
+            light_rd.take_messages(),
+            self.mailbox_control.clone(),
+            self.logger.clone(),
+        );
 
         // Apply all committed entries.
-        self.handle_committed_entries(light_rd.take_committed_entries()).await?;
+        self.handle_committed_entries(light_rd.take_committed_entries())
+            .await?;
 
         // Advance the apply index.
         self.raft.advance_apply();
@@ -452,7 +462,11 @@ impl Peer {
         Ok(())
     }
 
-    fn send_messages(msgs: Vec<Vec<Message>>, mailbox_control: MailboxControl<PeerMsg>, logger: Logger) {
+    fn send_messages(
+        msgs: Vec<Vec<Message>>,
+        mailbox_control: MailboxControl<PeerMsg>,
+        logger: Logger,
+    ) {
         tokio::spawn(async move {
             for msg in msgs.into_iter().flatten() {
                 let pm = PeerMsg::Normal(msg);
