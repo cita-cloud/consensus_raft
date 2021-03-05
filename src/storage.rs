@@ -154,35 +154,6 @@ impl RaftStorageCore {
     pub fn applied_index(&self) -> u64 {
         self.applied_index
     }
-
-    pub async fn set_applied_index(&mut self, applied_index: u64) {
-        self.applied_index = applied_index;
-        self.sync_applied_index().await;
-    }
-
-    pub async fn sync_applied_index(&mut self) {
-        self.engine.set_applied_index(self.applied_index).await;
-    }
-
-    pub async fn update_snapshot_metadata(&mut self) {
-        // Use the latest applied_idx to construct the snapshot.
-        let applied_idx = self.raft_state.hard_state.commit;
-        let term = self.raft_state.hard_state.term;
-
-        let meta = &mut self.snapshot_metadata;
-
-        meta.index = applied_idx;
-        meta.term = term;
-        meta.set_conf_state(self.raft_state.conf_state.clone());
-
-        self.sync_snapshot_metadata().await;
-    }
-
-    pub async fn sync_snapshot_metadata(&mut self) {
-        self.engine
-            .set_snapshot_metadata(&self.snapshot_metadata)
-            .await;
-    }
 }
 
 pub struct RaftStorage {
@@ -387,14 +358,6 @@ impl StorageEngine {
         f.set_len(0).await.unwrap();
         f.seek(SeekFrom::Start(0)).await.unwrap();
         f.write_all(&data[..]).await.unwrap();
-        f.sync_all().await.unwrap();
-    }
-
-    pub async fn set_applied_index(&mut self, applied_index: u64) {
-        let f = &mut self.applied_index_file;
-        f.set_len(0).await.unwrap();
-        f.seek(SeekFrom::Start(0)).await.unwrap();
-        f.write_u64(applied_index).await.unwrap();
         f.sync_all().await.unwrap();
     }
 }
