@@ -99,10 +99,7 @@ impl RaftStorageCore {
         self.entries.clear();
 
         // Update conf states.
-        self.raft_state.conf_state = meta.take_conf_state();
-        self.engine
-            .set_conf_state(&self.raft_state.conf_state)
-            .await;
+        self.set_conf_state(meta.take_conf_state()).await;
         Ok(())
     }
 

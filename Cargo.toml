@@ -18,7 +18,7 @@ rand = "*"
 serde = "*"
 serde_derive = "*"
 toml = "*"
-raft = { git = "https://github.com/tikv/raft-rs", version = "0.6.0-alpha"}
+raft = { git = "https://github.com/tikv/raft-rs", version = "0.6.0-alpha" }
 slog = "*"
 slog-envlogger = { version = "*" }
 slog-stdlog = { version = "*" }
