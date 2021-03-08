@@ -365,6 +365,9 @@ impl Peer {
         let d = Duration::from_secs(1);
         let mut ticker = time::interval(d);
         let mut last_propose_time = Instant::now();
+        for _ in 0..30 {
+            ticker.tick().await;
+        }
         loop {
             ticker.tick().await;
             let block_interval = service.peer_control.get_block_interval().await;
@@ -504,7 +507,10 @@ impl Peer {
                     let mut cc = ConfChange::default();
                     cc.merge_from_bytes(&entry.data)?;
                     let cs = self.raft.apply_conf_change(&cc)?;
-                    self.raft.mut_store().core.set_conf_state(cs).await;
+
+                    let store = self.raft.mut_store();
+                    store.core.set_conf_state(cs).await;
+
                     match cc.change_type {
                         ConfChangeType::AddNode => {
                             info!(self.logger, "add node #{}", cc.node_id);
