@@ -443,6 +443,7 @@ impl Peer {
         if let Some(commit) = light_rd.commit_index() {
             let store = self.raft.mut_store();
             store.core.mut_hard_state().set_commit(commit);
+            store.core.sync_hard_state().await;
         }
 
         // Send out the messages.
