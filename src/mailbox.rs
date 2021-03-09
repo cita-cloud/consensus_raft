@@ -43,7 +43,7 @@ type NetworkClient = NetworkServiceClient<Channel>;
 
 pub trait Letter: Clone + Debug + Send + Sized + Sync + 'static {
     type Address: std::hash::Hash + std::cmp::Eq;
-    type ReadError: Debug;
+    type ReadError: std::fmt::Display;
     fn to(&self) -> Option<Self::Address>;
     fn from(&self) -> Self::Address;
     fn write_down(&self) -> Vec<u8>;
@@ -486,7 +486,7 @@ mod test {
 
     impl Letter for Letty {
         type Address = u32;
-        type ReadError = ();
+        type ReadError = String;
 
         fn to(&self) -> Option<Self::Address> {
             if self.to > 0 {
@@ -507,7 +507,7 @@ mod test {
         fn read_from(paper: &[u8]) -> Result<Self, Self::ReadError> {
             use std::convert::TryInto;
             if paper.len() != 8 {
-                Err(())
+                Err("read paper failed".to_owned())
             } else {
                 let to = u32::from_be_bytes(paper[..4].try_into().unwrap());
                 let from = u32::from_be_bytes(paper[4..8].try_into().unwrap());
