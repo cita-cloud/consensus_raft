@@ -31,6 +31,8 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncSeekExt;
 use tokio::io::AsyncWriteExt;
 
+use std::cmp;
+
 pub struct RaftStorageCore {
     raft_state: RaftState,
     entries: Vec<Entry>,
@@ -62,13 +64,26 @@ impl RaftStorageCore {
         let mut snapshot = Snapshot::default();
 
         let meta = snapshot.mut_metadata();
-        *meta = self.snapshot_metadata.clone();
+        meta.index = self.raft_state.hard_state.commit;
+        meta.term = match meta.index.cmp(&self.snapshot_metadata.index) {
+            cmp::Ordering::Equal => self.snapshot_metadata.term,
+            cmp::Ordering::Greater => {
+                let offset = self.entries[0].index;
+                self.entries[(meta.index - offset) as usize].term
+            }
+            cmp::Ordering::Less => {
+                panic!(
+                    "commit {} < snapshot_metadata.index {}",
+                    meta.index, self.snapshot_metadata.index
+                );
+            }
+        };
+        meta.set_conf_state(self.raft_state.conf_state.clone());
         snapshot
     }
 
     pub async fn apply_snapshot(&mut self, mut snapshot: Snapshot) -> Result<()> {
         let mut meta = snapshot.take_metadata();
-        let term = meta.term;
         let index = meta.index;
 
         if self.first_index() > index {
@@ -76,21 +91,15 @@ impl RaftStorageCore {
         }
 
         self.snapshot_metadata = meta.clone();
-        self.engine
-            .set_snapshot_metadata(&self.snapshot_metadata)
-            .await;
 
-        self.mut_hard_state().term = term;
+        self.mut_hard_state().term = std::cmp::max(self.raft_state.hard_state.term, meta.term);
         self.mut_hard_state().commit = index;
         self.sync_hard_state().await;
 
         self.entries.clear();
 
         // Update conf states.
-        self.raft_state.conf_state = meta.take_conf_state();
-        self.engine
-            .set_conf_state(&self.raft_state.conf_state)
-            .await;
+        self.set_conf_state(meta.take_conf_state()).await;
         Ok(())
     }
 
@@ -155,15 +164,18 @@ impl RaftStorageCore {
         self.applied_index
     }
 
+    #[allow(unused)]
     pub async fn set_applied_index(&mut self, applied_index: u64) {
         self.applied_index = applied_index;
         self.sync_applied_index().await;
     }
 
+    #[allow(unused)]
     pub async fn sync_applied_index(&mut self) {
         self.engine.set_applied_index(self.applied_index).await;
     }
 
+    #[allow(unused)]
     pub async fn update_snapshot_metadata(&mut self) {
         // Use the latest applied_idx to construct the snapshot.
         let applied_idx = self.raft_state.hard_state.commit;
@@ -178,6 +190,7 @@ impl RaftStorageCore {
         self.sync_snapshot_metadata().await;
     }
 
+    #[allow(unused)]
     pub async fn sync_snapshot_metadata(&mut self) {
         self.engine
             .set_snapshot_metadata(&self.snapshot_metadata)
@@ -363,6 +376,7 @@ impl StorageEngine {
         self.entry_file.sync_all().await.unwrap();
     }
 
+    #[allow(unused)]
     pub async fn set_snapshot_metadata(&mut self, meta: &SnapshotMetadata) {
         let data = meta.write_to_bytes().unwrap();
         let f = &mut self.snapshot_metadata_file;
@@ -390,6 +404,7 @@ impl StorageEngine {
         f.sync_all().await.unwrap();
     }
 
+    #[allow(unused)]
     pub async fn set_applied_index(&mut self, applied_index: u64) {
         let f = &mut self.applied_index_file;
         f.set_len(0).await.unwrap();

@@ -16,7 +16,9 @@ use raft::eraftpb::ConfChangeType;
 use raft::eraftpb::Message as RaftMsg;
 use raft::prelude::ConfChange;
 use raft::prelude::Config;
+use raft::prelude::Entry;
 use raft::prelude::EntryType;
+use raft::prelude::Message;
 use raft::prelude::RawNode;
 use raft::prelude::Snapshot;
 use raft::StateRole;
@@ -35,6 +37,7 @@ use slog::info;
 use slog::trace;
 use slog::warn;
 
+use anyhow::anyhow;
 use anyhow::Result;
 
 use protobuf::Message as _;
@@ -393,78 +396,128 @@ impl Peer {
         if !self.raft.has_ready() {
             return Ok(());
         }
+
+        // Get the `Ready` with `RawNode::ready` interface.
         let mut ready = self.raft.ready();
-        let store = self.raft.mut_store();
 
-        // Save raft states to stable storage.
+        // Send out the message come from the node.
+        Self::send_messages(
+            ready.take_messages(),
+            self.mailbox_control.clone(),
+            self.logger.clone(),
+        );
 
-        if !ready.snapshot().is_empty() {
+        // Apply the snapshot.
+        if *ready.snapshot() != Snapshot::default() {
+            let store = self.raft.mut_store();
             let s = ready.snapshot().clone();
             if let Err(e) = store.core.apply_snapshot(s).await {
-                warn!(self.logger, "apply snapshot failed: {}", e);
+                return Err(anyhow!("apply snapshot failed: {}", e));
             }
         }
 
+        // Apply committed_entries, this includes:
+        //   1. Commit block to controller
+        //   2. Apply raft config change
+        self.handle_committed_entries(ready.take_committed_entries())
+            .await?;
+
+        // Persistent raft logs.
         if !ready.entries().is_empty() {
+            let store = self.raft.mut_store();
             if let Err(e) = store.core.append(ready.entries()).await {
-                warn!(self.logger, "append entries failed: {}", e);
+                return Err(anyhow!("append entries failed: {}", e));
             }
         }
 
+        // Raft HardState changed, and we need to persist it.
         if let Some(hs) = ready.hs() {
+            let store = self.raft.mut_store();
             store.core.set_hard_state(hs.clone()).await;
         }
 
-        // Send messages to other peers.
-        let messages = ready.take_messages();
-        let mailbox_control = self.mailbox_control.clone();
-        let logger_cloned = self.logger.clone();
+        // Call `RawNode::advance` interface to update position flags in the raft.
+        let mut light_rd = self.raft.advance(ready);
+
+        // Update commit index.
+        if let Some(commit) = light_rd.commit_index() {
+            let store = self.raft.mut_store();
+            store.core.mut_hard_state().set_commit(commit);
+            store.core.sync_hard_state().await;
+        }
+
+        // Send out the messages.
+        Self::send_messages(
+            light_rd.take_messages(),
+            self.mailbox_control.clone(),
+            self.logger.clone(),
+        );
+
+        // Apply all committed entries.
+        self.handle_committed_entries(light_rd.take_committed_entries())
+            .await?;
+
+        // Advance the apply index.
+        self.raft.advance_apply();
+
+        Ok(())
+    }
+
+    fn send_messages(
+        msgs: Vec<Vec<Message>>,
+        mailbox_control: MailboxControl<PeerMsg>,
+        logger: Logger,
+    ) {
         tokio::spawn(async move {
-            for vec_msg in messages {
-                for msg in vec_msg {
-                    let pm = PeerMsg::Normal(msg);
-                    if let Err(e) = mailbox_control.send_message(pm).await {
-                        warn!(logger_cloned, "send msg failed: {}", e);
-                    }
+            for msg in msgs.into_iter().flatten() {
+                let pm = PeerMsg::Normal(msg);
+                if let Err(e) = mailbox_control.send_message(pm).await {
+                    warn!(logger, "send msg failed: {}", e);
                 }
             }
         });
+    }
 
-        // Handle the committed entries:
-        // - executing config changes.
-        // - commit blocks to controller.
-        let committed_entries = ready.take_committed_entries();
-        for entry in &committed_entries {
-            if entry.data.is_empty() {
-                continue;
-            }
+    async fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) -> Result<()> {
+        // Fitler out empty entries produced by new elected leaders.
+        for entry in committed_entries
+            .into_iter()
+            .filter(|ent| !ent.data.is_empty())
+        {
             match entry.get_entry_type() {
                 EntryType::EntryNormal => {
                     info!(self.logger, "commiting proposal"; "entry" => hex::encode(entry.data.clone()));
                     let proposal = entry.data.clone();
-                    // Ignore any empty entries that may be produced by raft itself.
-                    if !proposal.is_empty() {
-                        let mailbox_control = self.mailbox_control.clone();
-                        let logger = self.logger.clone();
-                        tokio::spawn(async move {
-                            let pwp = ProposalWithProof {
-                                proposal,
-                                // Empty proof for non-BFT consensus.
-                                proof: vec![],
-                            };
-                            let mut retry_interval = time::interval(Duration::from_secs(3));
-                            while let Err(e) = mailbox_control.commit_block(pwp.clone()).await {
-                                retry_interval.tick().await;
-                                warn!(logger, "commit block failed: `{:?}`", e);
-                            }
-                        });
-                    }
+
+                    let mailbox_control = self.mailbox_control.clone();
+                    let logger = self.logger.clone();
+                    tokio::spawn(async move {
+                        let pwp = ProposalWithProof {
+                            proposal,
+                            // Empty proof for non-BFT consensus.
+                            proof: vec![],
+                        };
+                        let retry_secs = 3;
+                        let mut retry_interval = time::interval(Duration::from_secs(retry_secs));
+                        while let Err(e) = mailbox_control.commit_block(pwp.clone()).await {
+                            retry_interval.tick().await;
+                            warn!(
+                                logger,
+                                "commit block failed, retry in {} secs. Reason: `{}`",
+                                retry_secs,
+                                e
+                            );
+                        }
+                    });
                 }
                 EntryType::EntryConfChange => {
                     let mut cc = ConfChange::default();
                     cc.merge_from_bytes(&entry.data)?;
                     let cs = self.raft.apply_conf_change(&cc)?;
-                    self.raft.mut_store().core.set_conf_state(cs).await;
+
+                    let store = self.raft.mut_store();
+                    store.core.set_conf_state(cs).await;
+
                     match cc.change_type {
                         ConfChangeType::AddNode => {
                             info!(self.logger, "add node #{}", cc.node_id);
@@ -482,20 +535,6 @@ impl Peer {
                 }
             }
         }
-        // Save the committed state.
-        if let Some(last_committed) = committed_entries.last() {
-            let store = self.raft.mut_store();
-
-            store.core.mut_hard_state().commit = last_committed.index;
-            store.core.mut_hard_state().term = last_committed.term;
-            store.core.sync_hard_state().await;
-
-            store.core.set_applied_index(last_committed.index).await;
-
-            store.core.update_snapshot_metadata().await;
-        }
-        // Tell the raft that this ready state has benn processed.
-        self.raft.advance(ready);
         Ok(())
     }
 }
@@ -596,7 +635,7 @@ impl<T: Letter> NetworkMsgHandlerService for RaftService<T> {
             Err(tonic::Status::invalid_argument("wrong module"))
         } else {
             let letter = Letter::read_from(msg.msg.as_slice()).map_err(|e| {
-                tonic::Status::invalid_argument(format!("msg fail to decode: `{:?}`", e))
+                tonic::Status::invalid_argument(format!("msg fail to decode: `{}`", e))
             })?;
             let origin = msg.origin;
             self.mailbox_control.put_mail(origin, letter).await.unwrap();
