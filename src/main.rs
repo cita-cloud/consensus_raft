@@ -65,8 +65,6 @@ struct RunOpts {
 fn main() {
     ::std::env::set_var("RUST_BACKTRACE", "full");
 
-    println!("updated 2021/3/8");
-
     let opts: Opts = Opts::parse();
 
     // You can handle information about subcommands by requesting their matches by name
@@ -102,6 +100,8 @@ fn main() {
                 slog::Duplicate::new(terminal_drain, file_drain).fuse(),
                 o!(),
             );
+
+            info!(logger, "updated 2021/3/9 10:19");
 
             info!(logger, "server start, grpc port: {}", opts.grpc_port);
 
