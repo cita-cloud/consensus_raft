@@ -90,7 +90,12 @@ impl RaftStorageCore {
             return Err(Error::Store(StorageError::SnapshotOutOfDate));
         }
 
+        // TODO: store persistent data in a transactional way
+
         self.snapshot_metadata = meta.clone();
+        self.engine
+            .set_snapshot_metadata(&self.snapshot_metadata)
+            .await;
 
         self.mut_hard_state().term = std::cmp::max(self.raft_state.hard_state.term, meta.term);
         self.mut_hard_state().commit = index;
