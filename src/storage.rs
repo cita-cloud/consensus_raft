@@ -29,6 +29,7 @@ use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::io::AsyncSeekExt;
 
 pub struct RaftStorageCore {
     raft_state: RaftState,
