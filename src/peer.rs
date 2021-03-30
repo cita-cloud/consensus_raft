@@ -336,30 +336,37 @@ impl Peer {
                 let mut is_ok = true;
                 if let MessageType::MsgAppend = raft_msg.msg_type {
                     // Spawn tasks to check proposal and wait for their result.
-                    let mut wait_list = Vec::with_capacity(raft_msg.entries.len());
-                    for ent in raft_msg.entries.iter() {
+                    let mut check_results = Vec::with_capacity(raft_msg.entries.len());
+                    for ent in raft_msg.entries.iter().filter(|ent| !ent.data.is_empty()) {
                         if let EntryType::EntryNormal = ent.entry_type {
                             let mailbox_control = self.mailbox_control.clone();
                             let proposal = ent.data.clone();
+                            let logger = self.logger.clone();
                             let handle = tokio::spawn(async move {
-                                mailbox_control.check_proposal(proposal).await
+                                match mailbox_control.check_proposal(proposal.clone()).await {
+                                    Ok(true) => true,
+                                    Ok(false) => {
+                                        warn!(
+                                            logger,
+                                            "check proposal `0x{}` failed",
+                                            hex::encode(&proposal)
+                                        );
+                                        false
+                                    }
+                                    Err(e) => {
+                                        warn!(logger, "can't check proposal: {}", e);
+                                        false
+                                    }
+                                }
                             });
-                            wait_list.push(handle);
+                            check_results.push(handle);
                         }
                     }
-                    for h in wait_list {
-                        match h.await.unwrap() {
-                            Ok(true) => (),
-                            Ok(false) => {
-                                warn!(self.logger, "check proposal failed");
-                                is_ok = false;
-                                break;
-                            }
-                            Err(e) => {
-                                warn!(self.logger, "can't check proposal: {}", e);
-                                is_ok = false;
-                                break;
-                            }
+
+                    for result in check_results {
+                        if !result.await.unwrap() {
+                            is_ok = false;
+                            break;
                         }
                     }
                 }
