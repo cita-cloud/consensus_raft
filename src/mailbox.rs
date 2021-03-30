@@ -70,7 +70,6 @@ pub enum ControllerMail {
     GetProposal {
         reply_tx: oneshot::Sender<Result<Vec<u8>>>,
     },
-    #[allow(unused)]
     CheckProposal {
         proposal: Vec<u8>,
         reply_tx: oneshot::Sender<Result<bool>>,
@@ -122,7 +121,6 @@ impl<T: Letter> MailboxControl<T> {
         reply_rx.await?
     }
 
-    #[allow(unused)]
     pub async fn check_proposal(&self, proposal: Vec<u8>) -> Result<bool> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let mail = ControllerMail::CheckProposal { proposal, reply_tx };

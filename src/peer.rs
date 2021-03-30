@@ -14,6 +14,7 @@
 
 use raft::eraftpb::ConfChangeType;
 use raft::eraftpb::Message as RaftMsg;
+use raft::eraftpb::MessageType;
 use raft::prelude::ConfChange;
 use raft::prelude::Config;
 use raft::prelude::Entry;
@@ -291,6 +292,7 @@ impl Peer {
                         "current_peer_cnt" => current_peer_count,
                         "new_peer_cnt" => new_peer_count,
                     );
+                    // TODO: do this in a better way.
                     tokio::spawn(async move {
                         let mut ticker = time::interval(Duration::from_secs(2));
                         let nodes: Vec<u64> = (1..=new_peer_count).collect();
@@ -330,9 +332,45 @@ impl Peer {
                 self.raft.tick();
             }
             PeerMsg::Normal(raft_msg) => {
-                // We don't check appending entires here, leaving the problem to commit_block.
-                if let Err(e) = self.raft.step(raft_msg) {
-                    warn!(self.logger, "raft step failed: `{}`", e);
+                // If the msg is to append entries, check it first.
+                let mut is_ok = true;
+                if let MessageType::MsgAppend = raft_msg.msg_type {
+                    // Spawn tasks to check proposal and wait for their result.
+                    let mut wait_list = Vec::with_capacity(raft_msg.entries.len());
+                    for ent in raft_msg.entries.iter() {
+                        if let EntryType::EntryNormal = ent.entry_type {
+                            let mailbox_control = self.mailbox_control.clone();
+                            let proposal = ent.data.clone();
+                            let handle = tokio::spawn(async move {
+                                mailbox_control.check_proposal(proposal).await
+                            });
+                            wait_list.push(handle);
+                        }
+                    }
+                    for h in wait_list {
+                        match h.await.unwrap() {
+                            Ok(true) => (),
+                            Ok(false) => {
+                                warn!(self.logger, "check proposal failed");
+                                is_ok = false;
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(self.logger, "can't check proposal: {}", e);
+                                is_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Step this msg if:
+                //   1. It's a append msg and pass controller's check.
+                //   2. It's other msg.
+                if is_ok {
+                    if let Err(e) = self.raft.step(raft_msg) {
+                        warn!(self.logger, "raft step failed: `{}`", e);
+                    }
                 }
             }
         }
@@ -489,26 +527,20 @@ impl Peer {
                     info!(self.logger, "commiting proposal"; "entry" => hex::encode(entry.data.clone()));
                     let proposal = entry.data.clone();
 
-                    let mailbox_control = self.mailbox_control.clone();
-                    let logger = self.logger.clone();
-                    tokio::spawn(async move {
-                        let pwp = ProposalWithProof {
-                            proposal,
-                            // Empty proof for non-BFT consensus.
-                            proof: vec![],
-                        };
-                        let retry_secs = 3;
-                        let mut retry_interval = time::interval(Duration::from_secs(retry_secs));
-                        while let Err(e) = mailbox_control.commit_block(pwp.clone()).await {
-                            retry_interval.tick().await;
-                            warn!(
-                                logger,
-                                "commit block failed, retry in {} secs. Reason: `{}`",
-                                retry_secs,
-                                e
-                            );
-                        }
-                    });
+                    let pwp = ProposalWithProof {
+                        proposal,
+                        // Empty proof for non-BFT consensus.
+                        proof: vec![],
+                    };
+                    let retry_secs = 3;
+                    let mut retry_interval = time::interval(Duration::from_secs(retry_secs));
+                    while let Err(e) = self.mailbox_control.commit_block(pwp.clone()).await {
+                        retry_interval.tick().await;
+                        warn!(
+                            self.logger,
+                            "commit block failed, retry in {} secs. Reason: `{}`", retry_secs, e
+                        );
+                    }
                 }
                 EntryType::EntryConfChange => {
                     let mut cc = ConfChange::default();
@@ -534,6 +566,10 @@ impl Peer {
                     warn!(self.logger, "ConfChangeV2 unimplemented.")
                 }
             }
+
+            // Persist applied index.
+            let store = self.raft.mut_store();
+            store.core.set_applied_index(entry.index).await;
         }
         Ok(())
     }
