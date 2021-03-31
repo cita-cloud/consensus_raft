@@ -113,10 +113,6 @@ pub enum ControlMsg {
         config: ConsensusConfiguration,
         reply_tx: mpsc::UnboundedSender<()>,
     },
-    CheckBlock {
-        pwp: ProposalWithProof,
-        reply_tx: mpsc::UnboundedSender<bool>,
-    },
     IsLeader {
         reply_tx: mpsc::UnboundedSender<bool>,
     },
@@ -267,13 +263,6 @@ impl Peer {
                     );
                 }
             }
-            // Reply true since we assume no byzantine faults.
-            PeerMsg::Control(ControlMsg::CheckBlock { pwp, reply_tx }) => {
-                trace!(self.logger, "check block"; "proposal with proof" => ?pwp);
-                if let Err(e) = reply_tx.send(true) {
-                    warn!(self.logger, "reply CheckBlock request failed: `{}`", e);
-                }
-            }
             // Changing config is to change:
             //   1. block interval
             //   2. membership of peers (For now, only adding node is supported)
@@ -348,7 +337,7 @@ impl Peer {
                                     Ok(false) => {
                                         warn!(
                                             logger,
-                                            "check proposal `0x{}` failed",
+                                            "check proposal `{}` failed",
                                             hex::encode(&proposal)
                                         );
                                         false
@@ -638,13 +627,6 @@ impl PeerControl {
         reply_rx.recv().await.unwrap()
     }
 
-    pub async fn check_block(&self, pwp: ProposalWithProof) -> bool {
-        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
-        let msg = PeerMsg::Control(ControlMsg::CheckBlock { pwp, reply_tx });
-        self.msg_tx.send(msg).unwrap();
-        reply_rx.recv().await.unwrap()
-    }
-
     pub async fn set_consensus_config(&self, config: ConsensusConfiguration) {
         let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
         let msg = PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx });
@@ -702,11 +684,10 @@ impl<T: Letter> ConsensusService for RaftService<T> {
 
     async fn check_block(
         &self,
-        request: tonic::Request<ProposalWithProof>,
+        _request: tonic::Request<ProposalWithProof>,
     ) -> Result<tonic::Response<SimpleResponse>, tonic::Status> {
-        let pwp = request.into_inner();
-        let is_success = self.peer_control.check_block(pwp).await;
-        let reply = SimpleResponse { is_success };
+        // Reply true since we assume no byzantine faults.
+        let reply = SimpleResponse { is_success: true };
         Ok(tonic::Response::new(reply))
     }
 }
@@ -740,17 +721,6 @@ mod test {
                     PeerMsg::Control(ControlMsg::GetBlockInterval { reply_tx }) => {
                         reply_tx.send(6).unwrap();
                     }
-                    PeerMsg::Control(ControlMsg::CheckBlock {
-                        pwp: ProposalWithProof { proposal, proof },
-                        reply_tx,
-                    }) => {
-                        assert_eq!(
-                            &proposal[..],
-                            &b"For any integer n > 2, exists prime p, q that n = p + q"[..]
-                        );
-                        assert_eq!(&proof[..], &b"I think it's obivious."[..]);
-                        reply_tx.send(true).unwrap();
-                    }
                     PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
                         let ConsensusConfiguration {
                             block_interval,
@@ -773,14 +743,6 @@ mod test {
         control.campaign();
         assert!(control.is_leader().await);
         assert_eq!(control.get_block_interval().await, 6);
-        assert!(
-            control
-                .check_block(ProposalWithProof {
-                    proposal: b"For any integer n > 2, exists prime p, q that n = p + q"[..].into(),
-                    proof: b"I think it's obivious."[..].into()
-                })
-                .await
-        );
         let config = ConsensusConfiguration {
             block_interval: 6,
             validators: vec![vec![1, 2, 3]],
