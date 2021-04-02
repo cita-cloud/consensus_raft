@@ -193,7 +193,6 @@ impl Peer {
         let mut started = false;
 
         while let Some(msg) = self.msg_rx.recv().await {
-            info!(self.logger, "handle peer message: {:?}", msg);
             if !started {
                 // Leader should be started by campaign msg.
                 // Followers should be started by leader's msg.

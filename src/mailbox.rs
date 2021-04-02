@@ -218,7 +218,6 @@ impl<T: Letter> Mailbox<T> {
 
     pub async fn run(&mut self) {
         while let Some(m) = self.mail_get.recv().await {
-            info!(self.logger, "handle mail: {:?}", m);
             if let Err(e) = self.handle_mail(m) {
                 warn!(self.logger, "handle mail failed: `{}`", e);
             }
