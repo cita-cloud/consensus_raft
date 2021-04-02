@@ -14,6 +14,7 @@
 
 use raft::eraftpb::ConfChangeType;
 use raft::eraftpb::Message as RaftMsg;
+use raft::eraftpb::MessageType;
 use raft::prelude::ConfChange;
 use raft::prelude::Config;
 use raft::prelude::Entry;
@@ -111,10 +112,6 @@ pub enum ControlMsg {
     SetConsensusConfig {
         config: ConsensusConfiguration,
         reply_tx: mpsc::UnboundedSender<()>,
-    },
-    CheckBlock {
-        pwp: ProposalWithProof,
-        reply_tx: mpsc::UnboundedSender<bool>,
     },
     IsLeader {
         reply_tx: mpsc::UnboundedSender<bool>,
@@ -266,13 +263,6 @@ impl Peer {
                     );
                 }
             }
-            // Reply true since we assume no byzantine faults.
-            PeerMsg::Control(ControlMsg::CheckBlock { pwp, reply_tx }) => {
-                trace!(self.logger, "check block"; "proposal with proof" => ?pwp);
-                if let Err(e) = reply_tx.send(true) {
-                    warn!(self.logger, "reply CheckBlock request failed: `{}`", e);
-                }
-            }
             // Changing config is to change:
             //   1. block interval
             //   2. membership of peers (For now, only adding node is supported)
@@ -291,6 +281,7 @@ impl Peer {
                         "current_peer_cnt" => current_peer_count,
                         "new_peer_cnt" => new_peer_count,
                     );
+                    // TODO: do this in a better way.
                     tokio::spawn(async move {
                         let mut ticker = time::interval(Duration::from_secs(2));
                         let nodes: Vec<u64> = (1..=new_peer_count).collect();
@@ -330,9 +321,52 @@ impl Peer {
                 self.raft.tick();
             }
             PeerMsg::Normal(raft_msg) => {
-                // We don't check appending entires here, leaving the problem to commit_block.
-                if let Err(e) = self.raft.step(raft_msg) {
-                    warn!(self.logger, "raft step failed: `{}`", e);
+                // If the msg is to append entries, check it first.
+                let mut is_ok = true;
+                if let MessageType::MsgAppend = raft_msg.msg_type {
+                    // Spawn tasks to check proposal and wait for their result.
+                    let mut check_results = Vec::with_capacity(raft_msg.entries.len());
+                    for ent in raft_msg.entries.iter().filter(|ent| !ent.data.is_empty()) {
+                        if let EntryType::EntryNormal = ent.entry_type {
+                            let mailbox_control = self.mailbox_control.clone();
+                            let proposal = ent.data.clone();
+                            let logger = self.logger.clone();
+                            let handle = tokio::spawn(async move {
+                                match mailbox_control.check_proposal(proposal.clone()).await {
+                                    Ok(true) => true,
+                                    Ok(false) => {
+                                        warn!(
+                                            logger,
+                                            "check proposal `{}` failed",
+                                            hex::encode(&proposal)
+                                        );
+                                        false
+                                    }
+                                    Err(e) => {
+                                        warn!(logger, "can't check proposal: {}", e);
+                                        false
+                                    }
+                                }
+                            });
+                            check_results.push(handle);
+                        }
+                    }
+
+                    for result in check_results {
+                        if !result.await.unwrap() {
+                            is_ok = false;
+                            break;
+                        }
+                    }
+                }
+
+                // Step this msg if:
+                //   1. It's a append msg and pass controller's check.
+                //   2. It's other msg.
+                if is_ok {
+                    if let Err(e) = self.raft.step(raft_msg) {
+                        warn!(self.logger, "raft step failed: `{}`", e);
+                    }
                 }
             }
         }
@@ -489,26 +523,20 @@ impl Peer {
                     info!(self.logger, "commiting proposal"; "entry" => hex::encode(entry.data.clone()));
                     let proposal = entry.data.clone();
 
-                    let mailbox_control = self.mailbox_control.clone();
-                    let logger = self.logger.clone();
-                    tokio::spawn(async move {
-                        let pwp = ProposalWithProof {
-                            proposal,
-                            // Empty proof for non-BFT consensus.
-                            proof: vec![],
-                        };
-                        let retry_secs = 3;
-                        let mut retry_interval = time::interval(Duration::from_secs(retry_secs));
-                        while let Err(e) = mailbox_control.commit_block(pwp.clone()).await {
-                            retry_interval.tick().await;
-                            warn!(
-                                logger,
-                                "commit block failed, retry in {} secs. Reason: `{}`",
-                                retry_secs,
-                                e
-                            );
-                        }
-                    });
+                    let pwp = ProposalWithProof {
+                        proposal,
+                        // Empty proof for non-BFT consensus.
+                        proof: vec![],
+                    };
+                    let retry_secs = 3;
+                    let mut retry_interval = time::interval(Duration::from_secs(retry_secs));
+                    while let Err(e) = self.mailbox_control.commit_block(pwp.clone()).await {
+                        retry_interval.tick().await;
+                        warn!(
+                            self.logger,
+                            "commit block failed, retry in {} secs. Reason: `{}`", retry_secs, e
+                        );
+                    }
                 }
                 EntryType::EntryConfChange => {
                     let mut cc = ConfChange::default();
@@ -534,6 +562,10 @@ impl Peer {
                     warn!(self.logger, "ConfChangeV2 unimplemented.")
                 }
             }
+
+            // Persist applied index.
+            let store = self.raft.mut_store();
+            store.core.set_applied_index(entry.index).await;
         }
         Ok(())
     }
@@ -595,13 +627,6 @@ impl PeerControl {
         reply_rx.recv().await.unwrap()
     }
 
-    pub async fn check_block(&self, pwp: ProposalWithProof) -> bool {
-        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
-        let msg = PeerMsg::Control(ControlMsg::CheckBlock { pwp, reply_tx });
-        self.msg_tx.send(msg).unwrap();
-        reply_rx.recv().await.unwrap()
-    }
-
     pub async fn set_consensus_config(&self, config: ConsensusConfiguration) {
         let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
         let msg = PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx });
@@ -659,11 +684,10 @@ impl<T: Letter> ConsensusService for RaftService<T> {
 
     async fn check_block(
         &self,
-        request: tonic::Request<ProposalWithProof>,
+        _request: tonic::Request<ProposalWithProof>,
     ) -> Result<tonic::Response<SimpleResponse>, tonic::Status> {
-        let pwp = request.into_inner();
-        let is_success = self.peer_control.check_block(pwp).await;
-        let reply = SimpleResponse { is_success };
+        // Reply true since we assume no byzantine faults.
+        let reply = SimpleResponse { is_success: true };
         Ok(tonic::Response::new(reply))
     }
 }
@@ -697,17 +721,6 @@ mod test {
                     PeerMsg::Control(ControlMsg::GetBlockInterval { reply_tx }) => {
                         reply_tx.send(6).unwrap();
                     }
-                    PeerMsg::Control(ControlMsg::CheckBlock {
-                        pwp: ProposalWithProof { proposal, proof },
-                        reply_tx,
-                    }) => {
-                        assert_eq!(
-                            &proposal[..],
-                            &b"For any integer n > 2, exists prime p, q that n = p + q"[..]
-                        );
-                        assert_eq!(&proof[..], &b"I think it's obivious."[..]);
-                        reply_tx.send(true).unwrap();
-                    }
                     PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
                         let ConsensusConfiguration {
                             block_interval,
@@ -730,14 +743,6 @@ mod test {
         control.campaign();
         assert!(control.is_leader().await);
         assert_eq!(control.get_block_interval().await, 6);
-        assert!(
-            control
-                .check_block(ProposalWithProof {
-                    proposal: b"For any integer n > 2, exists prime p, q that n = p + q"[..].into(),
-                    proof: b"I think it's obivious."[..].into()
-                })
-                .await
-        );
         let config = ConsensusConfiguration {
             block_interval: 6,
             validators: vec![vec![1, 2, 3]],

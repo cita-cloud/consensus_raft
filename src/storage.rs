@@ -92,19 +92,16 @@ impl RaftStorageCore {
 
         // TODO: store persistent data in a transactional way
 
-        self.snapshot_metadata = meta.clone();
-        self.engine
-            .set_snapshot_metadata(&self.snapshot_metadata)
-            .await;
+        self.set_snapshot_metadata(meta.clone()).await;
 
         self.mut_hard_state().term = std::cmp::max(self.raft_state.hard_state.term, meta.term);
         self.mut_hard_state().commit = index;
         self.sync_hard_state().await;
 
-        self.entries.clear();
-
         // Update conf states.
         self.set_conf_state(meta.take_conf_state()).await;
+        self.clear_entries().await;
+
         Ok(())
     }
 
@@ -128,6 +125,11 @@ impl RaftStorageCore {
             self.engine.append(ent).await;
         }
         Ok(())
+    }
+
+    pub async fn clear_entries(&mut self) {
+        self.entries.clear();
+        self.engine.clear_entries().await;
     }
 
     pub fn is_initialized(&self) -> bool {
@@ -169,33 +171,19 @@ impl RaftStorageCore {
         self.applied_index
     }
 
-    #[allow(unused)]
     pub async fn set_applied_index(&mut self, applied_index: u64) {
         self.applied_index = applied_index;
         self.sync_applied_index().await;
     }
 
-    #[allow(unused)]
     pub async fn sync_applied_index(&mut self) {
         self.engine.set_applied_index(self.applied_index).await;
     }
 
-    #[allow(unused)]
-    pub async fn update_snapshot_metadata(&mut self) {
-        // Use the latest applied_idx to construct the snapshot.
-        let applied_idx = self.raft_state.hard_state.commit;
-        let term = self.raft_state.hard_state.term;
-
-        let meta = &mut self.snapshot_metadata;
-
-        meta.index = applied_idx;
-        meta.term = term;
-        meta.set_conf_state(self.raft_state.conf_state.clone());
-
+    pub async fn set_snapshot_metadata(&mut self, snapshot_metadata: SnapshotMetadata) {
+        self.snapshot_metadata = snapshot_metadata;
         self.sync_snapshot_metadata().await;
     }
-
-    #[allow(unused)]
     pub async fn sync_snapshot_metadata(&mut self) {
         self.engine
             .set_snapshot_metadata(&self.snapshot_metadata)
@@ -374,6 +362,9 @@ impl StorageEngine {
         SnapshotMetadata::parse_from_bytes(&buf[..]).unwrap()
     }
 
+    // TODO:
+    // 1. Check this. It seems like depending on file pointer pointing to the end of file.
+    // 2. Use batch update to improve performance.
     pub async fn append(&mut self, entry: &Entry) {
         let data = entry.write_to_bytes().unwrap();
         let data = [&(data.len() as u64).to_be_bytes(), &data[..]].concat();
@@ -381,7 +372,11 @@ impl StorageEngine {
         self.entry_file.sync_all().await.unwrap();
     }
 
-    #[allow(unused)]
+    pub async fn clear_entries(&mut self) {
+        self.entry_file.set_len(0).await.unwrap();
+        self.entry_file.sync_all().await.unwrap();
+    }
+
     pub async fn set_snapshot_metadata(&mut self, meta: &SnapshotMetadata) {
         let data = meta.write_to_bytes().unwrap();
         let f = &mut self.snapshot_metadata_file;
@@ -409,7 +404,6 @@ impl StorageEngine {
         f.sync_all().await.unwrap();
     }
 
-    #[allow(unused)]
     pub async fn set_applied_index(&mut self, applied_index: u64) {
         let f = &mut self.applied_index_file;
         f.set_len(0).await.unwrap();
@@ -488,26 +482,7 @@ mod test {
             assert_eq!(hard_state.vote, 2);
             assert_eq!(hard_state.commit, 3);
         }
-        {
-            use protobuf::SingularPtrField;
 
-            let mut meta = SnapshotMetadata {
-                index: 4,
-                term: 5,
-                ..Default::default()
-            };
-            let cs = ConfState {
-                learners: vec![202103031437],
-                ..Default::default()
-            };
-            meta.conf_state = SingularPtrField::some(cs.clone());
-            engine.set_snapshot_metadata(&meta).await;
-
-            let neta = engine.get_snapshot_metadata().await;
-            assert_eq!(neta.index, 4);
-            assert_eq!(neta.term, 5);
-            assert_eq!(neta.conf_state.unwrap(), cs);
-        }
         fs::remove_dir_all(test_dir).await.unwrap();
     }
 }

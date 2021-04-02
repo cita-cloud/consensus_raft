@@ -6,7 +6,7 @@ RUN /bin/sh -c set -eux;\
     apt-get install -y --no-install-recommends git;\
     rm -rf /var/lib/apt/lists/*;
 COPY . /build/
-RUN cargo build --release
+RUN cargo build
 FROM debian:buster-slim
-COPY --from=buildstage /build/target/release/consensus /usr/bin/
+COPY --from=buildstage /build/target/debug/consensus /usr/bin/
 CMD ["consensus"]

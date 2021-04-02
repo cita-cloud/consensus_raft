@@ -20,7 +20,7 @@ mod storage;
 use clap::Clap;
 use git_version::git_version;
 
-use std::fs::OpenOptions;
+use std::{fs, io::Seek, io::SeekFrom};
 
 use slog::error;
 use slog::info;
@@ -85,12 +85,13 @@ fn main() {
 
             // File log
             let log_path = "./logs/consensus_service.log";
-            let file = OpenOptions::new()
+            let mut file = fs::OpenOptions::new()
                 .create(true)
                 .write(true)
-                .truncate(true)
+                .truncate(false)
                 .open(log_path)
                 .unwrap();
+            file.seek(SeekFrom::End(0)).unwrap();
 
             let decorator = slog_term::PlainDecorator::new(file);
             let file_drain = slog_term::FullFormat::new(decorator).build().fuse();
