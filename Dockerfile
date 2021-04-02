@@ -8,5 +8,5 @@ RUN /bin/sh -c set -eux;\
 COPY . /build/
 RUN cargo build
 FROM debian:buster-slim
-COPY --from=buildstage /build/target/release/consensus /usr/bin/
+COPY --from=buildstage /build/target/debug/consensus /usr/bin/
 CMD ["consensus"]
