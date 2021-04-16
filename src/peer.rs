@@ -12,6 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
+use std::path::Path;
+use std::time::Duration;
+use std::time::Instant;
+
+use tokio::sync::mpsc;
+use tokio::time;
+
+use slog::debug;
+use slog::error;
+use slog::info;
+use slog::o;
+use slog::warn;
+use slog::Logger;
+
+use anyhow::anyhow;
+use anyhow::Result;
+
 use raft::eraftpb::ConfChangeType;
 use raft::eraftpb::Message as RaftMsg;
 use raft::eraftpb::MessageType;
@@ -24,23 +42,9 @@ use raft::prelude::RawNode;
 use raft::prelude::Snapshot;
 use raft::StateRole;
 
-use std::collections::HashSet;
-use std::path::Path;
-use std::time::Duration;
-use std::time::Instant;
-use tokio::sync::mpsc;
-use tokio::time;
+use cita_cloud_proto::common::Proposal;
 
-use slog::o;
-use slog::Logger;
-
-use slog::info;
-use slog::trace;
-use slog::warn;
-
-use anyhow::anyhow;
-use anyhow::Result;
-
+use prost::Message as _;
 use protobuf::Message as _;
 
 use crate::mailbox::Letter;
@@ -92,7 +96,7 @@ impl Letter for PeerMsg {
 pub enum ControlMsg {
     // Use mpsc channel for `reply_tx` instead of oneshot since we requires the msg to be Clone.
     Propose {
-        hash: Vec<u8>,
+        data: Vec<u8>,
     },
     AddNode {
         node_id: u64,
@@ -219,9 +223,9 @@ impl Peer {
 
     async fn handle_msg(&mut self, msg: PeerMsg) {
         match msg {
-            PeerMsg::Control(ControlMsg::Propose { hash }) => {
-                info!(self.logger, "propose"; "hash" => hex::encode(&hash));
-                if let Err(e) = self.raft.propose(vec![], hash) {
+            PeerMsg::Control(ControlMsg::Propose { data }) => {
+                info!(self.logger, "propose"; "hash" => hex::encode(&data));
+                if let Err(e) = self.raft.propose(vec![], data) {
                     warn!(self.logger, "propose failed: `{}`", e);
                 }
             }
@@ -267,7 +271,7 @@ impl Peer {
             //   1. block interval
             //   2. membership of peers (For now, only adding node is supported)
             PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
-                trace!(self.logger, "change consensus config"; "new config" => ?config);
+                info!(self.logger, "change consensus config"; "new config" => ?config);
                 self.consensus_config = config.clone();
                 let voters = &self.raft.store().core.conf_state().voters;
 
@@ -329,7 +333,19 @@ impl Peer {
                     for ent in raft_msg.entries.iter().filter(|ent| !ent.data.is_empty()) {
                         if let EntryType::EntryNormal = ent.entry_type {
                             let mailbox_control = self.mailbox_control.clone();
-                            let proposal = ent.data.clone();
+                            let proposal = match Proposal::decode(ent.data.as_slice()) {
+                                Ok(proposal) => proposal,
+                                Err(e) => {
+                                    error!(
+                                        self.logger,
+                                        "can't decode proposal data: `{}`, error: `{}`",
+                                        hex::encode(&ent.data),
+                                        e
+                                    );
+                                    return;
+                                }
+                            };
+
                             let logger = self.logger.clone();
                             let handle = tokio::spawn(async move {
                                 match mailbox_control.check_proposal(proposal.clone()).await {
@@ -337,8 +353,9 @@ impl Peer {
                                     Ok(false) => {
                                         warn!(
                                             logger,
-                                            "check proposal `{}` failed",
-                                            hex::encode(&proposal)
+                                            "check proposal failed, height: `{}` data: `{}`",
+                                            proposal.height,
+                                            hex::encode(&proposal.data)
                                         );
                                         false
                                     }
@@ -405,10 +422,17 @@ impl Peer {
             if last_propose_time.elapsed().as_secs() >= block_interval as u64
                 && service.peer_control.is_leader().await
             {
-                trace!(logger, "get propose");
+                debug!(logger, "get proposal..");
                 last_propose_time = Instant::now();
                 match service.mailbox_control.get_proposal().await {
-                    Ok(hash) => service.peer_control.propose(hash),
+                    Ok(proposal) => {
+                        let data = {
+                            let mut buf = Vec::with_capacity(proposal.encoded_len());
+                            proposal.encode(&mut buf).unwrap();
+                            buf
+                        };
+                        service.peer_control.propose(data);
+                    }
                     Err(e) => warn!(logger, "get proposal failed: `{}`", e),
                 }
             }
@@ -521,10 +545,10 @@ impl Peer {
             match entry.get_entry_type() {
                 EntryType::EntryNormal => {
                     info!(self.logger, "commiting proposal"; "entry" => hex::encode(entry.data.clone()));
-                    let proposal = entry.data.clone();
+                    let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
 
                     let pwp = ProposalWithProof {
-                        proposal,
+                        proposal: Some(proposal),
                         // Empty proof for non-BFT consensus.
                         proof: vec![],
                     };
@@ -603,8 +627,8 @@ impl PeerControl {
         self.msg_tx.send(msg).unwrap();
     }
 
-    pub fn propose(&self, hash: Vec<u8>) {
-        let msg = PeerMsg::Control(ControlMsg::Propose { hash });
+    pub fn propose(&self, data: Vec<u8>) {
+        let msg = PeerMsg::Control(ControlMsg::Propose { data });
         self.msg_tx.send(msg).unwrap();
     }
 
@@ -711,8 +735,8 @@ mod test {
                     PeerMsg::Control(ControlMsg::ApplySnapshot { snapshot }) => {
                         assert_eq!(snapshot, Snapshot::default());
                     }
-                    PeerMsg::Control(ControlMsg::Propose { hash }) => {
-                        assert_eq!(&hash[..], b"Akari!");
+                    PeerMsg::Control(ControlMsg::Propose { data }) => {
+                        assert_eq!(&data[..], b"Akari!");
                     }
                     PeerMsg::Control(ControlMsg::Campaign) => continue,
                     PeerMsg::Control(ControlMsg::IsLeader { reply_tx }) => {
@@ -723,9 +747,11 @@ mod test {
                     }
                     PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
                         let ConsensusConfiguration {
+                            height,
                             block_interval,
                             validators,
                         } = config;
+                        assert_eq!(height, 42);
                         assert_eq!(block_interval, 6);
                         assert_eq!(validators, vec![vec![1, 2, 3]]);
                         reply_tx.send(()).unwrap();
@@ -744,6 +770,7 @@ mod test {
         assert!(control.is_leader().await);
         assert_eq!(control.get_block_interval().await, 6);
         let config = ConsensusConfiguration {
+            height: 42,
             block_interval: 6,
             validators: vec![vec![1, 2, 3]],
         };

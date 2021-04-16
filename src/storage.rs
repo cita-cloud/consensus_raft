@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use protobuf::Message;
 use raft::eraftpb::SnapshotMetadata;
 use raft::prelude::ConfState;
 use raft::prelude::Entry;
@@ -23,6 +22,7 @@ use raft::RaftState;
 use raft::Result;
 use raft::Storage;
 use raft::StorageError;
+use std::cmp;
 use std::io::SeekFrom;
 use std::path::Path;
 use tokio::fs;
@@ -31,7 +31,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncSeekExt;
 use tokio::io::AsyncWriteExt;
 
-use std::cmp;
+use protobuf::Message;
 
 pub struct RaftStorageCore {
     raft_state: RaftState,
