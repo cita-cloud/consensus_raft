@@ -12,28 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use slog::debug;
-use slog::info;
-use slog::warn;
-use slog::Logger;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
+
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time;
 use tonic::transport::channel::Channel;
 
-use cita_cloud_proto::common::{Empty, Hash, ProposalWithProof};
+use slog::debug;
+use slog::info;
+use slog::warn;
+use slog::Logger;
+
+use anyhow::Result;
+
+use cita_cloud_proto::common::{Empty, Proposal, ProposalWithProof};
 use cita_cloud_proto::controller::consensus2_controller_service_client::Consensus2ControllerServiceClient;
 
 use cita_cloud_proto::network::{network_service_client::NetworkServiceClient, NetworkMsg};
 
 use crossbeam::queue::ArrayQueue;
-
-use std::fmt::Debug;
-
-use anyhow::Result;
 
 type ControllerClient = Consensus2ControllerServiceClient<Channel>;
 type NetworkClient = NetworkServiceClient<Channel>;
@@ -68,10 +69,10 @@ pub enum MyMail<T: Letter> {
 #[derive(Debug)]
 pub enum ControllerMail {
     GetProposal {
-        reply_tx: oneshot::Sender<Result<Vec<u8>>>,
+        reply_tx: oneshot::Sender<Result<Proposal>>,
     },
     CheckProposal {
-        proposal: Vec<u8>,
+        proposal: Proposal,
         reply_tx: oneshot::Sender<Result<bool>>,
     },
     CommitBlock {
@@ -114,14 +115,14 @@ impl<T: Letter> MailboxControl<T> {
 
     // controller
 
-    pub async fn get_proposal(&self) -> Result<Vec<u8>> {
+    pub async fn get_proposal(&self) -> Result<Proposal> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let mail = ControllerMail::GetProposal { reply_tx };
         self.mail_put.clone().send(Mail::ToController(mail))?;
         reply_rx.await?
     }
 
-    pub async fn check_proposal(&self, proposal: Vec<u8>) -> Result<bool> {
+    pub async fn check_proposal(&self, proposal: Proposal) -> Result<bool> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let mail = ControllerMail::CheckProposal { proposal, reply_tx };
         self.mail_put.clone().send(Mail::ToController(mail))?;
@@ -308,14 +309,14 @@ impl<T: Letter> Mailbox<T> {
                         let response = controller
                             .get_proposal(request)
                             .await
-                            .map(|resp| resp.into_inner().hash)
+                            .map(|resp| resp.into_inner())
                             .map_err(|e| e.into());
                         if let Err(e) = reply_tx.send(response) {
                             warn!(logger, "send `GetProposal` reply failed: `{:?}`", e);
                         }
                     }
                     CheckProposal { proposal, reply_tx } => {
-                        let request = tonic::Request::new(Hash { hash: proposal });
+                        let request = tonic::Request::new(proposal);
                         let response = controller
                             .check_proposal(request)
                             .await
@@ -532,16 +533,24 @@ mod test {
                         reply_tx.send(Ok(())).unwrap();
                     }
                     Mail::ToController(ControllerMail::GetProposal { reply_tx }) => {
-                        reply_tx
-                            .send(Ok(b"The quick brown fox jumps over the lazy dog"[..].into()))
-                            .unwrap();
+                        let proposal = Proposal {
+                            height: 42,
+                            data: b"The quick brown fox jumps over the lazy dog"[..].into(),
+                        };
+                        reply_tx.send(Ok(proposal)).unwrap();
                     }
                     Mail::ToController(ControllerMail::CheckProposal { proposal, reply_tx }) => {
-                        assert_eq!(proposal, b"hello world");
+                        assert_eq!(
+                            proposal,
+                            Proposal {
+                                height: 42,
+                                data: b"hello world"[..].into(),
+                            }
+                        );
                         reply_tx.send(Ok(true)).unwrap();
                     }
                     Mail::ToController(ControllerMail::CommitBlock { pwp, reply_tx }) => {
-                        assert!(!pwp.proposal.is_empty());
+                        assert!(pwp.proposal.is_some());
                         assert!(!pwp.proof.is_empty());
                         reply_tx.send(Ok(())).unwrap();
                     }
@@ -583,21 +592,28 @@ mod test {
             .unwrap();
 
         assert_eq!(
-            control.get_proposal().await.unwrap(),
+            control.get_proposal().await.unwrap().data,
             &b"The quick brown fox jumps over the lazy dog"[..],
         );
         assert_eq!(control.get_network_status().await.unwrap(), 42);
         assert_eq!(
             control
-                .check_proposal(b"hello world"[..].into())
+                .check_proposal(Proposal {
+                    height: 42,
+                    data: b"hello world"[..].into(),
+                })
                 .await
                 .unwrap(),
             true,
         );
         control.commit_block(
             ProposalWithProof {
-                proposal:
-                    b"No three positive integers a, b, and c satisfy the equation a^n + b^n = c^n (for n > 2)"[..].into(),
+                proposal: Some(
+                    Proposal {
+                        height: 42,
+                        data: b"No three positive integers a, b, and c satisfy the equation a^n + b^n = c^n (for n > 2)"[..].into(),
+                    }
+                ),
                 proof:
                     b"I have discovered a truly marvelous proof of this, which this margin is too narrow to contain."[..].into(),
             }

@@ -175,6 +175,7 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
     // peer
     let init_leader_id = 1;
     let config = ConsensusConfiguration {
+        height: 0,
         block_interval: 6,
         validators: vec![],
     };
