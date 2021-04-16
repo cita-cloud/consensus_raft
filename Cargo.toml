@@ -19,10 +19,7 @@ serde = "*"
 serde_derive = "*"
 toml = "*"
 raft = { git = "https://github.com/tikv/raft-rs", version = "0.6.0-alpha" }
-slog = "*"
-slog-envlogger = { version = "*" }
-slog-stdlog = { version = "*" }
-slog-term = { version = "*" }
-slog-async = "*"
+slog = "2.7.0"
+sloggers = "1.0.1"
 crossbeam = "*"
 hex = "*"

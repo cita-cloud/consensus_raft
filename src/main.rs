@@ -20,14 +20,12 @@ mod storage;
 use clap::Clap;
 use git_version::git_version;
 
-use std::{fs, io::Seek, io::SeekFrom};
-
 use slog::error;
 use slog::info;
-use slog::o;
 use slog::trace;
-use slog::Drain;
 use slog::Logger;
+use sloggers::file::FileLoggerBuilder;
+use sloggers::Build as _;
 
 const GIT_VERSION: &str = git_version!(
     args = ["--tags", "--always", "--dirty=-modified"],
@@ -75,32 +73,16 @@ fn main() {
             println!("homepage: {}", GIT_HOMEPAGE);
         }
         SubCommand::Run(opts) => {
-            // Terminal log
-            let decorator = slog_term::TermDecorator::new().build();
-            let terminal_drain = slog_term::FullFormat::new(decorator).build().fuse();
-            let terminal_drain = slog_async::Async::new(terminal_drain)
-                .chan_size(4096)
-                .overflow_strategy(slog_async::OverflowStrategy::Block)
-                .build();
-
-            // File log
-            let log_path = "./logs/consensus_service.log";
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(log_path)
-                .unwrap();
-            file.seek(SeekFrom::End(0)).unwrap();
-
-            let decorator = slog_term::PlainDecorator::new(file);
-            let file_drain = slog_term::FullFormat::new(decorator).build().fuse();
-            let file_drain = slog_async::Async::new(file_drain).build();
-
-            let logger = slog::Logger::root(
-                slog::Duplicate::new(terminal_drain, file_drain).fuse(),
-                o!(),
-            );
+            let logger = {
+                // File log
+                let log_path = "logs/consensus_service.log";
+                let mut log_builder = FileLoggerBuilder::new(log_path);
+                // 50 MB
+                log_builder.rotate_size(50 * 1024 * 1024);
+                log_builder.rotate_keep(5);
+                log_builder.rotate_compress(true);
+                log_builder.build().expect("can't build logger")
+            };
 
             info!(logger, "server start, grpc port: {}", opts.grpc_port);
 
