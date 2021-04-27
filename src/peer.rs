@@ -45,11 +45,10 @@ use raft::StateRole;
 use cita_cloud_proto::common::Proposal;
 
 use prost::Message as _;
-use protobuf::Message as _;
 
 use crate::mailbox::Letter;
 use crate::mailbox::MailboxControl;
-use crate::storage::RaftStorage;
+use crate::storage::WalStorage;
 
 /// An unified msg type for both local control messages
 /// and raft internal messages. It's used by the mailbox.
@@ -81,13 +80,17 @@ impl Letter for PeerMsg {
 
     fn write_down(&self) -> Vec<u8> {
         match self {
-            PeerMsg::Normal(raft_msg) => raft_msg.write_to_bytes().unwrap(),
+            PeerMsg::Normal(raft_msg) => {
+                let mut buf = Vec::with_capacity(raft_msg.encoded_len());
+                raft_msg.encode(&mut buf).unwrap();
+                buf
+            }
             PeerMsg::Control(_) => panic!("attempt to send local msg"),
         }
     }
 
     fn read_from(paper: &[u8]) -> std::result::Result<Self, Self::ReadError> {
-        Ok(PeerMsg::Normal(RaftMsg::parse_from_bytes(paper)?))
+        Ok(PeerMsg::Normal(RaftMsg::decode(paper)?))
     }
 }
 
@@ -125,7 +128,7 @@ pub enum ControlMsg {
 }
 
 pub struct Peer {
-    raft: RawNode<RaftStorage>,
+    raft: RawNode<WalStorage>,
     consensus_config: ConsensusConfiguration,
 
     msg_tx: mpsc::UnboundedSender<PeerMsg>,
@@ -159,19 +162,19 @@ impl Peer {
     ) -> Self {
         let logger = logger.new(o!("tag" => format!("peer_{}", id)));
 
-        let mut storage = RaftStorage::new(data_dir).await;
+        let mut storage = WalStorage::new(data_dir).await;
         // This step is according to the example in raft-rs to initialize the leader.
-        if id == init_leader_id && !storage.core.is_initialized() {
+        if id == init_leader_id && !storage.is_initialized() {
             let mut s = Snapshot::default();
-            s.mut_metadata().index = 1;
-            s.mut_metadata().term = 1;
+            s.mut_metadata().index = 5;
+            s.mut_metadata().term = 5;
             s.mut_metadata().mut_conf_state().voters = vec![id];
 
-            storage.core.apply_snapshot(s).await.unwrap();
+            storage.apply_snapshot(s).await.unwrap();
         }
 
         // Load applied index from stable storage.
-        let applied = storage.core.applied_index();
+        let applied = storage.get_applied_index();
         let cfg = Config {
             id,
             election_tick: 30,
@@ -231,7 +234,7 @@ impl Peer {
             }
             PeerMsg::Control(ControlMsg::AddNode { node_id }) => {
                 let cc = ConfChange {
-                    change_type: ConfChangeType::AddNode,
+                    change_type: ConfChangeType::AddNode as i32,
                     node_id,
                     ..Default::default()
                 };
@@ -241,7 +244,7 @@ impl Peer {
             }
             PeerMsg::Control(ControlMsg::RemoveNode { node_id }) => {
                 let cc = ConfChange {
-                    change_type: ConfChangeType::RemoveNode,
+                    change_type: ConfChangeType::RemoveNode as i32,
                     node_id,
                     ..Default::default()
                 };
@@ -250,12 +253,12 @@ impl Peer {
                 }
             }
             PeerMsg::Control(ControlMsg::GetNodeList { reply_tx }) => {
-                if let Err(e) = reply_tx.send(self.raft.store().core.conf_state().voters.clone()) {
+                if let Err(e) = reply_tx.send(self.raft.store().get_conf_state().voters.clone()) {
                     warn!(self.logger, "reply GetNodeList request failed: `{}`", e);
                 }
             }
             PeerMsg::Control(ControlMsg::ApplySnapshot { snapshot }) => {
-                if let Err(e) = self.raft.mut_store().core.apply_snapshot(snapshot).await {
+                if let Err(e) = self.raft.mut_store().apply_snapshot(snapshot).await {
                     warn!(self.logger, "apply snapshot failed: `{}`", e);
                 }
             }
@@ -273,7 +276,7 @@ impl Peer {
             PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
                 info!(self.logger, "change consensus config"; "new config" => ?config);
                 self.consensus_config = config.clone();
-                let voters = &self.raft.store().core.conf_state().voters;
+                let voters = &self.raft.store().get_conf_state().voters;
 
                 let current_peer_count = voters.len() as u64;
                 let new_peer_count = config.validators.len() as u64;
@@ -327,11 +330,11 @@ impl Peer {
             PeerMsg::Normal(raft_msg) => {
                 // If the msg is to append entries, check it first.
                 let mut is_ok = true;
-                if let MessageType::MsgAppend = raft_msg.msg_type {
+                if let Some(MessageType::MsgAppend) = MessageType::from_i32(raft_msg.msg_type) {
                     // Spawn tasks to check proposal and wait for their result.
                     let mut check_results = Vec::with_capacity(raft_msg.entries.len());
                     for ent in raft_msg.entries.iter().filter(|ent| !ent.data.is_empty()) {
-                        if let EntryType::EntryNormal = ent.entry_type {
+                        if let Some(EntryType::EntryNormal) = EntryType::from_i32(ent.entry_type) {
                             let mailbox_control = self.mailbox_control.clone();
                             let proposal = match Proposal::decode(ent.data.as_slice()) {
                                 Ok(proposal) => proposal,
@@ -469,7 +472,7 @@ impl Peer {
         if *ready.snapshot() != Snapshot::default() {
             let store = self.raft.mut_store();
             let s = ready.snapshot().clone();
-            if let Err(e) = store.core.apply_snapshot(s).await {
+            if let Err(e) = store.apply_snapshot(s).await {
                 return Err(anyhow!("apply snapshot failed: {}", e));
             }
         }
@@ -483,15 +486,13 @@ impl Peer {
         // Persistent raft logs.
         if !ready.entries().is_empty() {
             let store = self.raft.mut_store();
-            if let Err(e) = store.core.append(ready.entries()).await {
-                return Err(anyhow!("append entries failed: {}", e));
-            }
+            store.append_entries(ready.entries()).await;
         }
 
         // Raft HardState changed, and we need to persist it.
         if let Some(hs) = ready.hs() {
             let store = self.raft.mut_store();
-            store.core.set_hard_state(hs.clone()).await;
+            store.update_hard_state(hs.clone()).await;
         }
 
         // Call `RawNode::advance` interface to update position flags in the raft.
@@ -500,8 +501,7 @@ impl Peer {
         // Update commit index.
         if let Some(commit) = light_rd.commit_index() {
             let store = self.raft.mut_store();
-            store.core.mut_hard_state().set_commit(commit);
-            store.core.sync_hard_state().await;
+            store.update_committed_index(commit).await;
         }
 
         // Send out the messages.
@@ -563,22 +563,24 @@ impl Peer {
                     }
                 }
                 EntryType::EntryConfChange => {
-                    let mut cc = ConfChange::default();
-                    cc.merge_from_bytes(&entry.data)?;
+                    let cc = ConfChange::decode(entry.data.as_slice())?;
                     let cs = self.raft.apply_conf_change(&cc)?;
 
                     let store = self.raft.mut_store();
-                    store.core.set_conf_state(cs).await;
+                    store.update_conf_state(cs).await;
 
-                    match cc.change_type {
-                        ConfChangeType::AddNode => {
+                    match ConfChangeType::from_i32(cc.change_type) {
+                        Some(ConfChangeType::AddNode) => {
                             info!(self.logger, "add node #{}", cc.node_id);
                         }
-                        ConfChangeType::RemoveNode => {
+                        Some(ConfChangeType::RemoveNode) => {
                             info!(self.logger, "remove node #{}", cc.node_id);
                         }
-                        ConfChangeType::AddLearnerNode => {
+                        Some(ConfChangeType::AddLearnerNode) => {
                             warn!(self.logger, "AddLearnerNode unimplemented.")
+                        }
+                        unexpected => {
+                            error!(self.logger, "unexpected conf change type: {:?}", unexpected);
                         }
                     }
                 }
@@ -589,7 +591,7 @@ impl Peer {
 
             // Persist applied index.
             let store = self.raft.mut_store();
-            store.core.set_applied_index(entry.index).await;
+            store.advance_applied_index(entry.index).await;
         }
         Ok(())
     }
