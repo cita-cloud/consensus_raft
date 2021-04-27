@@ -25,6 +25,7 @@ use slog::info;
 use slog::trace;
 use slog::Logger;
 use sloggers::file::FileLoggerBuilder;
+use sloggers::types::Severity;
 use sloggers::Build as _;
 
 const GIT_VERSION: &str = git_version!(
@@ -77,6 +78,7 @@ fn main() {
                 // File log
                 let log_path = "logs/consensus_service.log";
                 let mut log_builder = FileLoggerBuilder::new(log_path);
+                log_builder.level(Severity::Debug);
                 // 50 MB
                 log_builder.rotate_size(50 * 1024 * 1024);
                 log_builder.rotate_keep(5);
