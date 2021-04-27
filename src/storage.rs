@@ -152,10 +152,12 @@ impl LogFile {
         self.file.write_all(src).await.unwrap();
     }
 
+    #[allow(unused)]
     async fn seek(&mut self, pos: SeekFrom) {
         self.file.seek(pos).await.unwrap();
     }
 
+    #[allow(unused)]
     async fn len(&self) -> u64 {
         let metadata = self.file.metadata().await.unwrap();
         metadata.len()
@@ -721,7 +723,7 @@ mod tests {
         for _ in 0..dup_cnt {
             let log_path = {
                 let mut buf = dir.as_ref().to_path_buf();
-                buf.push(format!("test-raft-log.backup"));
+                buf.push("test-raft-log.backup");
                 buf
             };
             // Path preservation is triggered here.
@@ -732,7 +734,7 @@ mod tests {
             let mut log_set = HashSet::<OsString>::new();
             for i in 0..cmp::min(dup_cnt as u64, MAX_LOG_FILE_PRESERVED + 1) {
                 if i == 0 {
-                    log_set.insert(format!("test-raft-log.backup").into());
+                    log_set.insert("test-raft-log.backup".into());
                 } else {
                     log_set.insert(format!("test-raft-log.{}.backup", i).into());
                 }
@@ -810,7 +812,6 @@ mod tests {
             term: 3,
             commit: 5,
             vote: 1,
-            ..Default::default()
         };
         store.update_hard_state(hard_state.clone()).await;
 
@@ -867,7 +868,6 @@ mod tests {
             term: 1,
             commit: 1,
             vote: 1,
-            ..Default::default()
         };
         store.update_hard_state(hard_state.clone()).await;
 
