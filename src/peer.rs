@@ -135,6 +135,8 @@ pub struct Peer {
     msg_rx: mpsc::UnboundedReceiver<PeerMsg>,
     mailbox_control: MailboxControl<PeerMsg>,
 
+    started: bool,
+
     logger: Logger,
 }
 
@@ -164,13 +166,15 @@ impl Peer {
 
         let mut storage = WalStorage::new(data_dir).await;
         // This step is according to the example in raft-rs to initialize the leader.
-        if id == init_leader_id && !storage.is_initialized() {
+        let mut started = storage.is_initialized();
+        if id == init_leader_id && !started {
             let mut s = Snapshot::default();
             s.mut_metadata().index = 5;
             s.mut_metadata().term = 5;
             s.mut_metadata().mut_conf_state().voters = vec![id];
 
             storage.apply_snapshot(s).await.unwrap();
+            started = true;
         }
 
         // Load applied index from stable storage.
@@ -192,15 +196,18 @@ impl Peer {
             msg_rx,
             mailbox_control,
             consensus_config,
+            started,
             logger,
         }
     }
 
     pub async fn run(&mut self) {
-        let mut started = false;
+        if self.started {
+            self.start_raft();
+        }
 
         while let Some(msg) = self.msg_rx.recv().await {
-            if !started {
+            if !self.started {
                 // Leader should be started by campaign msg.
                 // Followers should be started by leader's msg.
                 // Don't start them when receives SetConsensusConfig msg.
@@ -209,15 +216,19 @@ impl Peer {
                     reply_tx.send(()).unwrap();
                     continue;
                 } else {
-                    // Try to get a proposal every block interval secs.
-                    tokio::spawn(Self::wait_proposal(self.service(), self.logger.clone()));
-                    // Send tick msg to raft periodically.
-                    tokio::spawn(Self::pacemaker(self.msg_tx.clone()));
-                    started = true;
+                    self.start_raft();
                 }
             }
             self.handle_msg(msg).await;
         }
+    }
+
+    fn start_raft(&mut self) {
+        // Try to get a proposal every block interval secs.
+        tokio::spawn(Self::wait_proposal(self.service(), self.logger.clone()));
+        // Send tick msg to raft periodically.
+        tokio::spawn(Self::pacemaker(self.msg_tx.clone()));
+        self.started = true;
     }
 
     fn id(&self) -> u64 {
