@@ -25,6 +25,7 @@ use slog::info;
 use slog::trace;
 use slog::Logger;
 use sloggers::file::FileLoggerBuilder;
+use sloggers::terminal::TerminalLoggerBuilder;
 use sloggers::types::Severity;
 use sloggers::Build as _;
 
@@ -59,6 +60,8 @@ struct RunOpts {
     /// Sets grpc port of this service.
     #[clap(short = 'p', long = "port", default_value = "50003")]
     grpc_port: String,
+    #[clap(long = "log", default_value = "file")]
+    log: String,
 }
 
 fn main() {
@@ -74,16 +77,30 @@ fn main() {
             println!("homepage: {}", GIT_HOMEPAGE);
         }
         SubCommand::Run(opts) => {
-            let logger = {
-                // File log
-                let log_path = "logs/consensus_service.log";
-                let mut log_builder = FileLoggerBuilder::new(log_path);
-                log_builder.level(Severity::Debug);
-                // 50 MB
-                log_builder.rotate_size(50 * 1024 * 1024);
-                log_builder.rotate_keep(5);
-                log_builder.rotate_compress(true);
-                log_builder.build().expect("can't build logger")
+            let log_level = Severity::Debug;
+            let logger = match opts.log.as_str() {
+                "file" => {
+                    // File log
+                    let log_path = "logs/consensus_service.log";
+                    let mut log_builder = FileLoggerBuilder::new(log_path);
+                    log_builder.level(log_level);
+                    // 50 MB
+                    log_builder.rotate_size(50 * 1024 * 1024);
+                    log_builder.rotate_keep(5);
+                    log_builder.rotate_compress(true);
+                    log_builder.build().expect("can't build file logger")
+                }
+                "terminal" => {
+                    let mut log_builder = TerminalLoggerBuilder::new();
+                    log_builder.level(log_level);
+                    log_builder.build().expect("can't build terminal logger")
+                }
+                _unexpected => {
+                    panic!(
+                        "unexpected log type `{}`, only `file` and `terminal` are allowed.",
+                        _unexpected
+                    );
+                }
             };
 
             info!(logger, "server start, grpc port: {}", opts.grpc_port);
