@@ -13,8 +13,6 @@
 // limitations under the License.
 
 use std::path::Path;
-use std::time::Duration;
-use std::time::Instant;
 
 use tokio::sync::mpsc;
 use tokio::time;
@@ -381,17 +379,11 @@ impl Peer {
     // The current leader will get proposal
     // from controller every block interval secs.
     async fn wait_proposal(service: RaftService<PeerMsg>, logger: Logger) {
-        let d = Duration::from_secs(1);
-        let mut ticker = time::interval(d);
-        let mut last_propose_time = Instant::now();
+        let mut propose_time = time::Instant::now();
         loop {
-            ticker.tick().await;
-            let block_interval = service.peer_control.get_block_interval().await;
-            if last_propose_time.elapsed().as_secs() >= block_interval as u64
-                && service.peer_control.is_leader().await
-            {
+            time::sleep_until(propose_time).await;
+            if service.peer_control.is_leader().await {
                 debug!(logger, "get proposal..");
-                last_propose_time = Instant::now();
                 match service.mailbox_control.get_proposal().await {
                     Ok(proposal) => {
                         let data = {
@@ -404,12 +396,14 @@ impl Peer {
                     Err(e) => warn!(logger, "get proposal failed: `{}`", e),
                 }
             }
+            let block_interval = service.peer_control.get_block_interval().await;
+            propose_time += time::Duration::from_secs(block_interval as u64);
         }
     }
 
     // Tick raft's logical clock.
     async fn pacemaker(msg_tx: mpsc::UnboundedSender<PeerMsg>) {
-        let pace = Duration::from_millis(200);
+        let pace = time::Duration::from_millis(200);
         let mut ticker = time::interval(pace);
         loop {
             ticker.tick().await;
@@ -518,7 +512,7 @@ impl Peer {
                         proof: vec![],
                     };
                     let retry_secs = 3;
-                    let mut retry_interval = time::interval(Duration::from_secs(retry_secs));
+                    let mut retry_interval = time::interval(time::Duration::from_secs(retry_secs));
                     while let Err(e) = self.mailbox_control.commit_block(pwp.clone()).await {
                         retry_interval.tick().await;
                         warn!(
