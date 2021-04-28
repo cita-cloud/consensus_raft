@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
@@ -34,6 +33,8 @@ use raft::eraftpb::ConfChangeType;
 use raft::eraftpb::Message as RaftMsg;
 use raft::eraftpb::MessageType;
 use raft::prelude::ConfChange;
+use raft::prelude::ConfChangeSingle;
+use raft::prelude::ConfChangeV2;
 use raft::prelude::Config;
 use raft::prelude::Entry;
 use raft::prelude::EntryType;
@@ -53,6 +54,7 @@ use crate::storage::WalStorage;
 /// An unified msg type for both local control messages
 /// and raft internal messages. It's used by the mailbox.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum PeerMsg {
     // Local message to control this peer.
     Control(ControlMsg),
@@ -101,24 +103,12 @@ pub enum ControlMsg {
     Propose {
         data: Vec<u8>,
     },
-    AddNode {
-        node_id: u64,
-    },
-    RemoveNode {
-        node_id: u64,
-    },
-    GetNodeList {
-        reply_tx: mpsc::UnboundedSender<Vec<u64>>,
-    },
-    ApplySnapshot {
-        snapshot: Snapshot,
-    },
     GetBlockInterval {
         reply_tx: mpsc::UnboundedSender<u32>,
     },
     SetConsensusConfig {
         config: ConsensusConfiguration,
-        reply_tx: mpsc::UnboundedSender<()>,
+        reply_tx: mpsc::UnboundedSender<bool>,
     },
     IsLeader {
         reply_tx: mpsc::UnboundedSender<bool>,
@@ -213,7 +203,7 @@ impl Peer {
                 // Don't start them when receives SetConsensusConfig msg.
                 if let PeerMsg::Control(ControlMsg::SetConsensusConfig { reply_tx, .. }) = &msg {
                     // Ignore it since we haven't started yet.
-                    reply_tx.send(()).unwrap();
+                    reply_tx.send(false).unwrap();
                     continue;
                 } else {
                     self.start_raft();
@@ -243,36 +233,6 @@ impl Peer {
                     warn!(self.logger, "propose failed: `{}`", e);
                 }
             }
-            PeerMsg::Control(ControlMsg::AddNode { node_id }) => {
-                let cc = ConfChange {
-                    change_type: ConfChangeType::AddNode as i32,
-                    node_id,
-                    ..Default::default()
-                };
-                if let Err(e) = self.raft.propose_conf_change(vec![], cc) {
-                    warn!(self.logger, "add node failed: `{}`", e);
-                }
-            }
-            PeerMsg::Control(ControlMsg::RemoveNode { node_id }) => {
-                let cc = ConfChange {
-                    change_type: ConfChangeType::RemoveNode as i32,
-                    node_id,
-                    ..Default::default()
-                };
-                if let Err(e) = self.raft.propose_conf_change(vec![], cc) {
-                    warn!(self.logger, "remove node failed: `{}`", e);
-                }
-            }
-            PeerMsg::Control(ControlMsg::GetNodeList { reply_tx }) => {
-                if let Err(e) = reply_tx.send(self.raft.store().get_conf_state().voters.clone()) {
-                    warn!(self.logger, "reply GetNodeList request failed: `{}`", e);
-                }
-            }
-            PeerMsg::Control(ControlMsg::ApplySnapshot { snapshot }) => {
-                if let Err(e) = self.raft.mut_store().apply_snapshot(snapshot).await {
-                    warn!(self.logger, "apply snapshot failed: `{}`", e);
-                }
-            }
             PeerMsg::Control(ControlMsg::GetBlockInterval { reply_tx }) => {
                 if let Err(e) = reply_tx.send(self.consensus_config.block_interval) {
                     warn!(
@@ -287,39 +247,33 @@ impl Peer {
             PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
                 info!(self.logger, "change consensus config"; "new config" => ?config);
                 self.consensus_config = config.clone();
-                let voters = &self.raft.store().get_conf_state().voters;
 
-                let current_peer_count = voters.len() as u64;
+                let current_peer_count = self.raft.store().get_conf_state().voters.len() as u64;
                 let new_peer_count = config.validators.len() as u64;
 
-                let peer_control = self.control();
-                if current_peer_count < new_peer_count {
-                    info!(
-                        self.logger, "sync peer";
-                        "current_peer_cnt" => current_peer_count,
-                        "new_peer_cnt" => new_peer_count,
-                    );
-                    // TODO: do this in a better way.
-                    tokio::spawn(async move {
-                        let mut ticker = time::interval(Duration::from_secs(2));
-                        let nodes: Vec<u64> = (1..=new_peer_count).collect();
-                        loop {
-                            ticker.tick().await;
-                            let current_nodes: HashSet<u64> =
-                                peer_control.get_node_list().await.into_iter().collect();
+                let cc = {
+                    let mut changes = vec![];
+                    for id in (current_peer_count + 1)..=new_peer_count {
+                        let ccs = ConfChangeSingle {
+                            change_type: ConfChangeType::AddNode as i32,
+                            node_id: id,
+                        };
+                        changes.push(ccs);
+                    }
+                    ConfChangeV2 {
+                        changes,
+                        ..Default::default()
+                    }
+                };
 
-                            if let Some(&node_id) =
-                                nodes.iter().find(|&id| !current_nodes.contains(id))
-                            {
-                                peer_control.add_node(node_id);
-                            } else {
-                                break;
-                            }
-                        }
-                    });
+                let mut is_success = true;
+                if let Err(e) = self.raft.propose_conf_change(vec![], cc) {
+                    warn!(self.logger, "add node failed: `{}`", e);
+                    is_success = false;
                 }
-                if let Err(e) = reply_tx.send(()) {
-                    warn!(
+
+                if let Err(e) = reply_tx.send(is_success) {
+                    error!(
                         self.logger,
                         "reply SetConsensusConfig request failed: `{}`", e
                     );
@@ -616,30 +570,6 @@ pub struct PeerControl {
 }
 
 impl PeerControl {
-    pub fn add_node(&self, node_id: u64) {
-        let msg = PeerMsg::Control(ControlMsg::AddNode { node_id });
-        self.msg_tx.send(msg).unwrap();
-    }
-
-    #[allow(unused)]
-    pub fn remove_node(&self, node_id: u64) {
-        let msg = PeerMsg::Control(ControlMsg::RemoveNode { node_id });
-        self.msg_tx.send(msg).unwrap();
-    }
-
-    pub async fn get_node_list(&self) -> Vec<u64> {
-        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
-        let msg = PeerMsg::Control(ControlMsg::GetNodeList { reply_tx });
-        self.msg_tx.send(msg).unwrap();
-        reply_rx.recv().await.unwrap()
-    }
-
-    #[allow(unused)]
-    pub fn apply_snapshot(&self, snapshot: Snapshot) {
-        let msg = PeerMsg::Control(ControlMsg::ApplySnapshot { snapshot });
-        self.msg_tx.send(msg).unwrap();
-    }
-
     pub fn propose(&self, data: Vec<u8>) {
         let msg = PeerMsg::Control(ControlMsg::Propose { data });
         self.msg_tx.send(msg).unwrap();
@@ -664,7 +594,7 @@ impl PeerControl {
         reply_rx.recv().await.unwrap()
     }
 
-    pub async fn set_consensus_config(&self, config: ConsensusConfiguration) {
+    pub async fn set_consensus_config(&self, config: ConsensusConfiguration) -> bool {
         let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
         let msg = PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx });
         self.msg_tx.send(msg).unwrap();
@@ -714,8 +644,8 @@ impl<T: Letter> ConsensusService for RaftService<T> {
         request: tonic::Request<ConsensusConfiguration>,
     ) -> std::result::Result<tonic::Response<SimpleResponse>, tonic::Status> {
         let config = request.into_inner();
-        self.peer_control.set_consensus_config(config).await;
-        let reply = SimpleResponse { is_success: true };
+        let is_success = self.peer_control.set_consensus_config(config).await;
+        let reply = SimpleResponse { is_success };
         Ok(tonic::Response::new(reply))
     }
 
@@ -740,14 +670,6 @@ mod test {
         let handle = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 match msg {
-                    PeerMsg::Control(ControlMsg::AddNode { node_id: 666 })
-                    | PeerMsg::Control(ControlMsg::RemoveNode { node_id: 666 }) => continue,
-                    PeerMsg::Control(ControlMsg::GetNodeList { reply_tx }) => {
-                        reply_tx.send(vec![20, 20, 9, 29]).unwrap();
-                    }
-                    PeerMsg::Control(ControlMsg::ApplySnapshot { snapshot }) => {
-                        assert_eq!(snapshot, Snapshot::default());
-                    }
                     PeerMsg::Control(ControlMsg::Propose { data }) => {
                         assert_eq!(&data[..], b"Akari!");
                     }
@@ -767,17 +689,13 @@ mod test {
                         assert_eq!(height, 42);
                         assert_eq!(block_interval, 6);
                         assert_eq!(validators, vec![vec![1, 2, 3]]);
-                        reply_tx.send(()).unwrap();
+                        reply_tx.send(true).unwrap();
                     }
                     msg => panic!("unexpected msg: `{:?}`", msg),
                 }
             }
         });
 
-        control.add_node(666);
-        control.remove_node(666);
-        assert_eq!(control.get_node_list().await, vec![20, 20, 9, 29]);
-        control.apply_snapshot(Snapshot::default());
         control.propose(b"Akari!"[..].into());
         control.campaign();
         assert!(control.is_leader().await);
