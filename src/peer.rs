@@ -531,8 +531,7 @@ impl Peer {
                     let cc = ConfChange::decode(entry.data.as_slice())?;
                     let cs = self.raft.apply_conf_change(&cc)?;
 
-                    let store = self.raft.mut_store();
-                    store.update_conf_state(cs).await;
+                    self.raft.mut_store().update_conf_state(cs).await;
 
                     match ConfChangeType::from_i32(cc.change_type) {
                         Some(ConfChangeType::AddNode) => {
@@ -550,13 +549,19 @@ impl Peer {
                     }
                 }
                 EntryType::EntryConfChangeV2 => {
-                    warn!(self.logger, "ConfChangeV2 unimplemented.")
+                    let cc = ConfChangeV2::decode(entry.data.as_slice())?;
+                    let cs = self.raft.apply_conf_change(&cc)?;
+                    info!(self.logger, "conf change: {:?}", cc);
+                    info!(self.logger, "now config state is: {:?}", cs);
+                    self.raft.mut_store().update_conf_state(cs).await;
                 }
             }
 
             // Persist applied index.
-            let store = self.raft.mut_store();
-            store.advance_applied_index(entry.index).await;
+            self.raft
+                .mut_store()
+                .advance_applied_index(entry.index)
+                .await;
         }
         Ok(())
     }
