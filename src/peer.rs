@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::Path;
 use std::collections::HashSet;
+use std::path::Path;
 
 use tokio::sync::mpsc;
 use tokio::time;
@@ -167,6 +167,7 @@ impl Peer {
     pub async fn run(&mut self) {
         let mut started = false;
         if self.raft.store().is_initialized() {
+            info!(self.logger, "start initialized node");
             self.start_raft();
             started = true;
         }
@@ -174,6 +175,12 @@ impl Peer {
         while let Some(msg) = self.msg_rx.recv().await {
             if !started {
                 if let PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) = msg {
+                    debug!(
+                        self.logger,
+                        "node_addr: `{}`, incoming config: `{:?}`",
+                        String::from_utf8_lossy(&self.node_addr),
+                        config
+                    );
                     if config.validators.iter().any(|addr| addr == &self.node_addr) {
                         let voters = config
                             .validators
