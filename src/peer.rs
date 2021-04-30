@@ -245,7 +245,7 @@ impl Peer {
             }
             // Changing config is to change:
             //   1. block interval
-            //   2. membership of peers (For now, only adding node is supported)
+            //   2. membership of peers
             PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
                 info!(self.logger, "change consensus config"; "new config" => ?config);
 
@@ -611,7 +611,11 @@ impl PeerControl {
         let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
         let msg = PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx });
         self.msg_tx.send(msg).unwrap();
-        reply_rx.recv().await.unwrap()
+        // FIXME: conf change may failed to propose if there is no leader.
+        tokio::spawn(async move {
+            reply_rx.recv().await.unwrap();
+        });
+        true
     }
 }
 
