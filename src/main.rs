@@ -151,7 +151,7 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
         .unwrap_or_else(|err| panic!("Error while loading config: [{}]", err));
     let config = config::RaftConfig::new(&buffer);
 
-    let node_addr = &fs::read("node_address").await?[2..];
+    let node_addr = hex::decode(&fs::read("node_address").await?[2..])?;
     let node_id = address_to_peer_id(&node_addr);
     let network_port = config.network_port;
     let controller_port = config.controller_port;
