@@ -178,8 +178,12 @@ impl Peer {
                     debug!(
                         self.logger,
                         "node_addr: `{}`, incoming config: `{:?}`",
-                        String::from_utf8_lossy(&self.node_addr),
+                        hex::encode(&self.node_addr),
                         config
+                            .validators
+                            .iter()
+                            .map(hex::encode)
+                            .collect::<Vec<String>>()
                     );
                     if config.validators.iter().any(|addr| addr == &self.node_addr) {
                         let voters = config
