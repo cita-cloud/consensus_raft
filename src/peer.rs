@@ -197,6 +197,7 @@ impl Peer {
                         s.mut_metadata().term = 5;
                         s.mut_metadata().mut_conf_state().voters = voters;
                         self.raft.mut_store().apply_snapshot(s).await.unwrap();
+                        self.raft.campaign().unwrap();
 
                         self.start_raft();
                         started = true;
@@ -208,10 +209,6 @@ impl Peer {
                             "[During started] reply SetConsensusConfig request failed: `{}`", e
                         );
                     }
-                } else {
-                    self.start_raft();
-                    started = true;
-                    self.handle_msg(msg).await;
                 }
             } else {
                 self.handle_msg(msg).await;
@@ -220,6 +217,7 @@ impl Peer {
     }
 
     fn start_raft(&mut self) {
+        info!(self.logger, "Start raft ticker..");
         // Try to get a proposal every block interval secs.
         tokio::spawn(Self::wait_proposal(self.service(), self.logger.clone()));
         // Send tick msg to raft periodically.
