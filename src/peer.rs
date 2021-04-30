@@ -173,6 +173,7 @@ impl Peer {
         }
 
         while let Some(msg) = self.msg_rx.recv().await {
+            debug!(self.logger, "handle msg: `{:?}`", msg);
             if !started {
                 if let PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) = msg {
                     debug!(
@@ -185,7 +186,11 @@ impl Peer {
                             .map(hex::encode)
                             .collect::<Vec<String>>()
                     );
-                    if config.validators.iter().any(|addr| addr == &self.node_addr) {
+                    if let Some(index) = config
+                        .validators
+                        .iter()
+                        .position(|addr| addr == &self.node_addr)
+                    {
                         let voters = config
                             .validators
                             .iter()
@@ -197,7 +202,12 @@ impl Peer {
                         s.mut_metadata().term = 5;
                         s.mut_metadata().mut_conf_state().voters = voters;
                         self.raft.mut_store().apply_snapshot(s).await.unwrap();
-                        self.raft.campaign().unwrap();
+
+                        debug!(self.logger, "Raft peer initialized");
+
+                        if index == 0 {
+                            self.raft.campaign().unwrap();
+                        }
 
                         self.start_raft();
                         started = true;
@@ -209,6 +219,7 @@ impl Peer {
                             "[During started] reply SetConsensusConfig request failed: `{}`", e
                         );
                     }
+                    info!(self.logger, "Raft node started");
                 }
             } else {
                 self.handle_msg(msg).await;
