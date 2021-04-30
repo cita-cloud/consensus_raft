@@ -205,12 +205,12 @@ impl Peer {
 
                         debug!(self.logger, "Raft peer initialized");
 
-                        if index == 0 {
-                            self.raft.campaign().unwrap();
-                        }
-
                         self.start_raft();
                         started = true;
+
+                        // if index == 0 {
+                        //     self.raft.campaign().unwrap();
+                        // }
                     }
                     self.raft.mut_store().update_consensus_config(config).await;
                     if let Err(e) = reply_tx.send(true) {
