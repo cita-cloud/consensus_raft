@@ -194,7 +194,7 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
     // peer
     let data_dir = std::env::current_dir()?.join("raft-data-dir");
     let mut peer = peer::Peer::new(
-        &node_addr,
+        node_addr,
         msg_tx,
         msg_rx,
         mailbox_control.clone(),
@@ -240,4 +240,19 @@ fn address_to_peer_id(addr: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     hasher.write(addr);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::address_to_peer_id;
+
+    #[test]
+    fn test_address_to_peer_id() {
+        let addrs: Vec<&[u8]> = vec![b"", b"1", b"1234"];
+        for addr in addrs {
+            let first = address_to_peer_id(&addr);
+            let second = address_to_peer_id(&addr);
+            assert_eq!(first, second);
+        }
+    }
 }

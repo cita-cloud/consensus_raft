@@ -198,12 +198,14 @@ struct WalStorageCore {
     log_dir: PathBuf,
     active_log: Option<LogFile>,
 
+    compact_limit: u64,
+
     // slog logger
     logger: Logger,
 }
 
 impl WalStorageCore {
-    async fn new<P: AsRef<Path>>(log_dir: P, logger: Logger) -> Self {
+    async fn new<P: AsRef<Path>>(log_dir: P, compact_limit: u64, logger: Logger) -> Self {
         let log_dir = log_dir.as_ref().to_path_buf();
         if !log_dir.exists() {
             fs::create_dir_all(&log_dir).await.unwrap();
@@ -216,6 +218,7 @@ impl WalStorageCore {
             consensus_config: ConsensusConfiguration::default(),
             log_dir,
             active_log: None,
+            compact_limit,
             logger,
         };
 
@@ -566,12 +569,24 @@ impl WalStorageCore {
     }
 
     // panic if active log is none
+    fn active_log(&self) -> &LogFile {
+        self.active_log.as_ref().unwrap()
+    }
+
+    // panic if active log is none
     fn mut_active_log(&mut self) -> &mut LogFile {
         self.active_log.as_mut().unwrap()
     }
 
     async fn flush(&mut self) {
         self.mut_active_log().flush().await;
+    }
+
+    async fn maybe_compact(&mut self) {
+        // 0 means don't compact
+        if self.compact_limit > 0 && self.active_log().len().await > self.compact_limit {
+            self.generate_new_active_log().await;
+        }
     }
 }
 
@@ -580,8 +595,8 @@ pub struct WalStorage(WalStorageCore);
 
 // The public interface, the WAL operations.
 impl WalStorage {
-    pub async fn new<P: AsRef<Path>>(log_dir: P, logger: Logger) -> Self {
-        let core = WalStorageCore::new(log_dir, logger).await;
+    pub async fn new<P: AsRef<Path>>(log_dir: P, compact_limit: u64, logger: Logger) -> Self {
+        let core = WalStorageCore::new(log_dir, compact_limit, logger).await;
         WalStorage(core)
     }
 
@@ -642,6 +657,10 @@ impl WalStorage {
         self.0.log_update_consensus_config(&config).await;
         self.0.flush().await;
         self.0.update_consensus_config(config);
+    }
+
+    pub async fn maybe_compact(&mut self) {
+        self.0.maybe_compact().await;
     }
 }
 
@@ -760,7 +779,7 @@ mod tests {
             log_builder.level(log_level);
             log_builder.build().expect("can't build terminal logger")
         };
-        WalStorage::new(log_dir, logger).await
+        WalStorage::new(log_dir, 0, logger).await
     }
 
     fn entry(term: u64, index: u64) -> Entry {
@@ -1127,7 +1146,24 @@ mod tests {
 
         store = new_store(&log_dir).await;
 
-        assert_eq!(&store.0.entries, &[entry(1, 1), entry(1, 2), entry(1, 3),]);
+        assert_eq!(&store.0.entries, &[entry(1, 1), entry(1, 2), entry(1, 3)]);
+        assert_eq!(store.0.applied_index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_maybe_compact() {
+        let log_dir = tempdir().unwrap();
+        let mut store = new_store(&log_dir).await;
+        store.0.compact_limit = 1;
+        store.append_entries(&[entry(1, 1), entry(1, 2)]).await;
+        store.advance_applied_index(1).await;
+        store.maybe_compact().await;
+
+        assert!(log_dir.as_ref().join(WAL_ACTIVE_LOG_NAME).exists());
+        assert!(log_dir.as_ref().join(WAL_BACKUP_LOG_NAME).exists());
+
+        store = new_store(&log_dir).await;
+        assert_eq!(&store.0.entries, &[entry(1, 2)]);
         assert_eq!(store.0.applied_index, 1);
     }
 }

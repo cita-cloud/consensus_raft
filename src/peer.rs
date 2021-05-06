@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 use tokio::time;
@@ -50,6 +51,9 @@ use crate::address_to_peer_id;
 use crate::mailbox::Letter;
 use crate::mailbox::MailboxControl;
 use crate::storage::WalStorage;
+
+// Compact wal log if file size > 64MB.
+const WAL_COMPACT_LIMIT: u64 = 64 * 1024 * 1024;
 
 /// An unified msg type for both local control messages
 /// and raft internal messages. It's used by the mailbox.
@@ -118,79 +122,100 @@ pub enum ControlMsg {
 
 pub struct Peer {
     node_addr: Vec<u8>,
-    raft: RawNode<WalStorage>,
+    node: Option<RawNode<WalStorage>>,
 
     msg_tx: mpsc::UnboundedSender<PeerMsg>,
     msg_rx: mpsc::UnboundedReceiver<PeerMsg>,
     mailbox_control: MailboxControl<PeerMsg>,
+
+    data_dir: PathBuf,
 
     logger: Logger,
 }
 
 impl Peer {
     pub async fn new(
-        node_addr: &[u8],
+        node_addr: Vec<u8>,
         msg_tx: mpsc::UnboundedSender<PeerMsg>,
         msg_rx: mpsc::UnboundedReceiver<PeerMsg>,
         mailbox_control: MailboxControl<PeerMsg>,
         data_dir: impl AsRef<Path>,
         logger: Logger,
     ) -> Self {
-        let node_id = address_to_peer_id(node_addr);
-        let logger = logger.new(o!("tag" => format!("peer_{}", node_id)));
-
-        let storage = WalStorage::new(data_dir, logger.clone()).await;
-
-        // Load applied index from stable storage.
-        let applied = storage.get_applied_index();
-        let cfg = Config {
-            id: node_id,
-            election_tick: 30,
-            heartbeat_tick: 3,
-            check_quorum: true,
-            applied,
-            ..Default::default()
-        };
-
-        let raw_node = RawNode::new(&cfg, storage, &logger).unwrap();
+        let peer_id = address_to_peer_id(&node_addr);
+        let logger = logger.new(o!("tag" => format!("peer_{}", peer_id)));
 
         Self {
-            node_addr: node_addr.to_owned(),
-            raft: raw_node,
+            node_addr,
+            node: None,
             msg_tx,
             msg_rx,
             mailbox_control,
+            data_dir: data_dir.as_ref().to_path_buf(),
             logger,
         }
     }
 
+    fn node(&self) -> &RawNode<WalStorage> {
+        match self.node.as_ref() {
+            Some(node) => node,
+            None => {
+                let error_msg = "try to access uninitialized node.";
+                error!(self.logger, "{}", error_msg);
+                panic!("{}", error_msg)
+            }
+        }
+    }
+
+    fn mut_node(&mut self) -> &mut RawNode<WalStorage> {
+        match self.node.as_mut() {
+            Some(node) => node,
+            None => {
+                let error_msg = "try to access uninitialized node.";
+                error!(self.logger, "{}", error_msg);
+                panic!("{}", error_msg)
+            }
+        }
+    }
+
     pub async fn run(&mut self) {
-        let mut started = false;
-        if self.raft.store().is_initialized() {
+        let storage = WalStorage::new(&self.data_dir, WAL_COMPACT_LIMIT, self.logger.clone()).await;
+
+        if storage.is_initialized() {
             info!(self.logger, "start initialized node");
-            self.start_raft();
-            started = true;
+            self.start_raft(storage);
+        } else {
+            self.wait_init(storage).await;
         }
 
         while let Some(msg) = self.msg_rx.recv().await {
             debug!(self.logger, "handle msg: `{:?}`", msg);
-            if !started {
-                if let PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) = msg {
-                    debug!(
-                        self.logger,
-                        "node_addr: `{}`, incoming config: `{:?}`",
-                        hex::encode(&self.node_addr),
-                        config
-                            .validators
-                            .iter()
-                            .map(hex::encode)
-                            .collect::<Vec<String>>()
-                    );
-                    if let Some(index) = config
+            self.handle_msg(msg).await;
+        }
+    }
+
+    async fn wait_init(&mut self, mut storage: WalStorage) {
+        while let Some(msg) = self.msg_rx.recv().await {
+            if let PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) = msg {
+                debug!(
+                    self.logger,
+                    "node_addr: `{}`, incoming config: `{:?}`",
+                    hex::encode(&self.node_addr),
+                    config
                         .validators
                         .iter()
-                        .position(|addr| addr == &self.node_addr)
-                    {
+                        .map(hex::encode)
+                        .collect::<Vec<String>>()
+                );
+
+                storage.update_consensus_config(config.clone()).await;
+
+                if let Some(index) = config
+                    .validators
+                    .iter()
+                    .position(|addr| addr == &self.node_addr)
+                {
+                    let snapshot = {
                         let voters = config
                             .validators
                             .iter()
@@ -201,54 +226,68 @@ impl Peer {
                         s.mut_metadata().index = 5;
                         s.mut_metadata().term = 5;
                         s.mut_metadata().mut_conf_state().voters = voters;
-                        self.raft.mut_store().apply_snapshot(s).await.unwrap();
+                        s
+                    };
 
-                        debug!(self.logger, "Raft peer initialized");
+                    storage.apply_snapshot(snapshot).await.unwrap();
+                    self.start_raft(storage);
 
-                        self.start_raft();
-                        started = true;
-
-                        if index == 0 {
-                            self.raft.campaign().unwrap();
-                        }
+                    if index == 0 {
+                        self.mut_node().campaign().unwrap();
                     }
-                    self.raft.mut_store().update_consensus_config(config).await;
-                    if let Err(e) = reply_tx.send(true) {
-                        error!(
-                            self.logger,
-                            "[During started] reply SetConsensusConfig request failed: `{}`", e
-                        );
-                    }
-                    info!(self.logger, "Raft node started");
+                    break;
+                } else {
+                    info!(self.logger, "consensus config doesn't contain this node.");
                 }
-            } else {
-                self.handle_msg(msg).await;
+                if let Err(e) = reply_tx.send(true) {
+                    error!(
+                        self.logger,
+                        "[During started] reply SetConsensusConfig request failed: `{}`", e
+                    );
+                }
             }
         }
     }
 
-    fn start_raft(&mut self) {
-        info!(self.logger, "Start raft ticker..");
+    fn start_raft(&mut self, storage: WalStorage) {
+        info!(self.logger, "Starting raft node..");
+
+        // Load applied index from stable storage.
+        let id = address_to_peer_id(&self.node_addr);
+        let applied = storage.get_applied_index();
+        let cfg = Config {
+            id,
+            election_tick: 30,
+            heartbeat_tick: 3,
+            check_quorum: true,
+            applied,
+            ..Default::default()
+        };
+
+        let node = RawNode::new(&cfg, storage, &self.logger).unwrap();
+        self.node.replace(node);
+
         // Try to get a proposal every block interval secs.
         tokio::spawn(Self::wait_proposal(self.service(), self.logger.clone()));
         // Send tick msg to raft periodically.
         tokio::spawn(Self::pacemaker(self.msg_tx.clone()));
+        debug!(&self.logger, "Raft node started");
     }
 
     fn id(&self) -> u64 {
-        self.raft.raft.r.id
+        self.node().raft.r.id
     }
 
     async fn handle_msg(&mut self, msg: PeerMsg) {
         match msg {
             PeerMsg::Control(ControlMsg::Propose { data }) => {
                 info!(self.logger, "propose"; "hash" => hex::encode(&data));
-                if let Err(e) = self.raft.propose(vec![], data) {
+                if let Err(e) = self.mut_node().propose(vec![], data) {
                     warn!(self.logger, "propose failed: `{}`", e);
                 }
             }
             PeerMsg::Control(ControlMsg::GetBlockInterval { reply_tx }) => {
-                let block_interval = self.raft.store().get_consensus_config().block_interval;
+                let block_interval = self.node().store().get_consensus_config().block_interval;
                 if let Err(e) = reply_tx.send(block_interval) {
                     warn!(
                         self.logger,
@@ -268,7 +307,7 @@ impl Peer {
                     .map(|addr| address_to_peer_id(addr))
                     .collect();
                 let current_peers: HashSet<u64> = self
-                    .raft
+                    .node()
                     .store()
                     .get_conf_state()
                     .voters
@@ -302,7 +341,7 @@ impl Peer {
                 };
 
                 let mut is_success = true;
-                if let Err(e) = self.raft.propose_conf_change(vec![], cc) {
+                if let Err(e) = self.mut_node().propose_conf_change(vec![], cc) {
                     warn!(self.logger, "propose conf change failed: `{}`", e);
                     is_success = false;
                 }
@@ -320,7 +359,7 @@ impl Peer {
                 }
             }
             PeerMsg::Control(ControlMsg::Tick) => {
-                self.raft.tick();
+                self.mut_node().tick();
             }
             PeerMsg::Normal(raft_msg) => {
                 // If the msg is to append entries, check it first.
@@ -379,7 +418,7 @@ impl Peer {
                 //   1. It's a append msg and pass controller's check.
                 //   2. It's other msg.
                 if is_ok {
-                    if let Err(e) = self.raft.step(raft_msg) {
+                    if let Err(e) = self.mut_node().step(raft_msg) {
                         warn!(self.logger, "raft step failed: `{}`", e);
                     }
                 }
@@ -391,7 +430,7 @@ impl Peer {
     }
 
     fn is_leader(&self) -> bool {
-        self.raft.raft.state == StateRole::Leader
+        self.node().raft.state == StateRole::Leader
     }
 
     pub fn control(&self) -> PeerControl {
@@ -445,12 +484,12 @@ impl Peer {
 
     // Handle the ready state produced by raft.
     async fn handle_ready(&mut self) -> Result<()> {
-        if !self.raft.has_ready() {
+        if !self.node().has_ready() {
             return Ok(());
         }
 
         // Get the `Ready` with `RawNode::ready` interface.
-        let mut ready = self.raft.ready();
+        let mut ready = self.mut_node().ready();
 
         // Send out the message come from the node.
         Self::send_messages(
@@ -461,7 +500,7 @@ impl Peer {
 
         // Apply the snapshot.
         if *ready.snapshot() != Snapshot::default() {
-            let store = self.raft.mut_store();
+            let store = self.mut_node().mut_store();
             let s = ready.snapshot().clone();
             if let Err(e) = store.apply_snapshot(s).await {
                 return Err(anyhow!("apply snapshot failed: {}", e));
@@ -476,22 +515,22 @@ impl Peer {
 
         // Persistent raft logs.
         if !ready.entries().is_empty() {
-            let store = self.raft.mut_store();
+            let store = self.mut_node().mut_store();
             store.append_entries(ready.entries()).await;
         }
 
         // Raft HardState changed, and we need to persist it.
         if let Some(hs) = ready.hs() {
-            let store = self.raft.mut_store();
+            let store = self.mut_node().mut_store();
             store.update_hard_state(hs.clone()).await;
         }
 
         // Call `RawNode::advance` interface to update position flags in the raft.
-        let mut light_rd = self.raft.advance(ready);
+        let mut light_rd = self.mut_node().advance(ready);
 
         // Update commit index.
         if let Some(commit) = light_rd.commit_index() {
-            let store = self.raft.mut_store();
+            let store = self.mut_node().mut_store();
             store.update_committed_index(commit).await;
         }
 
@@ -507,7 +546,10 @@ impl Peer {
             .await?;
 
         // Advance the apply index.
-        self.raft.advance_apply();
+        self.mut_node().advance_apply();
+
+        // Maybe compact log file.
+        self.mut_node().mut_store().maybe_compact().await;
 
         Ok(())
     }
@@ -555,9 +597,9 @@ impl Peer {
                 }
                 EntryType::EntryConfChange => {
                     let cc = ConfChange::decode(entry.data.as_slice())?;
-                    let cs = self.raft.apply_conf_change(&cc)?;
+                    let cs = self.mut_node().apply_conf_change(&cc)?;
 
-                    self.raft.mut_store().update_conf_state(cs).await;
+                    self.mut_node().mut_store().update_conf_state(cs).await;
 
                     match ConfChangeType::from_i32(cc.change_type) {
                         Some(ConfChangeType::AddNode) => {
@@ -576,15 +618,15 @@ impl Peer {
                 }
                 EntryType::EntryConfChangeV2 => {
                     let cc = ConfChangeV2::decode(entry.data.as_slice())?;
-                    let cs = self.raft.apply_conf_change(&cc)?;
+                    let cs = self.mut_node().apply_conf_change(&cc)?;
                     info!(self.logger, "conf change: {:?}", cc);
                     info!(self.logger, "now config state is: {:?}", cs);
-                    self.raft.mut_store().update_conf_state(cs).await;
+                    self.mut_node().mut_store().update_conf_state(cs).await;
                 }
             }
 
             // Persist applied index.
-            self.raft
+            self.mut_node()
                 .mut_store()
                 .advance_applied_index(entry.index)
                 .await;
