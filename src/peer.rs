@@ -121,6 +121,7 @@ pub enum ControlMsg {
 }
 
 pub struct Peer {
+    peer_id: u64,
     node_addr: Vec<u8>,
     node: Option<RawNode<WalStorage>>,
 
@@ -146,6 +147,7 @@ impl Peer {
         let logger = logger.new(o!("tag" => format!("peer_{}", peer_id)));
 
         Self {
+            peer_id,
             node_addr,
             node: None,
             msg_tx,
@@ -253,10 +255,9 @@ impl Peer {
         info!(self.logger, "Starting raft node..");
 
         // Load applied index from stable storage.
-        let id = address_to_peer_id(&self.node_addr);
         let applied = storage.get_applied_index();
         let cfg = Config {
-            id,
+            id: self.id(),
             election_tick: 30,
             heartbeat_tick: 3,
             check_quorum: true,
@@ -275,7 +276,7 @@ impl Peer {
     }
 
     fn id(&self) -> u64 {
-        self.node().raft.r.id
+        self.peer_id
     }
 
     async fn handle_msg(&mut self, msg: PeerMsg) {
