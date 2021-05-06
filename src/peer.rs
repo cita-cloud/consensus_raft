@@ -191,7 +191,6 @@ impl Peer {
         }
 
         while let Some(msg) = self.msg_rx.recv().await {
-            debug!(self.logger, "handle msg: `{:?}`", msg);
             self.handle_msg(msg).await;
         }
     }
@@ -239,7 +238,7 @@ impl Peer {
                     }
                     break;
                 } else {
-                    info!(self.logger, "consensus config doesn't contain this node.");
+                    info!(self.logger, "Consensus config doesn't contain this node.");
                 }
                 if let Err(e) = reply_tx.send(true) {
                     error!(
@@ -258,8 +257,8 @@ impl Peer {
         let applied = storage.get_applied_index();
         let cfg = Config {
             id: self.id(),
-            election_tick: 30,
-            heartbeat_tick: 3,
+            election_tick: 15,
+            heartbeat_tick: 5,
             check_quorum: true,
             applied,
             ..Default::default()
@@ -300,6 +299,19 @@ impl Peer {
             //   1. block interval
             //   2. membership of peers
             PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
+                if config == *self.node().store().get_consensus_config() {
+                    info!(
+                        self.logger,
+                        "skip unmodified consensus config: {:?}", config
+                    );
+                    if let Err(e) = reply_tx.send(true) {
+                        error!(
+                            self.logger,
+                            "reply SetConsensusConfig request failed: `{}`", e
+                        );
+                    }
+                }
+
                 info!(self.logger, "change consensus config"; "new config" => ?config);
 
                 let new_peers: HashSet<u64> = config
@@ -475,7 +487,7 @@ impl Peer {
 
     // Tick raft's logical clock.
     async fn pacemaker(msg_tx: mpsc::UnboundedSender<PeerMsg>) {
-        let pace = time::Duration::from_millis(200);
+        let pace = time::Duration::from_millis(100);
         let mut ticker = time::interval(pace);
         loop {
             ticker.tick().await;

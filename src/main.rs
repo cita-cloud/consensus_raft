@@ -14,6 +14,7 @@
 
 mod config;
 mod mailbox;
+mod panic_hook;
 mod peer;
 mod storage;
 
@@ -65,8 +66,6 @@ struct RunOpts {
 }
 
 fn main() {
-    ::std::env::set_var("RUST_BACKTRACE", "full");
-
     let opts: Opts = Opts::parse();
 
     // You can handle information about subcommands by requesting their matches by name
@@ -102,6 +101,8 @@ fn main() {
                     );
                 }
             };
+
+            panic_hook::set_panic_handler(logger.clone());
 
             info!(logger, "server start, grpc port: {}", opts.grpc_port);
 

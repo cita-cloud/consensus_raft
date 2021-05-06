@@ -164,7 +164,6 @@ impl LogFile {
         self.file.seek(pos).await.unwrap();
     }
 
-    #[allow(unused)]
     async fn len(&self) -> u64 {
         let metadata = self.file.metadata().await.unwrap();
         metadata.len()
