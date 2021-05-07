@@ -347,7 +347,10 @@ impl Peer {
                         is_success = false;
                     }
                 } else {
-                    info!(self.logger, "skip peer conf change since it's using the same conf");
+                    info!(
+                        self.logger,
+                        "skip peer conf change since it's using the same conf"
+                    );
                 }
 
                 if let Err(e) = reply_tx.send(is_success) {
