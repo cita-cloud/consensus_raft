@@ -67,6 +67,7 @@ enum WalOpType {
     ApplySnapshot = 4,
     AppendEntries = 5,
     AdvanceAppliedIndex = 6,
+    UpdateBlockHeight = 7,
 }
 
 #[derive(ThisError, Debug)]
@@ -90,6 +91,7 @@ impl TryFrom<u8> for WalOpType {
             4 => Self::ApplySnapshot,
             5 => Self::AppendEntries,
             6 => Self::AdvanceAppliedIndex,
+            7 => Self::UpdateBlockHeight,
             _ => return Err(DecodeLogError::CorruptedWalOpType),
         };
         Ok(ty)
@@ -194,6 +196,8 @@ struct WalStorageCore {
 
     consensus_config: ConsensusConfiguration,
 
+    block_height: u64,
+
     log_dir: PathBuf,
     active_log: Option<LogFile>,
 
@@ -215,6 +219,7 @@ impl WalStorageCore {
             entries: vec![],
             applied_index: 0,
             consensus_config: ConsensusConfiguration::default(),
+            block_height: 0,
             log_dir,
             active_log: None,
             compact_limit,
@@ -382,6 +387,10 @@ impl WalStorageCore {
                 let applied_index = log_data.get_u64();
                 self.advance_applied_index(applied_index);
             }
+            UpdateBlockHeight => {
+                let height = log_data.get_u64();
+                self.update_block_height(height);
+            }
         }
         let consumed = remaining - log_data.remaining();
         Ok(consumed)
@@ -538,6 +547,17 @@ impl WalStorageCore {
         self.mut_active_log().write_all(&buf).await;
     }
 
+    fn update_block_height(&mut self, height: u64) {
+        self.block_height = height;
+    }
+
+    async fn log_update_block_height(&mut self, height: u64) {
+        let mut buf = BytesMut::new();
+        buf.put_u8(WalOpType::UpdateBlockHeight as u8);
+        buf.put_u64(height);
+        self.mut_active_log().write_all(&buf).await;
+    }
+
     // This is also used for log compaction.
     async fn generate_new_active_log(&mut self) {
         if let Some(mut old_log) = self.active_log.take() {
@@ -561,6 +581,7 @@ impl WalStorageCore {
             .await;
         self.log_update_consensus_config(&self.consensus_config.clone())
             .await;
+        self.log_update_block_height(self.block_height).await;
 
         let acitve_log = self.mut_active_log();
         acitve_log.flush().await;
@@ -616,6 +637,10 @@ impl WalStorage {
         &self.0.consensus_config
     }
 
+    pub fn get_block_height(&self) -> u64 {
+        self.0.block_height
+    }
+
     pub async fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<(), StorageError> {
         self.0.log_apply_snapshot(&snapshot).await;
         self.0.flush().await;
@@ -656,6 +681,12 @@ impl WalStorage {
         self.0.log_update_consensus_config(&config).await;
         self.0.flush().await;
         self.0.update_consensus_config(config);
+    }
+
+    pub async fn update_block_height(&mut self, height: u64) {
+        self.0.log_update_block_height(height).await;
+        self.0.flush().await;
+        self.0.update_block_height(height);
     }
 
     pub async fn maybe_compact(&mut self) {
@@ -918,6 +949,35 @@ mod tests {
         assert_eq!(store.0.consensus_config, consensus_config);
         store = new_store(&log_dir).await;
         assert_eq!(store.0.consensus_config, consensus_config);
+    }
+
+    #[tokio::test]
+    async fn test_update_block_height() {
+        let log_dir = tempdir().unwrap();
+        let mut store = new_store(&log_dir).await;
+
+        let height = 1024;
+        store.update_block_height(height).await;
+
+        assert_eq!(store.0.block_height, height);
+        store = new_store(&log_dir).await;
+        assert_eq!(store.0.block_height, height);
+    }
+
+    #[tokio::test]
+    async fn test_compact_preserve_block_height() {
+        let log_dir = tempdir().unwrap();
+        let mut store = new_store(&log_dir).await;
+
+        let height = 1024;
+        store.update_block_height(height).await;
+
+        assert_eq!(store.0.block_height, height);
+
+        store.0.generate_new_active_log().await;
+        store = new_store(&log_dir).await;
+
+        assert_eq!(store.0.block_height, height);
     }
 
     #[tokio::test]

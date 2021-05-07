@@ -281,9 +281,21 @@ impl Peer {
     async fn handle_msg(&mut self, msg: PeerMsg) {
         match msg {
             PeerMsg::Control(ControlMsg::Propose { data }) => {
-                info!(self.logger, "propose"; "hash" => hex::encode(&data));
-                if let Err(e) = self.mut_node().propose(vec![], data) {
-                    warn!(self.logger, "propose failed: `{}`", e);
+                let proposal = Proposal::decode(data.as_slice()).unwrap();
+                let current_block_height = self.node().store().get_block_height();
+
+                if proposal.height == current_block_height + 1 {
+                    info!(self.logger, "propose"; "hash" => hex::encode(&data));
+                    if let Err(e) = self.mut_node().propose(vec![], data) {
+                        warn!(self.logger, "propose failed: `{}`", e);
+                    }
+                } else {
+                    warn!(
+                        self.logger,
+                        "skip proposing for proposal {:?}, current committed block height is {}",
+                        proposal,
+                        current_block_height,
+                    );
                 }
             }
             PeerMsg::Control(ControlMsg::GetBlockInterval { reply_tx }) => {
@@ -586,19 +598,36 @@ impl Peer {
                 EntryType::EntryNormal => {
                     info!(self.logger, "commiting proposal"; "entry" => hex::encode(entry.data.clone()));
                     let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
+                    let current_block_height = self.node().store().get_block_height();
 
-                    let pwp = ProposalWithProof {
-                        proposal: Some(proposal),
-                        // Empty proof for non-BFT consensus.
-                        proof: vec![],
-                    };
-                    let retry_secs = 3;
-                    let mut retry_interval = time::interval(time::Duration::from_secs(retry_secs));
-                    while let Err(e) = self.mailbox_control.commit_block(pwp.clone()).await {
-                        retry_interval.tick().await;
+                    if proposal.height == current_block_height + 1 {
+                        let pwp = ProposalWithProof {
+                            proposal: Some(proposal),
+                            // Empty proof for non-BFT consensus.
+                            proof: vec![],
+                        };
+                        let retry_secs = 3;
+                        let mut retry_interval =
+                            time::interval(time::Duration::from_secs(retry_secs));
+                        while let Err(e) = self.mailbox_control.commit_block(pwp.clone()).await {
+                            retry_interval.tick().await;
+                            warn!(
+                                self.logger,
+                                "commit block failed, retry in {} secs. Reason: `{}`",
+                                retry_secs,
+                                e
+                            );
+                        }
+                        self.mut_node()
+                            .mut_store()
+                            .update_block_height(current_block_height + 1)
+                            .await;
+                    } else {
                         warn!(
                             self.logger,
-                            "commit block failed, retry in {} secs. Reason: `{}`", retry_secs, e
+                            "skip commit_block for proposal {:?}, current committed block height is {}",
+                            proposal,
+                            current_block_height,
                         );
                     }
                 }
