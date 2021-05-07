@@ -299,19 +299,6 @@ impl Peer {
             //   1. block interval
             //   2. membership of peers
             PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
-                if config == *self.node().store().get_consensus_config() {
-                    info!(
-                        self.logger,
-                        "skip unmodified consensus config: {:?}", config
-                    );
-                    if let Err(e) = reply_tx.send(true) {
-                        error!(
-                            self.logger,
-                            "reply SetConsensusConfig request failed: `{}`", e
-                        );
-                    }
-                }
-
                 info!(self.logger, "change consensus config"; "new config" => ?config);
 
                 let new_peers: HashSet<u64> = config
@@ -354,9 +341,13 @@ impl Peer {
                 };
 
                 let mut is_success = true;
-                if let Err(e) = self.mut_node().propose_conf_change(vec![], cc) {
-                    warn!(self.logger, "propose conf change failed: `{}`", e);
-                    is_success = false;
+                if !cc.changes.is_empty() {
+                    if let Err(e) = self.mut_node().propose_conf_change(vec![], cc) {
+                        warn!(self.logger, "propose conf change failed: `{}`", e);
+                        is_success = false;
+                    }
+                } else {
+                    info!(self.logger, "skip peer conf change since it's using the same conf");
                 }
 
                 if let Err(e) = reply_tx.send(is_success) {
@@ -679,7 +670,7 @@ impl PeerControl {
         let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
         let msg = PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx });
         self.msg_tx.send(msg).unwrap();
-        // FIXME: conf change may failed to propose if there is no leader.
+        // FIXME: conf change may fail to propose if there is no leader.
         tokio::spawn(async move {
             reply_rx.recv().await.unwrap();
         });
