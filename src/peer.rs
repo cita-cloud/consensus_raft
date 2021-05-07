@@ -236,10 +236,19 @@ impl Peer {
                     if index == 0 {
                         self.mut_node().campaign().unwrap();
                     }
+
+                    if let Err(e) = reply_tx.send(true) {
+                        error!(
+                            self.logger,
+                            "[During started] reply SetConsensusConfig request failed: `{}`", e
+                        );
+                    }
+
                     break;
                 } else {
                     info!(self.logger, "Consensus config doesn't contain this node.");
                 }
+
                 if let Err(e) = reply_tx.send(true) {
                     error!(
                         self.logger,
