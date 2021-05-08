@@ -605,9 +605,16 @@ impl Peer {
         {
             match entry.get_entry_type() {
                 EntryType::EntryNormal => {
-                    info!(self.logger, "commiting proposal"; "entry" => hex::encode(entry.data.clone()));
                     let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
+                    let proposal_height = proposal.height;
                     let current_block_height = self.node().store().get_block_height();
+
+                    info!(
+                        self.logger,
+                        "try to commit proposal `{}` with height `{}`",
+                        hex::encode(entry.data.clone()),
+                        proposal_height,
+                    );
 
                     if proposal.height == current_block_height + 1 {
                         let pwp = ProposalWithProof {
@@ -618,24 +625,35 @@ impl Peer {
                         let retry_secs = 3;
                         let mut retry_interval =
                             time::interval(time::Duration::from_secs(retry_secs));
+                        // First tick won't wait, skip it.
+                        retry_interval.tick().await;
+
                         while let Err(e) = self.mailbox_control.commit_block(pwp.clone()).await {
-                            retry_interval.tick().await;
                             warn!(
                                 self.logger,
-                                "commit block failed, retry in {} secs. Reason: `{}`",
+                                "commit_block failed, retry in {} secs. Reason: `{}`",
                                 retry_secs,
-                                e
+                                e,
                             );
+                            retry_interval.tick().await;
                         }
                         self.mut_node()
                             .mut_store()
                             .update_block_height(current_block_height + 1)
                             .await;
+
+                        info!(
+                            self.logger,
+                            "proposal `{}` committed at block height `{}`",
+                            hex::encode(entry.data.clone()),
+                            current_block_height + 1,
+                        );
                     } else {
                         warn!(
                             self.logger,
-                            "skip commit_block for proposal {:?}, current committed block height is {}",
-                            proposal,
+                            "skip commit_block for proposal `{}` with height `{}`, because current committed block height is `{}`",
+                            hex::encode(entry.data.clone()),
+                            proposal_height,
                             current_block_height,
                         );
                     }
