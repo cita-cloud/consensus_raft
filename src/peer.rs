@@ -198,7 +198,7 @@ impl Peer {
     async fn wait_init(&mut self, mut storage: WalStorage) {
         while let Some(msg) = self.msg_rx.recv().await {
             if let PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) = msg {
-                debug!(
+                info!(
                     self.logger,
                     "node_addr: `{}`, incoming config: `{:?}`",
                     hex::encode(&self.node_addr),
@@ -280,7 +280,7 @@ impl Peer {
         tokio::spawn(Self::wait_proposal(self.service(), self.logger.clone()));
         // Send tick msg to raft periodically.
         tokio::spawn(Self::pacemaker(self.msg_tx.clone()));
-        debug!(&self.logger, "Raft node started");
+        debug!(self.logger, "Raft node started");
     }
 
     fn id(&self) -> u64 {
