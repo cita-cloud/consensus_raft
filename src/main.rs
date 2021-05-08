@@ -14,6 +14,7 @@
 
 mod config;
 mod mailbox;
+mod panic_hook;
 mod peer;
 mod storage;
 
@@ -38,7 +39,7 @@ const GIT_HOMEPAGE: &str = "https://github.com/cita-cloud/consensus_raft";
 /// This doc string acts as a help message when the user runs '--help'
 /// as do all doc strings on fields
 #[derive(Clap)]
-#[clap(version = "0.1.0", author = "Rivtower Technologies.")]
+#[clap(version = "0.2.0", author = "Rivtower Technologies.")]
 struct Opts {
     #[clap(subcommand)]
     subcmd: SubCommand,
@@ -65,8 +66,6 @@ struct RunOpts {
 }
 
 fn main() {
-    ::std::env::set_var("RUST_BACKTRACE", "full");
-
     let opts: Opts = Opts::parse();
 
     // You can handle information about subcommands by requesting their matches by name
@@ -103,6 +102,8 @@ fn main() {
                 }
             };
 
+            panic_hook::set_panic_handler(logger.clone());
+
             info!(logger, "server start, grpc port: {}", opts.grpc_port);
 
             if let Err(e) = run(opts, logger.clone()) {
@@ -133,13 +134,13 @@ async fn register_network_msg_handler(
 }
 
 use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServer;
-use cita_cloud_proto::consensus::ConsensusConfiguration;
 use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
 use cita_cloud_proto::network::network_service_client::NetworkServiceClient;
 use cita_cloud_proto::network::RegisterInfo;
 
 use crate::mailbox::Mailbox;
 use std::time::Duration;
+use tokio::fs;
 use tokio::sync::mpsc;
 use tokio::time;
 use tonic::{transport::Server, Request};
@@ -151,8 +152,8 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
         .unwrap_or_else(|err| panic!("Error while loading config: [{}]", err));
     let config = config::RaftConfig::new(&buffer);
 
-    // ID starts from 1 since RawNode's ID can't be 0.
-    let node_id = config.node_id + 1;
+    let node_addr = hex::decode(&fs::read("node_address").await?[2..])?;
+    let node_id = address_to_peer_id(&node_addr);
     let network_port = config.network_port;
     let controller_port = config.controller_port;
 
@@ -192,27 +193,18 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
     let mailbox_control = mailbox.control();
 
     // peer
-    let init_leader_id = 1;
-    let config = ConsensusConfiguration {
-        height: 0,
-        block_interval: 6,
-        validators: vec![],
-    };
-    let data_dir = std::env::current_dir()?;
+    let data_dir = std::env::current_dir()?.join("raft-data-dir");
     let mut peer = peer::Peer::new(
-        node_id,
-        config,
+        node_addr,
         msg_tx,
         msg_rx,
         mailbox_control.clone(),
-        init_leader_id,
         data_dir,
         logger.clone(),
     )
     .await;
 
     // run
-    let peer_control = peer.control();
     let raft_service = peer.service();
 
     info!(logger, "start raft");
@@ -224,10 +216,6 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
         peer.run().await;
     });
 
-    if node_id == init_leader_id {
-        peer_control.campaign();
-    }
-
     info!(logger, "start grpc server!");
     Server::builder()
         .add_service(ConsensusServiceServer::new(raft_service.clone()))
@@ -235,4 +223,37 @@ async fn run(opts: RunOpts, logger: Logger) -> Result<(), Box<dyn std::error::Er
         .serve(addr)
         .await?;
     Ok(())
+}
+
+// This is a very hacky way to map address to peer_id.
+// Because raft needs an id of integer type, but only
+// addresses are provided.
+// This also make peer_id unreadable.
+//
+// According to DefaultHasher's doc, it's fine when all peers are using the same build.
+// "This hasher is not guaranteed to be the same as all other DefaultHasher instances,
+// but is the same as all other DefaultHasher instances created through new or default."
+//
+// I don't like this, maybe fix it in the future, but leaves it here for now.
+fn address_to_peer_id(addr: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+    let mut hasher = DefaultHasher::new();
+    hasher.write(addr);
+    hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::address_to_peer_id;
+
+    #[test]
+    fn test_address_to_peer_id() {
+        let addrs: Vec<&[u8]> = vec![b"", b"1", b"1234"];
+        for addr in addrs {
+            let first = address_to_peer_id(&addr);
+            let second = address_to_peer_id(&addr);
+            assert_eq!(first, second);
+        }
+    }
 }

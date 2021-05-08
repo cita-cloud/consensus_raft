@@ -218,7 +218,13 @@ impl<T: Letter> Mailbox<T> {
     }
 
     pub async fn run(&mut self) {
+        let refresh_interval = time::Duration::from_secs(6);
+        let mut refresh_time = time::Instant::now();
         while let Some(m) = self.mail_get.recv().await {
+            if refresh_time.elapsed() > refresh_interval {
+                self.mailbook.clear();
+                refresh_time = time::Instant::now();
+            }
             if let Err(e) = self.handle_mail(m) {
                 warn!(self.logger, "handle mail failed: `{}`", e);
             }

@@ -12,6 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp;
+use std::convert::TryFrom;
+use std::convert::TryInto;
+use std::path::Path;
+use std::path::PathBuf;
+
+use cita_cloud_proto::consensus::ConsensusConfiguration;
 use raft::prelude::ConfState;
 use raft::prelude::Entry;
 use raft::prelude::HardState;
@@ -20,10 +27,6 @@ use raft::prelude::Snapshot;
 use raft::prelude::SnapshotMetadata;
 use raft::prelude::Storage;
 use raft::StorageError;
-use std::cmp;
-use std::convert::TryInto;
-use std::path::Path;
-use std::path::PathBuf;
 
 use prost::Message;
 
@@ -35,12 +38,14 @@ use tokio::io::AsyncSeekExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::SeekFrom;
 
-use std::convert::TryFrom;
-
 use bytes::Buf;
-
 use bytes::BufMut;
 use bytes::BytesMut;
+
+use slog::error;
+use slog::info;
+use slog::warn;
+use slog::Logger;
 
 use thiserror::Error as ThisError;
 
@@ -58,9 +63,11 @@ const WAL_TEMP_LOG_NAME: &str = "raft-wal-log.temp";
 enum WalOpType {
     UpdateHardState = 1,
     UpdateConfState = 2,
-    ApplySnapshot = 3,
-    AppendEntries = 4,
-    AdvanceAppliedIndex = 5,
+    UpdateConsensusConfig = 3,
+    ApplySnapshot = 4,
+    AppendEntries = 5,
+    AdvanceAppliedIndex = 6,
+    UpdateBlockHeight = 7,
 }
 
 #[derive(ThisError, Debug)]
@@ -80,9 +87,11 @@ impl TryFrom<u8> for WalOpType {
         let ty = match value {
             1 => Self::UpdateHardState,
             2 => Self::UpdateConfState,
-            3 => Self::ApplySnapshot,
-            4 => Self::AppendEntries,
-            5 => Self::AdvanceAppliedIndex,
+            3 => Self::UpdateConsensusConfig,
+            4 => Self::ApplySnapshot,
+            5 => Self::AppendEntries,
+            6 => Self::AdvanceAppliedIndex,
+            7 => Self::UpdateBlockHeight,
             _ => return Err(DecodeLogError::CorruptedWalOpType),
         };
         Ok(ty)
@@ -157,7 +166,6 @@ impl LogFile {
         self.file.seek(pos).await.unwrap();
     }
 
-    #[allow(unused)]
     async fn len(&self) -> u64 {
         let metadata = self.file.metadata().await.unwrap();
         metadata.len()
@@ -186,13 +194,21 @@ struct WalStorageCore {
     entries: Vec<Entry>,
     applied_index: u64,
 
-    log_dir: PathBuf,
+    consensus_config: ConsensusConfiguration,
 
+    block_height: u64,
+
+    log_dir: PathBuf,
     active_log: Option<LogFile>,
+
+    compact_limit: u64,
+
+    // slog logger
+    logger: Logger,
 }
 
 impl WalStorageCore {
-    async fn new<P: AsRef<Path>>(log_dir: P) -> Self {
+    async fn new<P: AsRef<Path>>(log_dir: P, compact_limit: u64, logger: Logger) -> Self {
         let log_dir = log_dir.as_ref().to_path_buf();
         if !log_dir.exists() {
             fs::create_dir_all(&log_dir).await.unwrap();
@@ -202,13 +218,17 @@ impl WalStorageCore {
             snapshot_metadata: SnapshotMetadata::default(),
             entries: vec![],
             applied_index: 0,
+            consensus_config: ConsensusConfiguration::default(),
+            block_height: 0,
             log_dir,
             active_log: None,
+            compact_limit,
+            logger,
         };
 
         let active_path = store.log_dir.join(WAL_ACTIVE_LOG_NAME);
         if active_path.exists() {
-            println!("recover from active_path.");
+            info!(store.logger, "recover from active_path.");
             let mut active_log = LogFile::open(active_path).await.unwrap();
             // Active log may have corrupt log tail.
             store.recover_from_log(&mut active_log, true).await;
@@ -216,12 +236,12 @@ impl WalStorageCore {
         } else {
             let backup_path = store.log_dir.join(WAL_BACKUP_LOG_NAME);
             if backup_path.exists() {
-                println!("recover from backup_path.");
+                info!(store.logger, "recover from backup_path.");
                 let mut bakcup_log = LogFile::open(backup_path).await.unwrap();
                 // Backup log should not contains corrupt data.
                 store.recover_from_log(&mut bakcup_log, false).await;
             } else {
-                println!("create a new wal log set.");
+                info!(store.logger, "create a new wal log set.");
             }
             store.generate_new_active_log().await;
         }
@@ -306,12 +326,13 @@ impl WalStorageCore {
 
         if processed != log_data.len() {
             if allow_corrupt_log_tail {
-                println!(
+                warn!(
+                    self.logger,
                     "raft log is corrupted at {}, total {} bytes",
                     processed,
                     log_data.len()
                 );
-                println!("truncate and backup active log");
+                warn!(self.logger, "truncate and backup active log");
 
                 // backup corrupt data
                 let backup_path = self.log_dir.join("corrupt-raft-log.backup");
@@ -345,6 +366,10 @@ impl WalStorageCore {
                 let conf_state = ConfState::decode_length_delimited(&mut log_data)?;
                 self.update_conf_state(conf_state);
             }
+            UpdateConsensusConfig => {
+                let config = ConsensusConfiguration::decode_length_delimited(&mut log_data)?;
+                self.update_consensus_config(config);
+            }
             ApplySnapshot => {
                 let snapshot = Snapshot::decode_length_delimited(&mut log_data)?;
                 let _ = self.apply_snapshot(snapshot);
@@ -361,6 +386,10 @@ impl WalStorageCore {
             AdvanceAppliedIndex => {
                 let applied_index = log_data.get_u64();
                 self.advance_applied_index(applied_index);
+            }
+            UpdateBlockHeight => {
+                let height = log_data.get_u64();
+                self.update_block_height(height);
             }
         }
         let consumed = remaining - log_data.remaining();
@@ -467,6 +496,12 @@ impl WalStorageCore {
         // This may occur when creating a new active log without new applied entry
         // than the one in snapshot.
         if self.snapshot_metadata.get_index() > index {
+            warn!(
+                self.logger,
+                "Ignore outdated incoming snapshot with index `{}`, current snapshot index is `{}`.",
+                self.snapshot_metadata.get_index(),
+                index,
+            );
             return Err(StorageError::SnapshotOutOfDate);
         }
 
@@ -489,7 +524,7 @@ impl WalStorageCore {
         // Update conf states.
         self.raft_state.conf_state = meta.take_conf_state();
 
-        println!("restore snapshot");
+        info!(self.logger, "Restore snapshot");
 
         Ok(())
     }
@@ -498,6 +533,28 @@ impl WalStorageCore {
         let mut buf = BytesMut::new();
         buf.put_u8(WalOpType::ApplySnapshot as u8);
         snapshot.encode_length_delimited(&mut buf).unwrap();
+        self.mut_active_log().write_all(&buf).await;
+    }
+
+    fn update_consensus_config(&mut self, config: ConsensusConfiguration) {
+        self.consensus_config = config;
+    }
+
+    async fn log_update_consensus_config(&mut self, config: &ConsensusConfiguration) {
+        let mut buf = BytesMut::new();
+        buf.put_u8(WalOpType::UpdateConsensusConfig as u8);
+        config.encode_length_delimited(&mut buf).unwrap();
+        self.mut_active_log().write_all(&buf).await;
+    }
+
+    fn update_block_height(&mut self, height: u64) {
+        self.block_height = height;
+    }
+
+    async fn log_update_block_height(&mut self, height: u64) {
+        let mut buf = BytesMut::new();
+        buf.put_u8(WalOpType::UpdateBlockHeight as u8);
+        buf.put_u64(height);
         self.mut_active_log().write_all(&buf).await;
     }
 
@@ -522,10 +579,18 @@ impl WalStorageCore {
         // This is used for update committed index, because the snapshot only contains applied index.
         self.log_update_hard_state(&self.raft_state.hard_state.clone())
             .await;
+        self.log_update_consensus_config(&self.consensus_config.clone())
+            .await;
+        self.log_update_block_height(self.block_height).await;
 
         let acitve_log = self.mut_active_log();
         acitve_log.flush().await;
         acitve_log.rename_to(WAL_ACTIVE_LOG_NAME).await;
+    }
+
+    // panic if active log is none
+    fn active_log(&self) -> &LogFile {
+        self.active_log.as_ref().unwrap()
     }
 
     // panic if active log is none
@@ -536,6 +601,13 @@ impl WalStorageCore {
     async fn flush(&mut self) {
         self.mut_active_log().flush().await;
     }
+
+    async fn maybe_compact(&mut self) {
+        // 0 means don't compact
+        if self.compact_limit > 0 && self.active_log().len().await > self.compact_limit {
+            self.generate_new_active_log().await;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -543,8 +615,8 @@ pub struct WalStorage(WalStorageCore);
 
 // The public interface, the WAL operations.
 impl WalStorage {
-    pub async fn new<P: AsRef<Path>>(log_dir: P) -> Self {
-        let core = WalStorageCore::new(log_dir).await;
+    pub async fn new<P: AsRef<Path>>(log_dir: P, compact_limit: u64, logger: Logger) -> Self {
+        let core = WalStorageCore::new(log_dir, compact_limit, logger).await;
         WalStorage(core)
     }
 
@@ -559,6 +631,14 @@ impl WalStorage {
 
     pub fn get_conf_state(&self) -> &ConfState {
         &self.0.raft_state.conf_state
+    }
+
+    pub fn get_consensus_config(&self) -> &ConsensusConfiguration {
+        &self.0.consensus_config
+    }
+
+    pub fn get_block_height(&self) -> u64 {
+        self.0.block_height
     }
 
     pub async fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<(), StorageError> {
@@ -595,6 +675,22 @@ impl WalStorage {
         self.0.log_advance_applied_index(applied_index).await;
         self.0.flush().await;
         self.0.advance_applied_index(applied_index);
+    }
+
+    pub async fn update_consensus_config(&mut self, config: ConsensusConfiguration) {
+        self.0.log_update_consensus_config(&config).await;
+        self.0.flush().await;
+        self.0.update_consensus_config(config);
+    }
+
+    pub async fn update_block_height(&mut self, height: u64) {
+        self.0.log_update_block_height(height).await;
+        self.0.flush().await;
+        self.0.update_block_height(height);
+    }
+
+    pub async fn maybe_compact(&mut self) {
+        self.0.maybe_compact().await;
     }
 }
 
@@ -701,6 +797,21 @@ mod tests {
     use std::ffi::OsString;
     use tempfile::tempdir;
 
+    async fn new_store<P: AsRef<Path>>(log_dir: &P) -> WalStorage {
+        let logger = {
+            use sloggers::file::FileLoggerBuilder;
+            use sloggers::types::Severity;
+            use sloggers::Build as _;
+
+            let log_level = Severity::Debug;
+            let log_path = log_dir.as_ref().join("raft-test.log");
+            let mut log_builder = FileLoggerBuilder::new(&log_path);
+            log_builder.level(log_level);
+            log_builder.build().expect("can't build terminal logger")
+        };
+        WalStorage::new(log_dir, 0, logger).await
+    }
+
     fn entry(term: u64, index: u64) -> Entry {
         Entry {
             term,
@@ -757,7 +868,7 @@ mod tests {
     #[tokio::test]
     async fn test_rewrite_entries() {
         let log_dir = tempdir().unwrap();
-        let mut store = WalStorage::new(&log_dir).await;
+        let mut store = new_store(&log_dir).await;
 
         store
             .append_entries(&[entry(1, 1), entry(1, 2), entry(1, 3)])
@@ -770,26 +881,26 @@ mod tests {
 
         // before and after recovery
         assert_eq!(store.0.entries, &expect_entries);
-        store = WalStorage::new(&log_dir).await;
+        store = new_store(&log_dir).await;
         assert_eq!(store.0.entries, &expect_entries);
     }
 
     #[tokio::test]
     async fn test_advance_applied_index() {
         let log_dir = tempdir().unwrap();
-        let mut store = WalStorage::new(&log_dir).await;
+        let mut store = new_store(&log_dir).await;
 
         store.advance_applied_index(42).await;
 
         assert_eq!(store.0.applied_index, 42);
-        store = WalStorage::new(&log_dir).await;
+        store = new_store(&log_dir).await;
         assert_eq!(store.0.applied_index, 42);
     }
 
     #[tokio::test]
     async fn test_update_conf_state() {
         let log_dir = tempdir().unwrap();
-        let mut store = WalStorage::new(&log_dir).await;
+        let mut store = new_store(&log_dir).await;
 
         let conf_state = ConfState {
             voters: vec![1, 2, 3],
@@ -799,14 +910,14 @@ mod tests {
         store.update_conf_state(conf_state.clone()).await;
 
         assert_eq!(store.0.raft_state.conf_state, conf_state);
-        store = WalStorage::new(&log_dir).await;
+        store = new_store(&log_dir).await;
         assert_eq!(store.0.raft_state.conf_state, conf_state);
     }
 
     #[tokio::test]
     async fn test_update_hard_state() {
         let log_dir = tempdir().unwrap();
-        let mut store = WalStorage::new(&log_dir).await;
+        let mut store = new_store(&log_dir).await;
 
         let hard_state = HardState {
             term: 3,
@@ -816,17 +927,67 @@ mod tests {
         store.update_hard_state(hard_state.clone()).await;
 
         assert_eq!(store.0.raft_state.hard_state, hard_state);
-        store = WalStorage::new(&log_dir).await;
+        store = new_store(&log_dir).await;
         assert_eq!(store.0.raft_state.hard_state, hard_state);
+    }
+
+    #[tokio::test]
+    async fn test_update_consensus_config() {
+        let log_dir = tempdir().unwrap();
+        let mut store = new_store(&log_dir).await;
+
+        let consensus_config = ConsensusConfiguration {
+            height: 1024,
+            block_interval: 9,
+            validators: vec![b"1234".to_vec(), b"5678".to_vec()],
+        };
+
+        store
+            .update_consensus_config(consensus_config.clone())
+            .await;
+
+        assert_eq!(store.0.consensus_config, consensus_config);
+        store = new_store(&log_dir).await;
+        assert_eq!(store.0.consensus_config, consensus_config);
+    }
+
+    #[tokio::test]
+    async fn test_update_block_height() {
+        let log_dir = tempdir().unwrap();
+        let mut store = new_store(&log_dir).await;
+
+        let height = 1024;
+        store.update_block_height(height).await;
+
+        assert_eq!(store.0.block_height, height);
+        store = new_store(&log_dir).await;
+        assert_eq!(store.0.block_height, height);
+    }
+
+    #[tokio::test]
+    async fn test_compact_preserve_block_height() {
+        let log_dir = tempdir().unwrap();
+        let mut store = new_store(&log_dir).await;
+
+        let height = 1024;
+        store.update_block_height(height).await;
+
+        assert_eq!(store.0.block_height, height);
+
+        store.0.generate_new_active_log().await;
+        store = new_store(&log_dir).await;
+
+        assert_eq!(store.0.block_height, height);
     }
 
     #[tokio::test]
     async fn test_empty_snapshot() {
         let log_dir = tempdir().unwrap();
-        let mut store = WalStorage::new(&log_dir).await;
+        let mut store = new_store(&log_dir).await;
+
         let snapshot = store.snapshot(0).unwrap();
         store.apply_snapshot(snapshot).await.unwrap();
-        store = WalStorage::new(&log_dir).await;
+        store = new_store(&log_dir).await;
         assert!(store.0.entries.is_empty());
         assert_eq!(store.0.raft_state.hard_state, HardState::default());
         assert_eq!(store.0.raft_state.conf_state, ConfState::default());
@@ -844,7 +1005,7 @@ mod tests {
     #[tokio::test]
     async fn test_outdated_snapshot() {
         let log_dir = tempdir().unwrap();
-        let mut store = WalStorage::new(&log_dir).await;
+        let mut store = new_store(&log_dir).await;
 
         store.append_entries(&[entry(1, 1), entry(1, 2)]).await;
         store.advance_applied_index(2).await;
@@ -862,7 +1023,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_preserve_uncommitted_entries() {
         let log_dir = tempdir().unwrap();
-        let mut store = WalStorage::new(&log_dir).await;
+        let mut store = new_store(&log_dir).await;
 
         let hard_state = HardState {
             term: 1,
@@ -902,7 +1063,7 @@ mod tests {
 
         assert_eq!(store.0.entries, &[entry(1, 4), entry(1, 5),]);
 
-        store = WalStorage::new(&log_dir).await;
+        store = new_store(&log_dir).await;
 
         assert_eq!(store.0.entries, &[entry(1, 4), entry(1, 5),]);
     }
@@ -910,7 +1071,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_committed_higher_than_applied() {
         let log_dir = tempdir().unwrap();
-        let mut store = WalStorage::new(&log_dir).await;
+        let mut store = new_store(&log_dir).await;
 
         store
             .append_entries(&[
@@ -953,7 +1114,7 @@ mod tests {
 
     async fn test_recover_from_log(from_backup: bool) {
         let log_dir = tempdir().unwrap();
-        let mut store = WalStorage::new(&log_dir).await;
+        let mut store = new_store(&log_dir).await;
 
         store
             .append_entries(&[entry(1, 1), entry(2, 2), entry(2, 3)])
@@ -984,7 +1145,7 @@ mod tests {
                 .unwrap();
         }
 
-        store = WalStorage::new(&log_dir).await;
+        store = new_store(&log_dir).await;
 
         assert_eq!(&store.0.entries, &[entry(2, 4), entry(3, 5),]);
         assert_eq!(store.0.applied_index, 3);
@@ -996,7 +1157,8 @@ mod tests {
     #[should_panic]
     async fn test_panic_backup_log_corrupt() {
         let log_dir = tempdir().unwrap();
-        let mut store = WalStorage::new(&log_dir).await;
+        let mut store = new_store(&log_dir).await;
+
         store
             .append_entries(&[entry(1, 1), entry(1, 2), entry(1, 3)])
             .await;
@@ -1020,13 +1182,13 @@ mod tests {
         backup_log.write_all(&[255]).await;
 
         // Should panic here
-        let _ = WalStorage::new(&log_dir).await;
+        let _ = new_store(&log_dir).await;
     }
 
     #[tokio::test]
     async fn test_allow_active_log_corrupt_tail() {
         let log_dir = tempdir().unwrap();
-        let mut store = WalStorage::new(&log_dir).await;
+        let mut store = new_store(&log_dir).await;
         store
             .append_entries(&[entry(1, 1), entry(1, 2), entry(1, 3)])
             .await;
@@ -1041,9 +1203,26 @@ mod tests {
         active_log.seek(SeekFrom::Start(corrupt_pos)).await;
         active_log.write_all(&[255]).await;
 
-        let store = WalStorage::new(&log_dir).await;
+        store = new_store(&log_dir).await;
 
-        assert_eq!(&store.0.entries, &[entry(1, 1), entry(1, 2), entry(1, 3),]);
+        assert_eq!(&store.0.entries, &[entry(1, 1), entry(1, 2), entry(1, 3)]);
+        assert_eq!(store.0.applied_index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_maybe_compact() {
+        let log_dir = tempdir().unwrap();
+        let mut store = new_store(&log_dir).await;
+        store.0.compact_limit = 1;
+        store.append_entries(&[entry(1, 1), entry(1, 2)]).await;
+        store.advance_applied_index(1).await;
+        store.maybe_compact().await;
+
+        assert!(log_dir.as_ref().join(WAL_ACTIVE_LOG_NAME).exists());
+        assert!(log_dir.as_ref().join(WAL_BACKUP_LOG_NAME).exists());
+
+        store = new_store(&log_dir).await;
+        assert_eq!(&store.0.entries, &[entry(1, 2)]);
         assert_eq!(store.0.applied_index, 1);
     }
 }
