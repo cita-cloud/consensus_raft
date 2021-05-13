@@ -59,7 +59,7 @@ enum SubCommand {
 #[derive(Clap)]
 struct RunOpts {
     /// Sets grpc port of this service.
-    #[clap(short = 'p', long = "port", default_value = "50003")]
+    #[clap(short = 'p', long = "port", default_value = "50001")]
     grpc_port: String,
     #[clap(long = "log", default_value = "file")]
     log: String,
