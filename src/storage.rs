@@ -18,7 +18,6 @@ use std::convert::TryInto;
 use std::path::Path;
 use std::path::PathBuf;
 
-use cita_cloud_proto::consensus::ConsensusConfiguration;
 use raft::prelude::ConfState;
 use raft::prelude::Entry;
 use raft::prelude::HardState;
@@ -48,6 +47,8 @@ use slog::warn;
 use slog::Logger;
 
 use thiserror::Error as ThisError;
+
+use cita_cloud_proto::common::ConsensusConfiguration;
 
 const NO_LIMIT: u64 = u64::MAX;
 // raft-log.backup, raft-log.1.backup, ... , raft-log.${MAX_LOG_FILE_PRESERVED}.backup

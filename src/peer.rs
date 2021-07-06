@@ -361,6 +361,14 @@ impl Peer {
                     }
                 };
 
+                // FIXME:
+                // we should refactor the reconfigure part. It's not safe if
+                // it crash during the reconfigure proccess.
+                self.mut_node()
+                    .mut_store()
+                    .update_consensus_config(config)
+                    .await;
+
                 let mut is_success = true;
                 if !cc.changes.is_empty() {
                     if let Err(e) = self.mut_node().propose_conf_change(vec![], cc) {
@@ -737,11 +745,10 @@ impl PeerControl {
     }
 }
 
+use cita_cloud_proto::common::ConsensusConfiguration;
 use cita_cloud_proto::common::ProposalWithProof;
 use cita_cloud_proto::common::SimpleResponse;
-use cita_cloud_proto::consensus::{
-    consensus_service_server::ConsensusService, ConsensusConfiguration,
-};
+use cita_cloud_proto::consensus::consensus_service_server::ConsensusService;
 use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerService;
 use cita_cloud_proto::network::NetworkMsg;
 
