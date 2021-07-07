@@ -15,7 +15,7 @@ slog = "2.7.0"
 sloggers = "1.0.1"
 crossbeam = "0.8.0"
 hex = "0.4.3"
-raft = { git = "https://github.com/tikv/raft-rs", version = "0.6.0-alpha", default-features = false, features = ["prost-codec"], rev = "a5423b241ed641ca0941c816153a9dfc0fdbfad9" }
+raft = { version = "0.6.0", default-features = false, features = ["prost-codec"] }
 prost = "0.7.0"
 tokio = { version = "1.5", features = ["fs", "io-util", "rt", "macros"] }
 anyhow = "1"

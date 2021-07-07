@@ -590,13 +590,9 @@ impl Peer {
         Ok(())
     }
 
-    fn send_messages(
-        msgs: Vec<Vec<Message>>,
-        mailbox_control: MailboxControl<PeerMsg>,
-        logger: Logger,
-    ) {
+    fn send_messages(msgs: Vec<Message>, mailbox_control: MailboxControl<PeerMsg>, logger: Logger) {
         tokio::spawn(async move {
-            for msg in msgs.into_iter().flatten() {
+            for msg in msgs.into_iter() {
                 let pm = PeerMsg::Normal(msg);
                 if let Err(e) = mailbox_control.send_message(pm).await {
                     warn!(logger, "send msg failed: {}", e);
