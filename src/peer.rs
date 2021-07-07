@@ -32,7 +32,6 @@ use anyhow::Result;
 use raft::eraftpb::ConfChangeType;
 use raft::eraftpb::Message as RaftMsg;
 use raft::eraftpb::MessageType;
-use raft::prelude::ConfChange;
 use raft::prelude::ConfChangeSingle;
 use raft::prelude::ConfChangeV2;
 use raft::prelude::Config;
@@ -291,7 +290,7 @@ impl Peer {
         match msg {
             PeerMsg::Control(ControlMsg::Propose { data }) => {
                 let proposal = Proposal::decode(data.as_slice()).unwrap();
-                let current_block_height = self.node().store().get_block_height();
+                let current_block_height = self.node().store().get_consensus_config().height;
 
                 if proposal.height == current_block_height + 1 {
                     info!(self.logger, "propose"; "hash" => hex::encode(&data));
@@ -322,66 +321,7 @@ impl Peer {
             PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
                 info!(self.logger, "change consensus config"; "new config" => ?config);
 
-                let new_peers: HashSet<u64> = config
-                    .validators
-                    .iter()
-                    .map(|addr| address_to_peer_id(addr))
-                    .collect();
-                let current_peers: HashSet<u64> = self
-                    .node()
-                    .store()
-                    .get_conf_state()
-                    .voters
-                    .iter()
-                    .copied()
-                    .collect();
-
-                let added: Vec<u64> = new_peers.difference(&current_peers).copied().collect();
-                let removed: Vec<u64> = current_peers.difference(&new_peers).copied().collect();
-
-                let cc = {
-                    let mut changes = vec![];
-                    for id in added {
-                        let ccs = ConfChangeSingle {
-                            change_type: ConfChangeType::AddNode as i32,
-                            node_id: id,
-                        };
-                        changes.push(ccs);
-                    }
-                    for id in removed {
-                        let ccs = ConfChangeSingle {
-                            change_type: ConfChangeType::RemoveNode as i32,
-                            node_id: id,
-                        };
-                        changes.push(ccs);
-                    }
-                    ConfChangeV2 {
-                        changes,
-                        ..Default::default()
-                    }
-                };
-
-                // FIXME:
-                // we should refactor the reconfigure part. It's not safe if
-                // it crash during the reconfigure proccess.
-                self.mut_node()
-                    .mut_store()
-                    .update_consensus_config(config)
-                    .await;
-
-                let mut is_success = true;
-                if !cc.changes.is_empty() {
-                    if let Err(e) = self.mut_node().propose_conf_change(vec![], cc) {
-                        warn!(self.logger, "propose conf change failed: `{}`", e);
-                        is_success = false;
-                    }
-                } else {
-                    info!(
-                        self.logger,
-                        "skip peer conf change since it's using the same conf"
-                    );
-                }
-
+                let is_success = self.update_consensus_config(config).await;
                 if let Err(e) = reply_tx.send(is_success) {
                     error!(
                         self.logger,
@@ -418,6 +358,12 @@ impl Peer {
                                     return;
                                 }
                             };
+
+                            // Skip check proposal we are lag behind
+                            if proposal.height <= self.node().store().get_consensus_config().height
+                            {
+                                continue;
+                            }
 
                             let logger = self.logger.clone();
                             let handle = tokio::spawn(async move {
@@ -483,6 +429,65 @@ impl Peer {
         }
     }
 
+    async fn update_consensus_config(&mut self, config: ConsensusConfiguration) -> bool {
+        let new_peers: HashSet<u64> = config
+            .validators
+            .iter()
+            .map(|addr| address_to_peer_id(addr))
+            .collect();
+        let current_peers: HashSet<u64> = self
+            .node()
+            .store()
+            .get_conf_state()
+            .voters
+            .iter()
+            .copied()
+            .collect();
+
+        let added: Vec<u64> = new_peers.difference(&current_peers).copied().collect();
+        let removed: Vec<u64> = current_peers.difference(&new_peers).copied().collect();
+
+        let cc = {
+            let mut changes = vec![];
+            for id in added {
+                let ccs = ConfChangeSingle {
+                    change_type: ConfChangeType::AddNode as i32,
+                    node_id: id,
+                };
+                changes.push(ccs);
+            }
+            for id in removed {
+                let ccs = ConfChangeSingle {
+                    change_type: ConfChangeType::RemoveNode as i32,
+                    node_id: id,
+                };
+                changes.push(ccs);
+            }
+            ConfChangeV2 {
+                changes,
+                ..Default::default()
+            }
+        };
+
+        // FIXME:
+        // we should refactor the reconfigure part. It's not safe if
+        // it crash during the reconfigure proccess.
+        self.mut_node()
+            .mut_store()
+            .update_consensus_config(config)
+            .await;
+
+        let mut is_success = true;
+        if !cc.changes.is_empty() {
+            if let Err(e) = self.mut_node().propose_conf_change(vec![], cc) {
+                warn!(self.logger, "propose conf change failed: `{}`", e);
+                is_success = false;
+            }
+        }
+
+        is_success
+    }
+
     // The current leader will get proposal
     // from controller every block interval secs.
     async fn wait_proposal(service: RaftService<PeerMsg>, logger: Logger) {
@@ -528,11 +533,7 @@ impl Peer {
         let mut ready = self.mut_node().ready();
 
         // Send out the message come from the node.
-        Self::send_messages(
-            ready.take_messages(),
-            self.mailbox_control.clone(),
-            self.logger.clone(),
-        );
+        self.send_messages(ready.take_messages());
 
         // Apply the snapshot.
         if *ready.snapshot() != Snapshot::default() {
@@ -571,11 +572,7 @@ impl Peer {
         }
 
         // Send out the messages.
-        Self::send_messages(
-            light_rd.take_messages(),
-            self.mailbox_control.clone(),
-            self.logger.clone(),
-        );
+        self.send_messages(light_rd.take_messages());
 
         // Apply all committed entries.
         self.handle_committed_entries(light_rd.take_committed_entries())
@@ -590,7 +587,9 @@ impl Peer {
         Ok(())
     }
 
-    fn send_messages(msgs: Vec<Message>, mailbox_control: MailboxControl<PeerMsg>, logger: Logger) {
+    fn send_messages(&self, msgs: Vec<Message>) {
+        let mailbox_control = self.mailbox_control.clone();
+        let logger = self.logger.clone();
         tokio::spawn(async move {
             for msg in msgs.into_iter() {
                 let pm = PeerMsg::Normal(msg);
@@ -611,7 +610,7 @@ impl Peer {
                 EntryType::EntryNormal => {
                     let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
                     let proposal_height = proposal.height;
-                    let current_block_height = self.node().store().get_block_height();
+                    let current_block_height = self.node().store().get_consensus_config().height;
 
                     info!(
                         self.logger,
@@ -626,32 +625,33 @@ impl Peer {
                             // Empty proof for non-BFT consensus.
                             proof: vec![],
                         };
-                        let retry_secs = 3;
-                        let mut retry_interval =
-                            time::interval(time::Duration::from_secs(retry_secs));
-                        // First tick won't wait, skip it.
-                        retry_interval.tick().await;
 
-                        while let Err(e) = self.mailbox_control.commit_block(pwp.clone()).await {
-                            warn!(
-                                self.logger,
-                                "commit_block failed, retry in {} secs. Reason: `{}`",
-                                retry_secs,
-                                e,
-                            );
-                            retry_interval.tick().await;
+                        match self.mailbox_control.commit_block(pwp).await {
+                            Ok(new_config) => {
+                                if !self.update_consensus_config(new_config).await {
+                                    warn!(
+                                        self.logger,
+                                        "fail to update consensus config after commit_block. ",
+                                    );
+                                }
+
+                                info!(
+                                    self.logger,
+                                    "proposal `{}` committed at block height `{}`",
+                                    hex::encode(entry.data.clone()),
+                                    current_block_height + 1,
+                                );
+                            }
+                            Err(e) => {
+                                let err_msg = format!(
+                                    "commit block {} failed: {}",
+                                    current_block_height + 1,
+                                    e
+                                );
+                                error!(self.logger, "{}", err_msg);
+                                panic!("{}", err_msg);
+                            }
                         }
-                        self.mut_node()
-                            .mut_store()
-                            .update_block_height(current_block_height + 1)
-                            .await;
-
-                        info!(
-                            self.logger,
-                            "proposal `{}` committed at block height `{}`",
-                            hex::encode(entry.data.clone()),
-                            current_block_height + 1,
-                        );
                     } else {
                         warn!(
                             self.logger,
@@ -663,25 +663,7 @@ impl Peer {
                     }
                 }
                 EntryType::EntryConfChange => {
-                    let cc = ConfChange::decode(entry.data.as_slice())?;
-                    let cs = self.mut_node().apply_conf_change(&cc)?;
-
-                    self.mut_node().mut_store().update_conf_state(cs).await;
-
-                    match ConfChangeType::from_i32(cc.change_type) {
-                        Some(ConfChangeType::AddNode) => {
-                            info!(self.logger, "add node #{}", cc.node_id);
-                        }
-                        Some(ConfChangeType::RemoveNode) => {
-                            info!(self.logger, "remove node #{}", cc.node_id);
-                        }
-                        Some(ConfChangeType::AddLearnerNode) => {
-                            warn!(self.logger, "add learner node #{}.", cc.node_id)
-                        }
-                        unexpected => {
-                            error!(self.logger, "unexpected conf change type: {:?}", unexpected);
-                        }
-                    }
+                    error!(self.logger, "unexpected EntryConfChange(V1)");
                 }
                 EntryType::EntryConfChangeV2 => {
                     let cc = ConfChangeV2::decode(entry.data.as_slice())?;
@@ -729,7 +711,7 @@ impl PeerControl {
         reply_rx.recv().await.unwrap()
     }
 
-    pub async fn set_consensus_config(&self, config: ConsensusConfiguration) -> bool {
+    pub async fn update_consensus_config(&self, config: ConsensusConfiguration) -> bool {
         let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
         let msg = PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx });
         self.msg_tx.send(msg).unwrap();
@@ -782,7 +764,7 @@ impl<T: Letter> ConsensusService for RaftService<T> {
         request: tonic::Request<ConsensusConfiguration>,
     ) -> std::result::Result<tonic::Response<SimpleResponse>, tonic::Status> {
         let config = request.into_inner();
-        let is_success = self.peer_control.set_consensus_config(config).await;
+        let is_success = self.peer_control.update_consensus_config(config).await;
         let reply = SimpleResponse { is_success };
         Ok(tonic::Response::new(reply))
     }
@@ -841,7 +823,7 @@ mod test {
             block_interval: 6,
             validators: vec![vec![1, 2, 3]],
         };
-        control.set_consensus_config(config).await;
+        control.update_consensus_config(config).await;
         drop(control);
         handle.await.unwrap();
     }

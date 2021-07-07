@@ -29,7 +29,7 @@ use slog::Logger;
 
 use anyhow::Result;
 
-use cita_cloud_proto::common::{Empty, Proposal, ProposalWithProof};
+use cita_cloud_proto::common::{ConsensusConfiguration, Empty, Proposal, ProposalWithProof};
 use cita_cloud_proto::controller::consensus2_controller_service_client::Consensus2ControllerServiceClient;
 
 use cita_cloud_proto::network::{network_service_client::NetworkServiceClient, NetworkMsg};
@@ -77,7 +77,7 @@ pub enum ControllerMail {
     },
     CommitBlock {
         pwp: ProposalWithProof,
-        reply_tx: oneshot::Sender<Result<()>>,
+        reply_tx: oneshot::Sender<Result<ConsensusConfiguration>>,
     },
 }
 
@@ -129,7 +129,7 @@ impl<T: Letter> MailboxControl<T> {
         reply_rx.await?
     }
 
-    pub async fn commit_block(&self, pwp: ProposalWithProof) -> Result<()> {
+    pub async fn commit_block(&self, pwp: ProposalWithProof) -> Result<ConsensusConfiguration> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let mail = ControllerMail::CommitBlock { pwp, reply_tx };
         self.mail_put.clone().send(Mail::ToController(mail))?;
@@ -337,8 +337,9 @@ impl<T: Letter> Mailbox<T> {
                         let response = controller
                             .commit_block(request)
                             .await
-                            .map(|_resp| ())
+                            .map(|resp| resp.into_inner())
                             .map_err(|e| e.into());
+
                         if let Err(e) = reply_tx.send(response) {
                             warn!(logger, "send `CommitBlock` reply failed: `{:?}`", e);
                         }
@@ -558,7 +559,9 @@ mod test {
                     Mail::ToController(ControllerMail::CommitBlock { pwp, reply_tx }) => {
                         assert!(pwp.proposal.is_some());
                         assert!(!pwp.proof.is_empty());
-                        reply_tx.send(Ok(())).unwrap();
+                        reply_tx
+                            .send(Ok(ConsensusConfiguration::default()))
+                            .unwrap();
                     }
                     Mail::ToNetwork(NetworkMail::GetNetworkStatus { reply_tx }) => {
                         reply_tx.send(Ok(42)).unwrap();
