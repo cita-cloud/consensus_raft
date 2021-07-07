@@ -320,31 +320,39 @@ impl WalStorageCore {
 
         let mut processing_buf = log_data.as_slice();
         let mut processed = 0usize;
-        while let Ok(consumed) = self.recover_one(processing_buf) {
-            processed += consumed;
-            processing_buf.advance(consumed);
-        }
+        while processed < log_data.len() {
+            match self.recover_one(processing_buf) {
+                Ok(consumed) => {
+                    processed += consumed;
+                    processing_buf.advance(consumed);
+                }
+                Err(e) => {
+                    error!(self.logger, "recover wal log failed: {}", e);
+                    if allow_corrupt_log_tail {
+                        error!(
+                            self.logger,
+                            "raft log is corrupted at {}, total {} bytes",
+                            processed,
+                            log_data.len()
+                        );
+                        error!(self.logger, "truncate and backup active log");
 
-        if processed != log_data.len() {
-            if allow_corrupt_log_tail {
-                warn!(
-                    self.logger,
-                    "raft log is corrupted at {}, total {} bytes",
-                    processed,
-                    log_data.len()
-                );
-                warn!(self.logger, "truncate and backup active log");
+                        // backup corrupt data
+                        let backup_path = self.log_dir.join("corrupt-raft-log.backup");
+                        let mut backup_file = LogFile::create(backup_path).await.unwrap();
+                        backup_file.write_all(log_data.as_mut_slice()).await;
+                        backup_file.flush().await;
 
-                // backup corrupt data
-                let backup_path = self.log_dir.join("corrupt-raft-log.backup");
-                let mut backup_file = LogFile::create(backup_path).await.unwrap();
-                backup_file.write_all(log_data.as_mut_slice()).await;
-                backup_file.flush().await;
+                        // truncate corrupt data
+                        log_file.set_len(processed as u64).await;
+                    } else {
+                        let err_msg = format!("log file `{}` is corrupt", log_file.file_name());
+                        error!(self.logger, "{}", err_msg);
+                        panic!("{}", err_msg);
+                    }
 
-                // truncate corrupt data
-                log_file.set_len(processed as u64).await;
-            } else {
-                panic!("log file `{}` is corrupt", log_file.file_name());
+                    return;
+                }
             }
         }
     }
