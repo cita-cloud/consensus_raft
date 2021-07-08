@@ -359,7 +359,7 @@ impl Peer {
                                 }
                             };
 
-                            // Skip check proposal we are lag behind
+                            // Skip check proposal if we are lagging behind.
                             if proposal.height <= self.node().store().get_consensus_config().height
                             {
                                 continue;
@@ -562,6 +562,10 @@ impl Peer {
             store.update_hard_state(hs.clone()).await;
         }
 
+        if !ready.persisted_messages().is_empty() {
+            self.send_messages(ready.take_persisted_messages());
+        }
+
         // Call `RawNode::advance` interface to update position flags in the raft.
         let mut light_rd = self.mut_node().advance(ready);
 
@@ -588,16 +592,18 @@ impl Peer {
     }
 
     fn send_messages(&self, msgs: Vec<Message>) {
-        let mailbox_control = self.mailbox_control.clone();
-        let logger = self.logger.clone();
-        tokio::spawn(async move {
-            for msg in msgs.into_iter() {
-                let pm = PeerMsg::Normal(msg);
-                if let Err(e) = mailbox_control.send_message(pm).await {
-                    warn!(logger, "send msg failed: {}", e);
+        if !msgs.is_empty() {
+            let mailbox_control = self.mailbox_control.clone();
+            let logger = self.logger.clone();
+            tokio::spawn(async move {
+                for msg in msgs {
+                    let pm = PeerMsg::Normal(msg);
+                    if let Err(e) = mailbox_control.send_message(pm).await {
+                        warn!(logger, "send msg failed: {}", e);
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     async fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) -> Result<()> {

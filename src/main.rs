@@ -80,10 +80,11 @@ fn main() {
             let logger = match opts.log.as_str() {
                 "file" => {
                     // File log
-                    let log_path = std::env::current_dir()
-                        .unwrap()
-                        .join("logs")
-                        .join("consensus_service.log");
+                    let log_path = {
+                        let log_dir = std::env::current_dir().unwrap().join("logs");
+                        let _ = std::fs::create_dir(&log_dir);
+                        log_dir.join("consensus_service.log")
+                    };
                     let mut log_builder = FileLoggerBuilder::new(log_path);
                     log_builder.level(log_level);
                     // 50 MB
