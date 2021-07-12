@@ -632,30 +632,35 @@ impl Peer {
                             proof: vec![],
                         };
 
-                        match self.mailbox_control.commit_block(pwp).await {
-                            Ok(new_config) => {
-                                if !self.update_consensus_config(new_config).await {
-                                    warn!(
-                                        self.logger,
-                                        "fail to update consensus config after commit_block. ",
-                                    );
-                                }
+                        let mut retry_interval = time::interval(time::Duration::from_secs(3));
+                        loop {
+                            retry_interval.tick().await;
+                            match self.mailbox_control.commit_block(pwp.clone()).await {
+                                Ok(new_config) => {
+                                    if !self.update_consensus_config(new_config).await {
+                                        warn!(
+                                            self.logger,
+                                            "fail to update consensus config after commit_block. ",
+                                        );
+                                    }
 
-                                info!(
-                                    self.logger,
-                                    "proposal `{}` committed at block height `{}`",
-                                    hex::encode(entry.data.clone()),
-                                    current_block_height + 1,
-                                );
-                            }
-                            Err(e) => {
-                                let err_msg = format!(
-                                    "commit block {} failed: {}",
-                                    current_block_height + 1,
-                                    e
-                                );
-                                error!(self.logger, "{}", err_msg);
-                                panic!("{}", err_msg);
+                                    info!(
+                                        self.logger,
+                                        "proposal `{}` committed at block height `{}`",
+                                        hex::encode(entry.data.clone()),
+                                        current_block_height + 1,
+                                    );
+
+                                    break;
+                                }
+                                Err(e) => {
+                                    let err_msg = format!(
+                                        "commit block {} failed: {}",
+                                        current_block_height + 1,
+                                        e
+                                    );
+                                    error!(self.logger, "{}", err_msg);
+                                }
                             }
                         }
                     } else {
