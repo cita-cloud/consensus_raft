@@ -293,7 +293,7 @@ impl Peer {
                 let current_block_height = self.node().store().get_consensus_config().height;
 
                 if proposal.height == current_block_height + 1 {
-                    info!(self.logger, "propose"; "hash" => hex::encode(&data));
+                    info!(self.logger, "propose"; "hash" => short_hex(&data));
                     if let Err(e) = self.mut_node().propose(vec![], data) {
                         warn!(self.logger, "propose failed: `{}`", e);
                     }
@@ -352,7 +352,7 @@ impl Peer {
                                     error!(
                                         self.logger,
                                         "can't decode proposal data: `{}`, error: `{}`",
-                                        hex::encode(&ent.data),
+                                        short_hex(&ent.data),
                                         e
                                     );
                                     return;
@@ -374,7 +374,7 @@ impl Peer {
                                             logger,
                                             "check proposal failed, height: `{}` data: `{}`",
                                             proposal.height,
-                                            hex::encode(&proposal.data)
+                                            short_hex(&proposal.data)
                                         );
                                         false
                                     }
@@ -621,7 +621,7 @@ impl Peer {
                     info!(
                         self.logger,
                         "try to commit proposal `{}` with height `{}`",
-                        hex::encode(entry.data.clone()),
+                        short_hex(&entry.data),
                         proposal_height,
                     );
 
@@ -647,7 +647,7 @@ impl Peer {
                                     info!(
                                         self.logger,
                                         "proposal `{}` committed at block height `{}`",
-                                        hex::encode(entry.data.clone()),
+                                        short_hex(&entry.data),
                                         current_block_height + 1,
                                     );
 
@@ -667,7 +667,7 @@ impl Peer {
                         warn!(
                             self.logger,
                             "skip commit_block for proposal `{}` with height `{}`, because current committed block height is `{}`",
-                            hex::encode(entry.data.clone()),
+                            short_hex(&entry.data),
                             proposal_height,
                             current_block_height,
                         );
@@ -790,6 +790,16 @@ impl<T: Letter> ConsensusService for RaftService<T> {
     }
 }
 
+fn short_hex(data: &[u8]) -> String {
+    if data.len() <= 8 {
+        hex::encode(data)
+    } else {
+        let head = hex::encode(&data[..4]);
+        let tail = hex::encode(&data[data.len() - 4..]);
+        format!("{}..{}", head, tail)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -837,5 +847,20 @@ mod test {
         control.update_consensus_config(config).await;
         drop(control);
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn test_short_hex() {
+        assert_eq!(short_hex(&[]), "");
+        assert_eq!(short_hex(&[0, 1]), "0001");
+
+        let mut long = vec![0u8; 16];
+        long[0] = 0xab;
+        long[15] = 0xcd;
+        let expect = {
+            let hex = hex::encode(&long);
+            format!("{}..{}", &hex[..8], &hex[(hex.len() - 8)..])
+        };
+        assert_eq!(short_hex(&long), expect);
     }
 }
