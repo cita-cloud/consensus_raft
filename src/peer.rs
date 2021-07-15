@@ -128,6 +128,8 @@ pub struct Peer {
     msg_rx: mpsc::UnboundedReceiver<PeerMsg>,
     mailbox_control: MailboxControl<PeerMsg>,
 
+    ready_for_proposal_notifier: Option<mpsc::UnboundedSender<()>>,
+
     data_dir: PathBuf,
 
     logger: Logger,
@@ -152,6 +154,7 @@ impl Peer {
             msg_tx,
             msg_rx,
             mailbox_control,
+            ready_for_proposal_notifier: None,
             data_dir: data_dir.as_ref().to_path_buf(),
             logger,
         }
@@ -276,7 +279,15 @@ impl Peer {
         self.node.replace(node);
 
         // Try to get a proposal every block interval secs.
-        tokio::spawn(Self::wait_proposal(self.service(), self.logger.clone()));
+        let (ready_tx, ready_rx) = mpsc::unbounded_channel();
+        ready_tx.send(()).unwrap();
+        self.ready_for_proposal_notifier.replace(ready_tx);
+        tokio::spawn(Self::wait_proposal(
+            self.service(),
+            ready_rx,
+            self.logger.clone(),
+        ));
+
         // Send tick msg to raft periodically.
         tokio::spawn(Self::pacemaker(self.msg_tx.clone()));
         debug!(self.logger, "Raft node started");
@@ -490,11 +501,16 @@ impl Peer {
 
     // The current leader will get proposal
     // from controller every block interval secs.
-    async fn wait_proposal(service: RaftService<PeerMsg>, logger: Logger) {
+    async fn wait_proposal(
+        service: RaftService<PeerMsg>,
+        mut ready_rx: mpsc::UnboundedReceiver<()>,
+        logger: Logger,
+    ) {
         let mut propose_time = time::Instant::now();
         loop {
             time::sleep_until(propose_time).await;
             if service.peer_control.is_leader().await {
+                ready_rx.recv().await.unwrap();
                 debug!(logger, "get proposal..");
                 match service.mailbox_control.get_proposal().await {
                     Ok(proposal) => {
@@ -505,11 +521,15 @@ impl Peer {
                         };
                         service.peer_control.propose(data);
                     }
-                    Err(e) => warn!(logger, "get proposal failed: `{}`", e),
+                    Err(e) => {
+                        warn!(logger, "get proposal failed: `{}`", e);
+                        continue;
+                    }
                 }
             }
+
             let block_interval = service.peer_control.get_block_interval().await;
-            propose_time += time::Duration::from_secs(block_interval as u64);
+            propose_time = time::Instant::now() + time::Duration::from_secs(block_interval as u64);
         }
     }
 
@@ -618,7 +638,7 @@ impl Peer {
                     let proposal_height = proposal.height;
                     let current_block_height = self.node().store().get_consensus_config().height;
 
-                    info!(
+                    debug!(
                         self.logger,
                         "try to commit proposal `{}` with height `{}`",
                         short_hex(&entry.data),
@@ -650,6 +670,12 @@ impl Peer {
                                         short_hex(&entry.data),
                                         current_block_height + 1,
                                     );
+
+                                    self.ready_for_proposal_notifier
+                                        .as_ref()
+                                        .unwrap()
+                                        .send(())
+                                        .unwrap();
 
                                     break;
                                 }
