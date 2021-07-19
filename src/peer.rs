@@ -268,8 +268,8 @@ impl Peer {
         let applied = storage.get_applied_index();
         let cfg = Config {
             id: self.id(),
-            election_tick: 15,
-            heartbeat_tick: 5,
+            election_tick: 150,
+            heartbeat_tick: 50,
             check_quorum: true,
             applied,
             ..Default::default()
