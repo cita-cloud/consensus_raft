@@ -360,7 +360,6 @@ impl Peer {
                 // If the msg is to append entries, check it first.
                 let mut is_ok = true;
                 if let Some(MessageType::MsgAppend) = MessageType::from_i32(raft_msg.msg_type) {
-                    info!(self.logger, "start checking proposal..");
                     // Spawn tasks to check proposal and wait for their result.
                     let mut check_results = Vec::with_capacity(raft_msg.entries.len());
                     for ent in raft_msg.entries.iter().filter(|ent| !ent.data.is_empty()) {
@@ -411,11 +410,9 @@ impl Peer {
                     for result in check_results {
                         if !result.await.unwrap() {
                             is_ok = false;
-                            info!(self.logger, "check failed, early exit..");
                             break;
                         }
                     }
-                    info!(self.logger, "check proposal success.");
                 }
 
                 // Step this msg if:
