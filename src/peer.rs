@@ -15,6 +15,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::time;
@@ -105,6 +106,7 @@ pub enum ControlMsg {
     // Use mpsc channel for `reply_tx` instead of oneshot since we requires the msg to be Clone.
     Propose {
         data: Vec<u8>,
+        reply_tx: mpsc::UnboundedSender<bool>,
     },
     GetBlockInterval {
         reply_tx: mpsc::UnboundedSender<u32>,
@@ -299,22 +301,28 @@ impl Peer {
 
     async fn handle_msg(&mut self, msg: PeerMsg) {
         match msg {
-            PeerMsg::Control(ControlMsg::Propose { data }) => {
+            PeerMsg::Control(ControlMsg::Propose { data, reply_tx }) => {
                 let proposal = Proposal::decode(data.as_slice()).unwrap();
                 let current_block_height = self.node().store().get_consensus_config().height;
 
+                let mut ok = true;
                 if proposal.height == current_block_height + 1 {
                     info!(self.logger, "propose"; "hash" => short_hex(&data));
                     if let Err(e) = self.mut_node().propose(vec![], data) {
+                        ok = false;
                         warn!(self.logger, "propose failed: `{}`", e);
                     }
                 } else {
+                    ok = false;
                     warn!(
                         self.logger,
                         "skip proposing for proposal {:?}, current committed block height is {}",
                         proposal,
                         current_block_height,
                     );
+                }
+                if let Err(e) = reply_tx.send(ok) {
+                    warn!(self.logger, "reply Propose request failed: `{}`", e);
                 }
             }
             PeerMsg::Control(ControlMsg::GetBlockInterval { reply_tx }) => {
@@ -352,6 +360,7 @@ impl Peer {
                 // If the msg is to append entries, check it first.
                 let mut is_ok = true;
                 if let Some(MessageType::MsgAppend) = MessageType::from_i32(raft_msg.msg_type) {
+                    info!(self.logger, "start checking proposal..");
                     // Spawn tasks to check proposal and wait for their result.
                     let mut check_results = Vec::with_capacity(raft_msg.entries.len());
                     for ent in raft_msg.entries.iter().filter(|ent| !ent.data.is_empty()) {
@@ -402,9 +411,11 @@ impl Peer {
                     for result in check_results {
                         if !result.await.unwrap() {
                             is_ok = false;
+                            info!(self.logger, "check failed, early exit..");
                             break;
                         }
                     }
+                    info!(self.logger, "check proposal success.");
                 }
 
                 // Step this msg if:
@@ -499,19 +510,38 @@ impl Peer {
         is_success
     }
 
-    // The current leader will get proposal
-    // from controller every block interval secs.
+    // The current leader will get proposal from controller every block interval secs.
     async fn wait_proposal(
         service: RaftService<PeerMsg>,
         mut ready_rx: mpsc::UnboundedReceiver<()>,
         logger: Logger,
     ) {
         let mut propose_time = time::Instant::now();
+        let mut block_interval = service.peer_control.get_block_interval().await;
         loop {
-            time::sleep_until(propose_time).await;
-            if service.peer_control.is_leader().await {
-                ready_rx.recv().await.unwrap();
-                debug!(logger, "get proposal..");
+            match time::timeout(
+                Duration::from_secs(3 * block_interval as u64),
+                ready_rx.recv(),
+            )
+            .await
+            {
+                Ok(None) => {
+                    info!(logger, "proposal fetcher exit.");
+                    break;
+                }
+                Ok(Some(())) => (),
+                Err(_) => {
+                    warn!(
+                        logger,
+                        "timeout waiting for new committed block. try to get new proposal."
+                    )
+                }
+            }
+
+            let mut proposed = false;
+            while !proposed && service.peer_control.is_leader().await {
+                time::sleep_until(propose_time).await;
+                info!(logger, "fetching proposal..");
                 match service.mailbox_control.get_proposal().await {
                     Ok(proposal) => {
                         let data = {
@@ -519,16 +549,15 @@ impl Peer {
                             proposal.encode(&mut buf).unwrap();
                             buf
                         };
-                        service.peer_control.propose(data);
+                        proposed = service.peer_control.propose(data).await;
                     }
                     Err(e) => {
                         warn!(logger, "get proposal failed: `{}`", e);
-                        continue;
                     }
                 }
             }
 
-            let block_interval = service.peer_control.get_block_interval().await;
+            block_interval = service.peer_control.get_block_interval().await;
             propose_time = time::Instant::now() + time::Duration::from_secs(block_interval as u64);
         }
     }
@@ -729,9 +758,11 @@ pub struct PeerControl {
 }
 
 impl PeerControl {
-    pub fn propose(&self, data: Vec<u8>) {
-        let msg = PeerMsg::Control(ControlMsg::Propose { data });
+    pub async fn propose(&self, data: Vec<u8>) -> bool {
+        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+        let msg = PeerMsg::Control(ControlMsg::Propose { data, reply_tx });
         self.msg_tx.send(msg).unwrap();
+        reply_rx.recv().await.unwrap()
     }
 
     pub async fn is_leader(&self) -> bool {
@@ -837,8 +868,9 @@ mod test {
         let handle = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 match msg {
-                    PeerMsg::Control(ControlMsg::Propose { data }) => {
+                    PeerMsg::Control(ControlMsg::Propose { data, reply_tx }) => {
                         assert_eq!(&data[..], b"Akari!");
+                        reply_tx.send(true).unwrap();
                     }
                     PeerMsg::Control(ControlMsg::IsLeader { reply_tx }) => {
                         reply_tx.send(true).unwrap();
@@ -862,7 +894,7 @@ mod test {
             }
         });
 
-        control.propose(b"Akari!"[..].into());
+        assert!(control.propose(b"Akari!"[..].into()).await);
         assert!(control.is_leader().await);
         assert_eq!(control.get_block_interval().await, 6);
         let config = ConsensusConfiguration {
