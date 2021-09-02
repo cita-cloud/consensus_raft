@@ -24,6 +24,7 @@ use slog::debug;
 use slog::info;
 use slog::Logger;
 
+#[derive(Debug, Clone)]
 pub struct Controller {
     // grpc client
     client: ControllerClient<Channel>,
@@ -99,7 +100,7 @@ impl Network {
 }
 
 #[derive(Debug)]
-struct Inner {
+pub struct Inner {
     // local peer id
     local_id: u64,
     // Send msg to our local peer
@@ -184,7 +185,7 @@ impl Inner {
         let origin = self.mailbook.read().await.get(&to).copied();
         if let Some(origin) = origin {
             msg.origin = origin;
-            self.client.clone().send_msg(msg).await.map(|_| ());
+            let _ = self.client.clone().send_msg(msg).await.map(|_| ());
         } else {
             // We don't know about the targeting peer. Drop the msg and probe.
             // It's ok because the raft peer will automatically retry.
