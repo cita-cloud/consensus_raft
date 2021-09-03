@@ -37,10 +37,7 @@ impl Controller {
         let client = {
             // TODO: maybe return a result
             let uri = format!("http://127.0.0.1:{}", port);
-            let channel = Endpoint::from_shared(uri.to_owned())
-                .unwrap()
-                .connect_lazy()
-                .unwrap();
+            let channel = Endpoint::from_shared(uri).unwrap().connect_lazy().unwrap();
             ControllerClient::new(channel)
         };
         Self { client, logger }
@@ -130,10 +127,7 @@ impl Inner {
         let client = {
             // TODO: maybe return a result
             let uri = format!("http://127.0.0.1:{}", network_port);
-            let channel = Endpoint::from_shared(uri.to_owned())
-                .unwrap()
-                .connect_lazy()
-                .unwrap();
+            let channel = Endpoint::from_shared(uri).unwrap().connect_lazy().unwrap();
             NetworkClient::new(channel)
         };
 

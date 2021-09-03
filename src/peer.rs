@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::future::pending;
 use std::path::Path;
 use std::time::Duration;
 
@@ -79,11 +78,9 @@ pub struct Peer {
     controller: Controller,
     network: Network,
 
-    // last time we fetching proposal from controller
-    last_fetching_time: time::Instant,
-
     // pending_conf_change
-    pending_pending_conf_change_proposed: bool,
+    pending_conf_change: Option<ConfChangeV2>,
+    pending_conf_change_proposed: bool,
 
     // pending proposal
     pending_proposal: Option<Proposal>,
@@ -149,12 +146,11 @@ impl Peer {
             controller,
             network,
 
-            last_fetching_time: time::Instant::now(),
-
-            pending_pending_conf_change_proposed: false,
-
             pending_proposal: None,
             pending_proposal_proposed: false,
+
+            pending_conf_change: None,
+            pending_conf_change_proposed: false,
 
             logger,
         }
@@ -169,10 +165,6 @@ impl Peer {
 
     fn is_leader(&self) -> bool {
         self.core.raft.state == raft::StateRole::Leader
-    }
-
-    fn pending_conf_change(&self) -> Option<&ConfChangeV2> {
-        self.core.store().get_pending_conf_change()
     }
 
     fn block_height(&self) -> u64 {
@@ -193,25 +185,34 @@ impl Peer {
     }
 
     pub async fn run(&mut self) {
+        // Wait for controller's reconfigure.
+        let trigger_config = self.controller_rx.recv().await.unwrap();
+        self.core
+            .mut_store()
+            .update_consensus_config(trigger_config)
+            .await;
+        self.maybe_pending_conf_change();
+
         let mut fetching_proposal: Option<JoinHandle<Proposal>> = None;
 
         let tick_interval = Duration::from_millis(200);
         let tick_timeout = time::sleep(tick_interval);
         tokio::pin!(tick_timeout);
 
-        let propose_timeout = time::sleep(Duration::from_secs(0));
-        tokio::pin!(propose_timeout);
+        let fetching_timeout = time::sleep(Duration::from_secs(0));
+        tokio::pin!(fetching_timeout);
 
         loop {
             tokio::select! {
                 // timing
                 _ = &mut tick_timeout => (),
-                _ = &mut propose_timeout, if self.is_leader() => (),
+                _ = &mut fetching_timeout, if self.is_leader() => (),
 
                 // handle reconfigure
                 config = self.controller_rx.recv() => {
                     let config = config.unwrap();
-                    self.maybe_pending_config_change(config).await;
+                    self.core.mut_store().update_consensus_config(config).await;
+                    self.maybe_pending_conf_change();
                 }
                 // raft msg from remote peers
                 raft_msg = self.peer_rx.recv() => {
@@ -229,7 +230,7 @@ impl Peer {
 
                     match fetch_result {
                         Ok(proposal) => {
-                            self.last_fetching_time = time::Instant::now();
+                            fetching_timeout.as_mut().reset(time::Instant::now() + Duration::from_secs(self.block_interval().into()));
                             self.pending_proposal.replace(proposal);
                             self.pending_proposal_proposed = false;
                         }
@@ -249,14 +250,12 @@ impl Peer {
 
             if self.is_leader() {
                 // propose pending conf change
-                if !self.pending_pending_conf_change_proposed
-                    && self.pending_conf_change().is_some()
-                {
+                if !self.pending_conf_change_proposed && self.pending_conf_change.is_some() {
                     match self
                         .core
-                        .propose_conf_change(vec![], self.pending_conf_change().cloned().unwrap())
+                        .propose_conf_change(vec![], self.pending_conf_change.clone().unwrap())
                     {
-                        Ok(()) => self.pending_pending_conf_change_proposed = true,
+                        Ok(()) => self.pending_conf_change_proposed = true,
                         Err(e) => warn!(self.logger, "propose conf change failed: `{}`", e),
                     }
                 }
@@ -264,7 +263,7 @@ impl Peer {
                 // propose pending proposal
                 if !self.pending_proposal_proposed
                     && self.pending_proposal.is_some()
-                    && self.pending_conf_change().is_none()
+                    && self.pending_conf_change.is_none()
                 {
                     let proposal = self.pending_proposal.as_ref().unwrap();
                     let epxected_height = self.block_height() + 1;
@@ -290,7 +289,7 @@ impl Peer {
                 // fetching new proposal
                 if self.pending_proposal.is_none()
                     && fetching_proposal.is_none()
-                    && self.last_fetching_time.elapsed() >= Duration::from_secs(self.block_interval().into())
+                    && fetching_timeout.is_elapsed()
                 {
                     let controller = self.controller.clone();
                     fetching_proposal.replace(tokio::spawn(async move {
@@ -304,7 +303,8 @@ impl Peer {
                 }
                 self.pending_proposal.take();
                 self.pending_proposal_proposed = false;
-                self.pending_pending_conf_change_proposed = false;
+                // If we step down and become leader again, we need to re-propose pending conf change.
+                self.pending_conf_change_proposed = false;
             }
 
             self.handle_ready().await;
@@ -392,59 +392,37 @@ impl Peer {
                             proof: vec![],
                         };
                         if let Ok(config) = self.controller.commit_block(pwp).await {
-                            self.maybe_pending_config_change(config).await;
+                            self.core.mut_store().update_consensus_config(config).await;
+                            self.maybe_pending_conf_change();
                         }
                     }
 
-                    self.core.mut_store().set_block_height(expected_height).await;
-                    if let Some(pending_proposal) = self.pending_proposal.as_ref() {
-                        if pending_proposal.height == expected_height {
+                    self.core
+                        .mut_store()
+                        .set_block_height(expected_height)
+                        .await;
+                    if let Some(p) = self.pending_proposal.as_ref() {
+                        if p.height <= expected_height {
                             self.pending_proposal.take();
-                        } else {
-                            error!(self.logger, "pending proposal's height is different from expected height";
-                                "pending" => pending_proposal.height,
-                                "expected" => expected_height,
-                            );
                         }
                     }
                 }
                 // All conf changes are v2.
                 EntryType::EntryConfChange => panic!("unexpected EntryConfChange(V1)"),
                 EntryType::EntryConfChangeV2 => {
-                    let cc = match ConfChangeV2::decode(entry.data.as_slice()) {
-                        Ok(cc) => cc,
-                        Err(e) => {
-                            error!(self.logger, "cannot decode confchange: `{}`", e);
-                            continue;
-                        }
-                    };
-
-                    let incoming_config = ConsensusConfiguration::decode(cc.context.as_slice())
-                        .expect(
-                            "fail to decode consensus config while handling committed confchange",
-                        );
-
-                    let pcc = self.core.store().get_pending_conf_change().cloned();
-                    if let Some(pcc) = pcc {
-                        let pending_config =
-                            ConsensusConfiguration::decode(pcc.context.as_slice()).unwrap();
-                        if pending_config == incoming_config {
-                            self.pending_pending_conf_change_proposed = false;
-                            self.core.mut_store().apply_pending_conf_change().await;
-                        }
-                    }
-
-                    let cs = match self.core.apply_conf_change(&cc) {
-                        Ok(cc) => cc,
-                        Err(e) => {
-                            panic!("apply conf change failed: `{}`", e);
-                        }
-                    };
+                    let cc = ConfChangeV2::decode(entry.data.as_slice())
+                        .expect("cannot decode ConfChangeV2");
+                    let cs = self
+                        .core
+                        .apply_conf_change(&cc)
+                        .expect("apply conf change failed");
                     info!(
                         self.logger,
                         "apply config change `{:?}`; now config state is: {:?}", cc, cs
                     );
                     self.core.mut_store().update_conf_state(cs).await;
+                    // maybe clean the pending conf change.
+                    self.maybe_pending_conf_change();
                 }
             }
 
@@ -455,55 +433,50 @@ impl Peer {
         }
     }
 
-    // We do consensus on the conf change if block interval or peer set changed.
-    // We have to do this because the controller isn't a deterministic state machine,
-    async fn maybe_pending_config_change(&mut self, new: ConsensusConfiguration) {
-        let new_interval = new.block_interval;
-        let new_peers: HashSet<u64> = new
-            .validators
+    fn maybe_pending_conf_change(&mut self) {
+        let current_peers: HashSet<u64> = self
+            .core
+            .store()
+            .get_conf_state()
+            .voters
             .iter()
-            .map(|addr| address_to_peer_id(addr))
+            .copied()
             .collect();
 
-        let old_interval = self.core.store().get_block_interval();
-        let old_peers: HashSet<u64> = self
+        let target_peers: HashSet<u64> = self
             .core
             .store()
             .get_validators()
             .iter()
-            .map(|addr| address_to_peer_id(addr))
+            .map(|v| address_to_peer_id(v))
             .collect();
 
-        if new_interval != old_interval || new_peers != old_peers {
-            let context = new.encode_to_vec();
+        let cc = {
+            let added: Vec<u64> = target_peers.difference(&current_peers).copied().collect();
+            let removed: Vec<u64> = current_peers.difference(&target_peers).copied().collect();
 
-            let added: Vec<u64> = new_peers.difference(&old_peers).copied().collect();
-            let removed: Vec<u64> = old_peers.difference(&new_peers).copied().collect();
+            let mut changes = vec![];
+            for id in added {
+                let ccs = ConfChangeSingle {
+                    change_type: ConfChangeType::AddNode as i32,
+                    node_id: id,
+                };
+                changes.push(ccs);
+            }
+            for id in removed {
+                let ccs = ConfChangeSingle {
+                    change_type: ConfChangeType::RemoveNode as i32,
+                    node_id: id,
+                };
+                changes.push(ccs);
+            }
+            ConfChangeV2 {
+                changes,
+                ..Default::default()
+            }
+        };
 
-            let cc = {
-                let mut changes = vec![];
-                for id in added {
-                    let ccs = ConfChangeSingle {
-                        change_type: ConfChangeType::AddNode as i32,
-                        node_id: id,
-                    };
-                    changes.push(ccs);
-                }
-                for id in removed {
-                    let ccs = ConfChangeSingle {
-                        change_type: ConfChangeType::RemoveNode as i32,
-                        node_id: id,
-                    };
-                    changes.push(ccs);
-                }
-                ConfChangeV2 {
-                    changes,
-                    context,
-                    ..Default::default()
-                }
-            };
-            self.pending_pending_conf_change_proposed = false;
-            self.core.mut_store().set_pending_conf_change(cc).await;
-        }
+        self.pending_conf_change.replace(cc);
+        self.pending_conf_change_proposed = false;
     }
 }

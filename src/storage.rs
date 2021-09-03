@@ -155,12 +155,8 @@ enum WalOpType {
     AppendEntries = 4,
     AdvanceAppliedIndex = 5,
 
-    SetBlockHeight = 6,
-    SetBlockInterval = 7,
-    UpdateValidators = 8,
-
-    SetPendingConfChange = 9,
-    ApplyPendingConfChange = 10,
+    UpdateBlockHeight = 6,
+    UpdateConsensusConfig = 7,
 }
 
 #[derive(ThisError, Debug)]
@@ -183,11 +179,8 @@ impl TryFrom<u8> for WalOpType {
             3 => Self::ApplySnapshot,
             4 => Self::AppendEntries,
             5 => Self::AdvanceAppliedIndex,
-            6 => Self::SetBlockHeight,
-            7 => Self::SetBlockInterval,
-            8 => Self::UpdateValidators,
-            9 => Self::SetPendingConfChange,
-            10 => Self::ApplyPendingConfChange,
+            6 => Self::UpdateBlockHeight,
+            7 => Self::UpdateConsensusConfig,
             _ => return Err(DecodeLogError::CorruptedWalOpType),
         };
         Ok(ty)
@@ -197,18 +190,13 @@ impl TryFrom<u8> for WalOpType {
 #[derive(Debug)]
 struct WalStorageCore {
     raft_state: RaftState,
-    // We don't take snapshot of the statemachine(controller),
-    // which has its own sync mechanism.
     snapshot_metadata: SnapshotMetadata,
 
     entries: Vec<Entry>,
     applied_index: u64,
 
-    // state machine
-    block_interval: u32,
-    block_height: u64,
-    validators: Vec<Vec<u8>>,
-    pending_conf_change: Option<ConfChangeV2>,
+    // It's the state
+    consensus_config: ConsensusConfiguration,
 
     // Storage
     log_dir: PathBuf,
@@ -230,12 +218,7 @@ impl WalStorageCore {
             snapshot_metadata: SnapshotMetadata::default(),
             entries: vec![],
             applied_index: 0,
-
-            block_height: 0,
-            block_interval: 0,
-            validators: vec![],
-
-            pending_conf_change: None,
+            consensus_config: Default::default(),
             log_dir,
             active_log: None,
             compact_limit,
@@ -414,53 +397,18 @@ impl WalStorageCore {
                 self.advance_applied_index(applied_index);
             }
 
-            SetBlockHeight => {
+            UpdateBlockHeight => {
                 let h = {
                     if log_data.remaining() < std::mem::size_of::<u64>() {
                         return Err(DecodeLogError::InsufficientData);
                     }
                     log_data.get_u64()
                 };
-                self.set_block_height(h);
+                self.update_block_height(h);
             }
-            SetBlockInterval => {
-                let interval = {
-                    if log_data.remaining() < std::mem::size_of::<u32>() {
-                        return Err(DecodeLogError::InsufficientData);
-                    }
-                    log_data.get_u32()
-                };
-                self.set_block_interval(interval);
-            }
-            UpdateValidators => {
-                // TODO: refactor this
-                if log_data.remaining() < std::mem::size_of::<u64>() {
-                    return Err(DecodeLogError::InsufficientData);
-                }
-                let len = log_data.get_u64();
-                let validators = (0..len)
-                    .map(|_| {
-                        if log_data.remaining() < std::mem::size_of::<u64>() {
-                            return Err(DecodeLogError::InsufficientData);
-                        }
-                        let validator_len = log_data.get_u64() as usize;
-                        if log_data.remaining() < validator_len {
-                            return Err(DecodeLogError::InsufficientData);
-                        }
-                        let v = log_data[..validator_len].to_vec();
-                        log_data.advance(validator_len);
-                        Ok(v)
-                    })
-                    .collect::<Result<Vec<_>, DecodeLogError>>()?;
-                self.update_validators(validators);
-            }
-
-            SetPendingConfChange => {
-                let cc = ConfChangeV2::decode_length_delimited(&mut log_data)?;
-                self.set_pending_conf_change(cc)
-            }
-            ApplyPendingConfChange => {
-                self.apply_pending_conf_change();
+            UpdateConsensusConfig => {
+                let config = ConsensusConfiguration::decode_length_delimited(&mut log_data)?;
+                self.update_consensus_config(config);
             }
         }
         let consumed = remaining - log_data.remaining();
@@ -619,72 +567,27 @@ impl WalStorageCore {
 
     // ----
 
-    fn set_block_height(&mut self, h: u64) {
-        self.block_height = h;
+    fn update_block_height(&mut self, h: u64) {
+        self.consensus_config.height = h;
     }
 
     async fn log_set_block_height(&mut self, h: u64) {
         let mut buf = BytesMut::new();
-        buf.put_u8(WalOpType::SetBlockHeight as u8);
+        buf.put_u8(WalOpType::UpdateBlockHeight as u8);
         buf.put_u64(h);
         self.mut_active_log().write_all(&buf).await;
     }
 
     // ----
 
-    fn set_block_interval(&mut self, interval: u32) {
-        self.block_interval = interval;
+    fn update_consensus_config(&mut self, config: ConsensusConfiguration) {
+        self.consensus_config = config;
     }
 
-    async fn log_set_block_interval(&mut self, interval: u32) {
+    async fn log_update_consensus_config(&mut self, config: &ConsensusConfiguration) {
         let mut buf = BytesMut::new();
-        buf.put_u8(WalOpType::SetBlockInterval as u8);
-        buf.put_u32(interval);
-        self.mut_active_log().write_all(&buf).await;
-    }
-
-    // ----
-
-    fn update_validators(&mut self, validators: Vec<Vec<u8>>) {
-        self.validators = validators;
-    }
-
-    async fn log_update_validators(&mut self, validators: &[Vec<u8>]) {
-        // TODO: do this in a better way.
-        let mut buf = BytesMut::new();
-        buf.put_u8(WalOpType::UpdateValidators as u8);
-        buf.put_u64(validators.len() as u64);
-        for v in validators {
-            buf.put_u64(v.len() as u64);
-            buf.put(v.as_slice());
-        }
-        self.mut_active_log().write_all(&buf).await;
-    }
-
-    // ----
-
-    fn set_pending_conf_change(&mut self, cc: ConfChangeV2) {
-        self.pending_conf_change.replace(cc);
-    }
-
-    async fn log_set_pending_conf_change(&mut self, cc: &ConfChangeV2) {
-        let mut buf = BytesMut::new();
-        buf.put_u8(WalOpType::SetPendingConfChange as u8);
-        cc.encode_length_delimited(&mut buf).unwrap();
-        self.mut_active_log().write_all(&buf).await;
-    }
-
-    // ----
-
-    fn apply_pending_conf_change(&mut self) {
-        self.pending_conf_change
-            .take()
-            .expect("try to apply pending consensus config, but there isn't any pending one");
-    }
-
-    async fn log_apply_pending_conf_change(&mut self) {
-        let mut buf = BytesMut::new();
-        buf.put_u8(WalOpType::ApplyPendingConfChange as u8);
+        buf.put_u8(WalOpType::UpdateConsensusConfig as u8);
+        config.encode_length_delimited(&mut buf).unwrap();
         self.mut_active_log().write_all(&buf).await;
     }
 
@@ -713,13 +616,8 @@ impl WalStorageCore {
         self.log_update_hard_state(&self.raft_state.hard_state.clone())
             .await;
 
-        self.log_set_block_height(self.block_height).await;
-        self.log_set_block_interval(self.block_interval).await;
-        self.log_update_validators(&self.validators.clone()).await;
-
-        if let Some(cc) = self.pending_conf_change.clone() {
-            self.log_set_pending_conf_change(&cc).await;
-        }
+        self.log_update_consensus_config(&self.consensus_config.clone())
+            .await;
 
         let acitve_log = self.mut_active_log();
         acitve_log.flush().await;
@@ -772,19 +670,15 @@ impl WalStorage {
     }
 
     pub fn get_block_height(&self) -> u64 {
-        self.0.block_height
+        self.0.consensus_config.height
     }
 
     pub fn get_block_interval(&self) -> u32 {
-        self.0.block_interval
+        self.0.consensus_config.block_interval
     }
 
     pub fn get_validators(&self) -> &[Vec<u8>] {
-        &self.0.validators
-    }
-
-    pub fn get_pending_conf_change(&self) -> Option<&ConfChangeV2> {
-        self.0.pending_conf_change.as_ref()
+        &self.0.consensus_config.validators
     }
 
     pub async fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<(), StorageError> {
@@ -826,25 +720,13 @@ impl WalStorage {
     pub async fn set_block_height(&mut self, h: u64) {
         self.0.log_set_block_height(h).await;
         self.0.flush().await;
-        self.0.set_block_height(h);
+        self.0.update_block_height(h);
     }
 
-    pub async fn set_block_interval(&mut self, interval: u32) {
-        self.0.log_set_block_interval(interval).await;
+    pub async fn update_consensus_config(&mut self, config: ConsensusConfiguration) {
+        self.0.log_update_consensus_config(&config).await;
         self.0.flush().await;
-        self.0.set_block_interval(interval);
-    }
-
-    pub async fn set_pending_conf_change(&mut self, cc: ConfChangeV2) {
-        self.0.log_set_pending_conf_change(&cc).await;
-        self.0.flush().await;
-        self.0.set_pending_conf_change(cc);
-    }
-
-    pub async fn apply_pending_conf_change(&mut self) {
-        self.0.log_apply_pending_conf_change().await;
-        self.0.flush().await;
-        self.0.apply_pending_conf_change();
+        self.0.update_consensus_config(config);
     }
 
     pub async fn maybe_compact(&mut self) {
@@ -896,11 +778,10 @@ fn limit_size<T: Message + Clone>(entries: &mut Vec<T>, max: Option<u64>) {
     let limit = entries
         .iter()
         .take_while(|&e| {
+            size += e.encoded_len() as u64;
             if size == 0 {
-                size += e.encoded_len() as u64;
                 true
             } else {
-                size += e.encoded_len() as u64;
                 size <= max
             }
         })
