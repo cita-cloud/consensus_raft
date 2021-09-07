@@ -14,7 +14,6 @@
 
 mod client;
 mod config;
-mod panic_hook;
 mod peer;
 mod storage;
 mod utils;
@@ -32,13 +31,9 @@ use sloggers::Build as _;
 
 use tokio::fs;
 
-use tonic::transport::Server;
-
-use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServer;
-use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
-
 use peer::Peer;
-use utils::address_to_peer_id;
+
+use utils::set_panic_handler;
 
 const GIT_VERSION: &str = git_version!(
     args = ["--tags", "--always", "--dirty=-modified"],
@@ -127,16 +122,17 @@ async fn run(local_port: u16, log_type: &str) -> anyhow::Result<()> {
         }
     };
 
+    set_panic_handler(logger.clone());
+
     // read consensus-config.toml
     let config = {
         let buf = fs::read_to_string("consensus-config.toml").await?;
         config::RaftConfig::new(&buf)
     };
 
-    let local_id = {
+    let node_addr = {
         let s = fs::read_to_string("node_address").await?;
-        let addr = hex::decode(s.strip_prefix("0x").unwrap_or(&s))?;
-        address_to_peer_id(&addr)
+        hex::decode(s.strip_prefix("0x").unwrap_or(&s))?
     };
 
     let network_port = config.network_port;
@@ -144,7 +140,7 @@ async fn run(local_port: u16, log_type: &str) -> anyhow::Result<()> {
 
     let data_dir = std::env::current_dir()?.join("raft-data-dir");
     let mut peer = Peer::setup(
-        local_id,
+        node_addr,
         local_port,
         controller_port,
         network_port,
@@ -153,19 +149,7 @@ async fn run(local_port: u16, log_type: &str) -> anyhow::Result<()> {
     )
     .await;
 
-    let addr = format!("127.0.0.1:{}", local_port).parse()?;
-    let (raft_svc, network_svc) = peer.service();
-    let h = tokio::spawn(async move {
-        Server::builder()
-            .add_service(ConsensusServiceServer::new(raft_svc))
-            .add_service(NetworkMsgHandlerServiceServer::new(network_svc))
-            .serve(addr)
-            .await
-    });
-
     peer.run().await;
-
-    h.abort();
 
     info!(logger, "raft service exit");
 

@@ -506,13 +506,13 @@ impl WalStorageCore {
         }
 
         let mut snapshot = Snapshot::default();
+
         let meta = snapshot.mut_metadata();
-
         meta.index = self.applied_index;
-        // This must exist.
         meta.term = self.term(self.applied_index).unwrap();
-
         meta.set_conf_state(self.raft_state.conf_state.clone());
+
+        snapshot.set_data(self.consensus_config.encode_to_vec());
 
         Ok(snapshot)
     }
@@ -533,6 +533,9 @@ impl WalStorageCore {
             );
             return Err(StorageError::SnapshotOutOfDate);
         }
+
+        self.consensus_config = ConsensusConfiguration::decode(snapshot.data.as_slice())
+            .expect("decode snapshot data failed");
 
         self.snapshot_metadata = meta.clone();
 

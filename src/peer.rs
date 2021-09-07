@@ -23,15 +23,19 @@ use slog::{debug, error, info, warn};
 
 use prost::Message as _;
 
+use tonic::transport::Server;
+
 use cita_cloud_proto::common::ConsensusConfiguration;
 use cita_cloud_proto::common::Proposal;
 use cita_cloud_proto::common::ProposalWithProof;
 use cita_cloud_proto::common::SimpleResponse;
 use cita_cloud_proto::consensus::consensus_service_server::ConsensusService;
+use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServer;
+use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
 
 use crate::client::{Controller, Network};
 use crate::storage::WalStorage;
-use crate::utils::{address_to_peer_id, short_hex};
+use crate::utils::{addr_to_peer_id, short_hex};
 
 // Compact wal log if file size > 64MB.
 const WAL_COMPACT_LIMIT: u64 = 64 * 1024 * 1024;
@@ -69,8 +73,6 @@ pub struct Peer {
     // peers' raft msg receiver.
     peer_rx: mpsc::Receiver<RaftMsg>,
 
-    // controller msg sender. Used for ConsensusService.
-    controller_tx: mpsc::Sender<ConsensusConfiguration>,
     // controller msg receiver. Currently only used for `reconfigure`.
     controller_rx: mpsc::Receiver<ConsensusConfiguration>,
 
@@ -92,34 +94,85 @@ pub struct Peer {
 
 impl Peer {
     pub async fn setup(
-        local_id: u64,
+        node_addr: Vec<u8>,
         local_port: u16,
         controller_port: u16,
         network_port: u16,
         data_dir: impl AsRef<Path>,
         logger: Logger,
     ) -> Self {
-        let logger = logger.new(o!("tag" => format!("peer_{}", local_id)));
+        let local_id = addr_to_peer_id(&node_addr);
+        let logger = logger.new(o!("peer" => local_id));
 
+        // Controller grpc client
         let controller = {
             let logger = logger.new(o!("tag" => "controller"));
             Controller::new(controller_port, logger)
         };
 
-        let (controller_tx, controller_rx) = mpsc::channel(0);
+        // Communicate with controller
+        let (controller_tx, mut controller_rx) = mpsc::channel::<ConsensusConfiguration>(1);
+        let raft_svc = RaftConsensusService(controller_tx);
 
-        // Network
+        // Network grpc client
         let (peer_tx, peer_rx) = mpsc::channel(64);
         let network = {
             let logger = logger.new(o!("tag" => "network"));
             Network::setup(local_id, local_port, network_port, peer_tx, logger).await
         };
+        let network_svc = network.clone();
+
+        let logger_cloned = logger.clone();
+        tokio::spawn(async move {
+            let addr = format!("127.0.0.1:{}", local_port).parse().unwrap();
+            let _ = Server::builder()
+                .add_service(ConsensusServiceServer::new(raft_svc))
+                .add_service(NetworkMsgHandlerServiceServer::new(network_svc))
+                .serve(addr)
+                .await;
+            info!(logger_cloned, "grpc service exit");
+        });
 
         // Recover data from log
-        let storage = {
+        let mut storage = {
             let logger = logger.new(o!("tag" => "storage"));
             WalStorage::new(&data_dir, WAL_COMPACT_LIMIT, logger.clone()).await
         };
+
+        // Wait for controller's reconfigure.
+        info!(logger, "waiting for `reconfigure` from controller..");
+        let (wants_compaign, trigger_config) = loop {
+            let config = controller_rx.recv().await.unwrap();
+            if let Some(index) = config.validators.iter().position(|addr| addr == &node_addr) {
+                if !storage.is_initialized() {
+                    let snapshot = {
+                        let voters = config
+                            .validators
+                            .iter()
+                            .map(|addr| addr_to_peer_id(addr))
+                            .collect();
+
+                        // We start with index 5 and term 5
+                        let mut s = Snapshot::default();
+                        s.mut_metadata().index = 5;
+                        s.mut_metadata().term = 5;
+                        s.mut_metadata().mut_conf_state().voters = voters;
+                        s
+                    };
+
+                    storage.apply_snapshot(snapshot).await.unwrap();
+                }
+
+                break (index == 0, config);
+            } else {
+                info!(
+                    logger,
+                    "incoming config doesn't contain this node, wait for next one."
+                );
+            }
+        };
+
+        storage.update_consensus_config(trigger_config).await;
 
         let core = {
             // Load applied index from stable storage.
@@ -136,11 +189,10 @@ impl Peer {
             RawNode::new(&cfg, storage, &logger).expect("cannot create raft raw node")
         };
 
-        Self {
+        let mut this = Self {
             core,
             peer_rx,
 
-            controller_tx,
             controller_rx,
 
             controller,
@@ -153,14 +205,15 @@ impl Peer {
             pending_conf_change_proposed: false,
 
             logger,
-        }
-    }
+        };
 
-    pub fn service(&self) -> (RaftConsensusService, Network) {
-        (
-            RaftConsensusService(self.controller_tx.clone()),
-            self.network.clone(),
-        )
+        this.maybe_pending_conf_change();
+
+        if wants_compaign {
+            this.core.campaign().unwrap();
+        }
+
+        this
     }
 
     fn is_leader(&self) -> bool {
@@ -177,22 +230,12 @@ impl Peer {
 
     async fn send_msgs(&self, msgs: Vec<Message>) {
         for msg in msgs {
-            let network = self.network.clone();
-            tokio::spawn(async move {
-                network.send_msg(msg).await;
-            });
+            // TODO: should we send it in parallel?
+            self.network.send_msg(msg).await;
         }
     }
 
     pub async fn run(&mut self) {
-        // Wait for controller's reconfigure.
-        let trigger_config = self.controller_rx.recv().await.unwrap();
-        self.core
-            .mut_store()
-            .update_consensus_config(trigger_config)
-            .await;
-        self.maybe_pending_conf_change();
-
         let mut fetching_proposal: Option<JoinHandle<Proposal>> = None;
 
         let tick_interval = Duration::from_millis(200);
@@ -225,7 +268,7 @@ impl Peer {
                     }
                 }
                 // future for fetching proposal from controller
-                fetch_result = fetching_proposal.as_mut().unwrap(), if fetching_proposal.is_some() => {
+                fetch_result = async { fetching_proposal.as_mut().unwrap().await }, if fetching_proposal.is_some() => {
                     fetching_proposal.take();
 
                     match fetch_result {
@@ -323,7 +366,7 @@ impl Peer {
         if *ready.snapshot() != Snapshot::default() {
             let s = ready.snapshot().clone();
             if let Err(e) = self.core.mut_store().apply_snapshot(s).await {
-                panic!("cannot apply snapshot: `{}`", e);
+                error!(self.logger, "cannot apply snapshot: `{}`", e);
             }
         }
 
@@ -376,7 +419,7 @@ impl Peer {
             match entry.get_entry_type() {
                 EntryType::EntryNormal => {
                     let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
-                    let expected_height = self.core.store().get_block_height() + 1;
+                    let expected_height = self.block_height() + 1;
                     // We must maintain the consistence in ourself
                     assert_eq!(proposal.height, expected_height);
 
@@ -448,7 +491,7 @@ impl Peer {
             .store()
             .get_validators()
             .iter()
-            .map(|v| address_to_peer_id(v))
+            .map(|v| addr_to_peer_id(v))
             .collect();
 
         let cc = {

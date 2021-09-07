@@ -1,4 +1,12 @@
-// This is a very hacky way to map address to peer_id.
+use std::panic::{self, PanicInfo};
+use std::thread;
+
+use slog::error;
+use slog::Logger;
+
+use backtrace::Backtrace;
+
+// This is a very hacky way to map node address to peer_id.
 // Because raft needs an id of integer type, but only
 // addresses are provided.
 // This also make peer_id unreadable.
@@ -6,9 +14,10 @@
 // According to DefaultHasher's doc, it's fine when all peers are using the same build.
 // "This hasher is not guaranteed to be the same as all other DefaultHasher instances,
 // but is the same as all other DefaultHasher instances created through new or default."
+// "The internal algorithm is not specified, and so it and its hashes should not be relied upon over releases"
 //
 // I don't like this, maybe fix it in the future, but leaves it here for now.
-pub fn address_to_peer_id(addr: &[u8]) -> u64 {
+pub fn addr_to_peer_id(addr: &[u8]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hasher;
     let mut hasher = DefaultHasher::new();
@@ -27,16 +36,47 @@ pub fn short_hex(data: &[u8]) -> String {
     }
 }
 
+/// Set the panic hook
+pub fn set_panic_handler(logger: Logger) {
+    panic::set_hook(Box::new(move |info| panic_hook(info, &logger)));
+}
+
+fn panic_hook(info: &PanicInfo, logger: &Logger) {
+    let location = info.location();
+    let file = location.as_ref().map(|l| l.file()).unwrap_or("<unknown>");
+    let line = location.as_ref().map(|l| l.line()).unwrap_or(0);
+    let msg = match info.payload().downcast_ref::<&'static str>() {
+        Some(s) => *s,
+        None => match info.payload().downcast_ref::<String>() {
+            Some(s) => &s[..],
+            None => "Box<Any>",
+        },
+    };
+    let thread = thread::current();
+    let name = thread.name().unwrap_or("<unnamed>");
+    let backtrace = Backtrace::new();
+    let error = format!(
+        "\n============================\n\
+         {:?}\n\n\
+         position:\n\
+         Thread {} panicked at {}, {}:{}\n\
+         ============================\n\
+         ",
+        backtrace, name, msg, file, line
+    );
+    error!(logger, "{}", error);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::address_to_peer_id;
+    use super::addr_to_peer_id;
 
     #[test]
     fn test_address_to_peer_id() {
         let addrs: Vec<&[u8]> = vec![b"", b"1", b"1234"];
         for addr in addrs {
-            let first = address_to_peer_id(&addr);
-            let second = address_to_peer_id(&addr);
+            let first = addr_to_peer_id(&addr);
+            let second = addr_to_peer_id(&addr);
             assert_eq!(first, second);
         }
     }
