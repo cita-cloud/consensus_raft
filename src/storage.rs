@@ -18,7 +18,6 @@ use std::convert::TryInto;
 use std::path::Path;
 use std::path::PathBuf;
 
-use raft::prelude::ConfChangeV2;
 use raft::prelude::ConfState;
 use raft::prelude::Entry;
 use raft::prelude::HardState;

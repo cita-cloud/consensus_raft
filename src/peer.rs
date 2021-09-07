@@ -102,7 +102,7 @@ impl Peer {
         logger: Logger,
     ) -> Self {
         let local_id = addr_to_peer_id(&node_addr);
-        let logger = logger.new(o!("peer" => local_id));
+        let logger = logger.new(o!("raft_id" => local_id));
 
         // Controller grpc client
         let controller = {
@@ -248,32 +248,30 @@ impl Peer {
         loop {
             tokio::select! {
                 // timing
-                _ = &mut tick_timeout => (),
-                _ = &mut fetching_timeout, if self.is_leader() => (),
+                _ = &mut tick_timeout => {
+                    self.core.tick();
+                    tick_timeout
+                        .as_mut()
+                        .reset(time::Instant::now() + tick_interval);
+                }
+                _ = &mut fetching_timeout, if self.is_leader() && fetching_proposal.is_none() && self.pending_proposal.is_none() => {
+                    // fetching new proposal
+                    info!(self.logger, "fetching proposal..");
+                    let controller = self.controller.clone();
+                    fetching_proposal.replace(tokio::spawn(async move {
+                        // TODO: hanlde error
+                        controller.get_proposal().await.unwrap()
+                    }));
+                }
 
-                // handle reconfigure
-                config = self.controller_rx.recv() => {
-                    let config = config.unwrap();
-                    self.core.mut_store().update_consensus_config(config).await;
-                    self.maybe_pending_conf_change();
-                }
-                // raft msg from remote peers
-                raft_msg = self.peer_rx.recv() => {
-                    let raft_msg = raft_msg.unwrap();
-                    if let Err(e) = self.core.step(raft_msg) {
-                        error!(self.logger, "step raft msg failed: `{}`", e);
-                    }
-                    if !self.core.has_ready() {
-                        continue;
-                    }
-                }
                 // future for fetching proposal from controller
                 fetch_result = async { fetching_proposal.as_mut().unwrap().await }, if fetching_proposal.is_some() => {
                     fetching_proposal.take();
+                    fetching_timeout.as_mut().reset(time::Instant::now() + Duration::from_secs(self.block_interval().into()));
 
                     match fetch_result {
                         Ok(proposal) => {
-                            fetching_timeout.as_mut().reset(time::Instant::now() + Duration::from_secs(self.block_interval().into()));
+                            info!(self.logger, "new proposal"; "height" => proposal.height, "data" => short_hex(&proposal.data));
                             self.pending_proposal.replace(proposal);
                             self.pending_proposal_proposed = false;
                         }
@@ -282,13 +280,22 @@ impl Peer {
                         }
                     }
                 }
-            }
 
-            if tick_timeout.is_elapsed() {
-                self.core.tick();
-                tick_timeout
-                    .as_mut()
-                    .reset(time::Instant::now() + tick_interval);
+                // reconfigure
+                Some(config) = self.controller_rx.recv() => {
+                    info!(self.logger, "incoming reconfigure request: `{:?}`", config);
+                    self.core.mut_store().update_consensus_config(config).await;
+                    self.maybe_pending_conf_change();
+                }
+                // raft msg from remote peers
+                Some(raft_msg) = self.peer_rx.recv() => {
+                    if let Err(e) = self.core.step(raft_msg) {
+                        error!(self.logger, "step raft msg failed: `{}`", e);
+                    }
+                    if !self.core.has_ready() {
+                        continue;
+                    }
+                }
             }
 
             if self.is_leader() {
@@ -327,18 +334,6 @@ impl Peer {
                         );
                         self.pending_proposal.take();
                     }
-                }
-
-                // fetching new proposal
-                if self.pending_proposal.is_none()
-                    && fetching_proposal.is_none()
-                    && fetching_timeout.is_elapsed()
-                {
-                    let controller = self.controller.clone();
-                    fetching_proposal.replace(tokio::spawn(async move {
-                        // TODO: hanlde error
-                        controller.get_proposal().await.unwrap()
-                    }));
                 }
             } else {
                 if let Some(h) = fetching_proposal.take() {
@@ -419,25 +414,34 @@ impl Peer {
             match entry.get_entry_type() {
                 EntryType::EntryNormal => {
                     let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
+                    let proposal_height = proposal.height;
+                    let proposal_data_hex = short_hex(&proposal.data);
                     let expected_height = self.block_height() + 1;
                     // We must maintain the consistence in ourself
                     assert_eq!(proposal.height, expected_height);
 
-                    // TODO: handle grpc error
-                    if self
-                        .controller
-                        .check_proposal(proposal.clone())
-                        .await
-                        .unwrap_or(false)
-                    {
-                        let pwp = ProposalWithProof {
-                            proposal: Some(proposal),
-                            proof: vec![],
-                        };
-                        if let Ok(config) = self.controller.commit_block(pwp).await {
-                            self.core.mut_store().update_consensus_config(config).await;
-                            self.maybe_pending_conf_change();
+                    match self.controller.check_proposal(proposal.clone()).await {
+                        Ok(true) => {
+                            let pwp = ProposalWithProof {
+                                proposal: Some(proposal),
+                                proof: vec![],
+                            };
+                            match self.controller.commit_block(pwp).await {
+                                Ok(config) => {
+                                    info!(self.logger, "block committed"; "height" => proposal_height, "data" => proposal_data_hex);
+                                    self.core.mut_store().update_consensus_config(config).await;
+                                    self.maybe_pending_conf_change();
+                                }
+                                Err(e) => {
+                                    warn!(self.logger, "commit block failed: {}", e);
+                                }
+                            }
                         }
+                        Ok(false) => warn!(
+                            self.logger,
+                            "check proposal failed, controller replies a false"
+                        ),
+                        Err(e) => warn!(self.logger, "check proposal failed: {}", e),
                     }
 
                     self.core
@@ -446,7 +450,10 @@ impl Peer {
                         .await;
                     if let Some(p) = self.pending_proposal.as_ref() {
                         if p.height <= expected_height {
+                            debug!(self.logger, "pending proposal done");
                             self.pending_proposal.take();
+                        } else {
+                            debug!(self.logger, "pending proposal is higher than committed"; "pending_height" => p.height, "committed_height" => expected_height);
                         }
                     }
                 }
@@ -518,6 +525,10 @@ impl Peer {
                 ..Default::default()
             }
         };
+
+        if !cc.changes.is_empty() {
+            info!(self.logger, "new pending conf change: `{:?}`", cc);
+        }
 
         self.pending_conf_change.replace(cc);
         self.pending_conf_change_proposed = false;
