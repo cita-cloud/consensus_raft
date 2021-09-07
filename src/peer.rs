@@ -102,7 +102,6 @@ impl Peer {
         logger: Logger,
     ) -> Self {
         let local_id = addr_to_peer_id(&node_addr);
-        let logger = logger.new(o!("raft_id" => local_id));
 
         // Controller grpc client
         let controller = {
@@ -305,7 +304,10 @@ impl Peer {
                         .core
                         .propose_conf_change(vec![], self.pending_conf_change.clone().unwrap())
                     {
-                        Ok(()) => self.pending_conf_change_proposed = true,
+                        Ok(()) => {
+                            info!(self.logger, "pending conf change proposed");
+                            self.pending_conf_change_proposed = true;
+                        }
                         Err(e) => warn!(self.logger, "propose conf change failed: `{}`", e),
                     }
                 }
@@ -323,6 +325,7 @@ impl Peer {
                         if let Err(e) = self.core.propose(vec![], proposal_bytes) {
                             warn!(self.logger, "can't propose proposal: `{}`", e);
                         } else {
+                            info!(self.logger, "pending proposal proposed"; "height" => proposal.height, "data" => short_hex(&proposal.data));
                             self.pending_proposal_proposed = true;
                         }
                     } else {
@@ -528,9 +531,10 @@ impl Peer {
 
         if !cc.changes.is_empty() {
             info!(self.logger, "new pending conf change: `{:?}`", cc);
+            self.pending_conf_change.replace(cc);
+        } else {
+            self.pending_conf_change.take();
         }
-
-        self.pending_conf_change.replace(cc);
         self.pending_conf_change_proposed = false;
     }
 }
