@@ -189,18 +189,28 @@ impl Inner {
     }
 
     async fn update_mailbook(&self, peer_id: u64, origin: u64) {
-        let recorded = self.mailbook.read().await.get(&peer_id).copied();
-        if let Some(recorded) = recorded {
-            if origin != recorded {
+        let record = self.mailbook.read().await.get(&peer_id).copied();
+        match record {
+            Some(recorded) if origin != recorded => {
                 let old = self.mailbook.write().await.insert(peer_id, origin);
                 debug!(
                     self.logger,
                     "mailbook updated";
                     "peer_id" => peer_id,
-                    "origin" => origin,
+                    "new_origin" => origin,
                     "old" => old,
                 );
             }
+            None => {
+                self.mailbook.write().await.insert(peer_id, origin);
+                debug!(
+                    self.logger,
+                    "mailbook add record";
+                    "peer_id" => peer_id,
+                    "origin" => origin,
+                );
+            }
+            _ => (),
         }
     }
 
