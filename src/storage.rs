@@ -377,9 +377,9 @@ impl WalStorageCore {
                 let _ = self.apply_snapshot(snapshot);
             }
             AppendEntries => {
-                let length = prost::decode_length_delimiter(&mut log_data)?;
-                let mut entries = Vec::with_capacity(length);
-                for _ in 0..length {
+                let cnt = prost::decode_length_delimiter(&mut log_data)?;
+                let mut entries = Vec::with_capacity(cnt);
+                for _ in 0..cnt {
                     let ent = Entry::decode_length_delimited(&mut log_data)?;
                     entries.push(ent);
                 }
@@ -573,7 +573,7 @@ impl WalStorageCore {
         self.consensus_config.height = h;
     }
 
-    async fn log_set_block_height(&mut self, h: u64) {
+    async fn log_update_block_height(&mut self, h: u64) {
         let mut buf = BytesMut::new();
         buf.put_u8(WalOpType::UpdateBlockHeight as u8);
         buf.put_u64(h);
@@ -611,15 +611,13 @@ impl WalStorageCore {
         // to compact log
         self.apply_snapshot(snapshot).unwrap();
 
-        // TODO: clone due to borrow checker, maybe remove it.
-        // Persist unapplied entries.
-        self.log_append_entries(&self.entries.clone()).await;
         // This is used for update committed index, because the snapshot only contains applied index.
         self.log_update_hard_state(&self.raft_state.hard_state.clone())
             .await;
 
-        self.log_update_consensus_config(&self.consensus_config.clone())
-            .await;
+        // TODO: clone due to borrow checker, maybe remove it.
+        // Persist unapplied entries.
+        self.log_append_entries(&self.entries.clone()).await;
 
         let acitve_log = self.mut_active_log();
         acitve_log.flush().await;
@@ -719,8 +717,8 @@ impl WalStorage {
         self.0.advance_applied_index(applied_index);
     }
 
-    pub async fn set_block_height(&mut self, h: u64) {
-        self.0.log_set_block_height(h).await;
+    pub async fn update_block_height(&mut self, h: u64) {
+        self.0.log_update_block_height(h).await;
         self.0.flush().await;
         self.0.update_block_height(h);
     }
@@ -780,10 +778,13 @@ fn limit_size<T: Message + Clone>(entries: &mut Vec<T>, max: Option<u64>) {
     let limit = entries
         .iter()
         .take_while(|&e| {
-            size += e.encoded_len() as u64;
+            // This clippy suggestion introduces a *BUG* which wastes me a day!!!
+            #[allow(clippy::branches_sharing_code)]
             if size == 0 {
+                size += e.encoded_len() as u64;
                 true
             } else {
+                size += e.encoded_len() as u64;
                 size <= max
             }
         })
