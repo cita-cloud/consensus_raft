@@ -166,12 +166,24 @@ impl Peer {
             } else {
                 info!(
                     logger,
-                    "incoming config doesn't contain this node, wait for next one."
+                    "incoming config doesn't contain this node, wait for next one"
                 );
             }
         };
 
-        storage.update_consensus_config(trigger_config).await;
+        let recorded_height = storage.get_block_height();
+        #[allow(clippy::comparison_chain)]
+        if trigger_config.height > recorded_height {
+            storage.update_consensus_config(trigger_config).await;
+        } else if trigger_config.height < recorded_height {
+            warn!(
+                logger, "block height in intial reconfigure is lower than recorded; skip it";
+                "reconfigure" => trigger_config.height,
+                "recorded" => recorded_height
+            );
+        }
+
+        info!(logger, "reconfigure ack");
 
         let core = {
             // Load applied index from stable storage.
@@ -419,9 +431,6 @@ impl Peer {
                     let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
                     let proposal_height = proposal.height;
                     let proposal_data_hex = short_hex(&proposal.data);
-                    let expected_height = self.block_height() + 1;
-                    // We must maintain the consistence in ourself
-                    assert_eq!(proposal.height, expected_height);
 
                     match self.controller.check_proposal(proposal.clone()).await {
                         Ok(true) => {
@@ -447,17 +456,28 @@ impl Peer {
                         Err(e) => warn!(self.logger, "check proposal failed: {}", e),
                     }
 
-                    self.core
-                        .mut_store()
-                        .set_block_height(expected_height)
-                        .await;
-                    if let Some(p) = self.pending_proposal.as_ref() {
-                        if p.height <= expected_height {
-                            debug!(self.logger, "pending proposal done");
+                    if let Some(pending) = self.pending_proposal.as_ref() {
+                        if pending.height <= proposal_height {
+                            debug!(self.logger, "pending proposal removed");
                             self.pending_proposal.take();
                         } else {
-                            debug!(self.logger, "pending proposal is higher than committed"; "pending_height" => p.height, "committed_height" => expected_height);
+                            debug!(
+                                self.logger, "pending proposal is higher than committed";
+                                "pending_height" => pending.height, "committed_height" => proposal_height
+                            );
                         }
+                    }
+
+                    if proposal_height > self.block_height() {
+                        self.core
+                            .mut_store()
+                            .update_block_height(proposal_height)
+                            .await;
+                    } else {
+                        warn!(
+                            self.logger, "committed entry height is lower than expected";
+                            "entry" => proposal_height, "expected" => self.block_height() + 1
+                        );
                     }
                 }
                 // All conf changes are v2.
