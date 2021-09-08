@@ -473,11 +473,6 @@ impl Peer {
                             .mut_store()
                             .update_block_height(proposal_height)
                             .await;
-                    } else {
-                        warn!(
-                            self.logger, "committed entry height is lower than expected";
-                            "entry" => proposal_height, "expected" => self.block_height() + 1
-                        );
                     }
                 }
                 // All conf changes are v2.
