@@ -143,6 +143,7 @@ impl Peer {
         let (wants_compaign, trigger_config) = loop {
             let config = controller_rx.recv().await.unwrap();
             if let Some(index) = config.validators.iter().position(|addr| addr == &node_addr) {
+                let mut wants_compaign = false;
                 if !storage.is_initialized() {
                     let snapshot = {
                         let voters = config
@@ -160,9 +161,10 @@ impl Peer {
                     };
 
                     storage.apply_snapshot(snapshot).await.unwrap();
+                    wants_compaign = index == 0;
                 }
 
-                break (index == 0, config);
+                break (wants_compaign, config);
             } else {
                 info!(
                     logger,
@@ -276,6 +278,7 @@ impl Peer {
                 }
 
                 // future for fetching proposal from controller
+                // the async {..} wrapper is for lazy evaluation
                 fetch_result = async { fetching_proposal.as_mut().unwrap().await }, if fetching_proposal.is_some() => {
                     fetching_proposal.take();
                     fetching_timeout.as_mut().reset(time::Instant::now() + Duration::from_secs(self.block_interval().into()));
@@ -302,9 +305,6 @@ impl Peer {
                 Some(raft_msg) = self.peer_rx.recv() => {
                     if let Err(e) = self.core.step(raft_msg) {
                         error!(self.logger, "step raft msg failed: `{}`", e);
-                    }
-                    if !self.core.has_ready() {
-                        continue;
                     }
                 }
             }
