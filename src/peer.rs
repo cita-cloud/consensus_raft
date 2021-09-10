@@ -50,8 +50,11 @@ impl ConsensusService for RaftConsensusService {
         request: tonic::Request<ConsensusConfiguration>,
     ) -> std::result::Result<tonic::Response<SimpleResponse>, tonic::Status> {
         let config = request.into_inner();
-        let _ = self.0.send(config).await;
-        // TODO: it's not safe
+        let tx = self.0.clone();
+        // FIXME: it's not safe; but if we wait for it, it may cause a deadlock
+        tokio::spawn(async move {
+            let _ = tx.send(config).await;
+        });
         let reply = SimpleResponse { is_success: true };
         Ok(tonic::Response::new(reply))
     }
