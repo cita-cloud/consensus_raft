@@ -143,7 +143,7 @@ impl Peer {
 
         // Wait for controller's reconfigure.
         info!(logger, "waiting for `reconfigure` from controller..");
-        let (wants_compaign, trigger_config) = loop {
+        let (wants_campaign, trigger_config) = loop {
             let config = controller_rx.recv().await.unwrap();
             if let Some(index) = config.validators.iter().position(|addr| addr == &node_addr) {
                 let mut wants_compaign = false;
@@ -225,7 +225,7 @@ impl Peer {
 
         this.maybe_pending_conf_change();
 
-        if wants_compaign {
+        if wants_campaign {
             this.core.campaign().unwrap();
         }
 
@@ -252,7 +252,7 @@ impl Peer {
     }
 
     pub async fn run(&mut self) {
-        let mut fetching_proposal: Option<JoinHandle<Proposal>> = None;
+        let mut fetching_proposal: Option<JoinHandle<Result<Proposal, tonic::Status>>> = None;
 
         let tick_interval = Duration::from_millis(200);
         let tick_timeout = time::sleep(tick_interval);
@@ -275,14 +275,13 @@ impl Peer {
                     info!(self.logger, "fetching proposal..");
                     let controller = self.controller.clone();
                     fetching_proposal.replace(tokio::spawn(async move {
-                        // TODO: hanlde error
-                        controller.get_proposal().await.unwrap()
+                        controller.get_proposal().await
                     }));
                 }
 
                 // future for fetching proposal from controller
                 // the async {..} wrapper is for lazy evaluation
-                fetch_result = async { fetching_proposal.as_mut().unwrap().await }, if fetching_proposal.is_some() => {
+                Ok(fetch_result) = async { fetching_proposal.as_mut().unwrap().await }, if fetching_proposal.is_some() => {
                     fetching_proposal.take();
                     fetching_timeout.as_mut().reset(time::Instant::now() + Duration::from_secs(self.block_interval().into()));
 
@@ -433,14 +432,16 @@ impl Peer {
                 EntryType::EntryNormal => {
                     let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
                     let proposal_height = proposal.height;
-                    let proposal_data_hex = short_hex(&proposal.data);
+                    let proposal_data_hex = &short_hex(&proposal.data);
 
+                    info!(self.logger, "checking proposal.."; "height" => proposal_height, "data" => proposal_data_hex);
                     match self.controller.check_proposal(proposal.clone()).await {
                         Ok(true) => {
                             let pwp = ProposalWithProof {
                                 proposal: Some(proposal),
                                 proof: vec![],
                             };
+                            info!(self.logger, "commiting proposal..");
                             match self.controller.commit_block(pwp).await {
                                 Ok(config) => {
                                     info!(self.logger, "block committed"; "height" => proposal_height, "data" => proposal_data_hex);
