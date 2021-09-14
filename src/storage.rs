@@ -59,44 +59,6 @@ const WAL_BACKUP_LOG_NAME: &str = "raft-wal-log.backup";
 // to ensure snapshot in active log is fully written.
 const WAL_TEMP_LOG_NAME: &str = "raft-wal-log.temp";
 
-#[repr(u8)]
-#[derive(Debug)]
-enum WalOpType {
-    UpdateHardState = 1,
-    UpdateConfState = 2,
-    UpdateConsensusConfig = 3,
-    ApplySnapshot = 4,
-    AppendEntries = 5,
-    AdvanceAppliedIndex = 6,
-}
-
-#[derive(ThisError, Debug)]
-enum DecodeLogError {
-    #[error("provide log data is insufficient")]
-    InsufficientData,
-    #[error("can't parse wal-op type, data may be corrupted")]
-    CorruptedWalOpType,
-    #[error("can't parse wal-op data, data may be corrupted, error: `{0}`")]
-    CorruptedWalData(#[from] prost::DecodeError),
-}
-
-impl TryFrom<u8> for WalOpType {
-    type Error = DecodeLogError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        let ty = match value {
-            1 => Self::UpdateHardState,
-            2 => Self::UpdateConfState,
-            3 => Self::UpdateConsensusConfig,
-            4 => Self::ApplySnapshot,
-            5 => Self::AppendEntries,
-            6 => Self::AdvanceAppliedIndex,
-            _ => return Err(DecodeLogError::CorruptedWalOpType),
-        };
-        Ok(ty)
-    }
-}
-
 #[derive(Debug)]
 struct LogFile {
     file: File,
@@ -119,7 +81,7 @@ impl LogFile {
         })
     }
 
-    async fn create_truncate<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
+    async fn create_truncated<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -183,21 +145,61 @@ impl LogFile {
     }
 }
 
+#[repr(u8)]
+#[derive(Debug)]
+enum WalOpType {
+    UpdateHardState = 1,
+    UpdateConfState = 2,
+    ApplySnapshot = 3,
+    AppendEntries = 4,
+    AdvanceAppliedIndex = 5,
+
+    UpdateBlockHeight = 6,
+    UpdateConsensusConfig = 7,
+}
+
+#[derive(ThisError, Debug)]
+enum DecodeLogError {
+    #[error("provide log data is insufficient")]
+    InsufficientData,
+    #[error("can't parse wal-op type, data may be corrupted")]
+    CorruptedWalOpType,
+    #[error("can't parse wal-op data, data may be corrupted, error: `{0}`")]
+    CorruptedWalData(#[from] prost::DecodeError),
+}
+
+impl TryFrom<u8> for WalOpType {
+    type Error = DecodeLogError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        let ty = match value {
+            1 => Self::UpdateHardState,
+            2 => Self::UpdateConfState,
+            3 => Self::ApplySnapshot,
+            4 => Self::AppendEntries,
+            5 => Self::AdvanceAppliedIndex,
+            6 => Self::UpdateBlockHeight,
+            7 => Self::UpdateConsensusConfig,
+            _ => return Err(DecodeLogError::CorruptedWalOpType),
+        };
+        Ok(ty)
+    }
+}
+
 #[derive(Debug)]
 struct WalStorageCore {
     raft_state: RaftState,
-    // We don't take snapshot of the statemachine(controller),
-    // which has its own sync mechanism.
     snapshot_metadata: SnapshotMetadata,
 
     entries: Vec<Entry>,
     applied_index: u64,
 
+    // It's the state
     consensus_config: ConsensusConfiguration,
 
+    // Storage
     log_dir: PathBuf,
     active_log: Option<LogFile>,
-
     compact_limit: u64,
 
     // slog logger
@@ -215,7 +217,7 @@ impl WalStorageCore {
             snapshot_metadata: SnapshotMetadata::default(),
             entries: vec![],
             applied_index: 0,
-            consensus_config: ConsensusConfiguration::default(),
+            consensus_config: Default::default(),
             log_dir,
             active_log: None,
             compact_limit,
@@ -370,31 +372,49 @@ impl WalStorageCore {
                 let conf_state = ConfState::decode_length_delimited(&mut log_data)?;
                 self.update_conf_state(conf_state);
             }
-            UpdateConsensusConfig => {
-                let config = ConsensusConfiguration::decode_length_delimited(&mut log_data)?;
-                self.update_consensus_config(config);
-            }
             ApplySnapshot => {
                 let snapshot = Snapshot::decode_length_delimited(&mut log_data)?;
                 let _ = self.apply_snapshot(snapshot);
             }
             AppendEntries => {
-                let length = prost::decode_length_delimiter(&mut log_data)?;
-                let mut entries = Vec::with_capacity(length);
-                for _ in 0..length {
+                let cnt = prost::decode_length_delimiter(&mut log_data)?;
+                let mut entries = Vec::with_capacity(cnt);
+                for _ in 0..cnt {
                     let ent = Entry::decode_length_delimited(&mut log_data)?;
                     entries.push(ent);
                 }
                 self.append_entries(&entries);
             }
+
             AdvanceAppliedIndex => {
-                let applied_index = log_data.get_u64();
+                let applied_index = {
+                    if log_data.remaining() < std::mem::size_of::<u64>() {
+                        return Err(DecodeLogError::InsufficientData);
+                    }
+                    log_data.get_u64()
+                };
                 self.advance_applied_index(applied_index);
+            }
+
+            UpdateBlockHeight => {
+                let h = {
+                    if log_data.remaining() < std::mem::size_of::<u64>() {
+                        return Err(DecodeLogError::InsufficientData);
+                    }
+                    log_data.get_u64()
+                };
+                self.update_block_height(h);
+            }
+            UpdateConsensusConfig => {
+                let config = ConsensusConfiguration::decode_length_delimited(&mut log_data)?;
+                self.update_consensus_config(config);
             }
         }
         let consumed = remaining - log_data.remaining();
         Ok(consumed)
     }
+
+    // wal operations on storage
 
     fn append_entries(&mut self, entries: &[Entry]) {
         let incoming_index = match entries.first() {
@@ -436,6 +456,8 @@ impl WalStorageCore {
         self.mut_active_log().write_all(&buf).await;
     }
 
+    // ----
+
     fn update_hard_state(&mut self, hard_state: HardState) {
         self.raft_state.hard_state = hard_state;
     }
@@ -446,6 +468,8 @@ impl WalStorageCore {
         hard_state.encode_length_delimited(&mut buf).unwrap();
         self.mut_active_log().write_all(&buf).await;
     }
+
+    // ----
 
     fn update_conf_state(&mut self, conf_state: ConfState) {
         self.raft_state.conf_state = conf_state;
@@ -458,6 +482,8 @@ impl WalStorageCore {
         self.mut_active_log().write_all(&buf).await;
     }
 
+    // ----
+
     fn advance_applied_index(&mut self, applied_index: u64) {
         self.applied_index = applied_index;
     }
@@ -469,6 +495,8 @@ impl WalStorageCore {
         self.mut_active_log().write_all(&buf).await;
     }
 
+    // ----
+
     fn snapshot(&self, request_index: u64) -> raft::Result<Snapshot> {
         if request_index > self.applied_index {
             return Err(raft::Error::Store(
@@ -477,13 +505,13 @@ impl WalStorageCore {
         }
 
         let mut snapshot = Snapshot::default();
+
         let meta = snapshot.mut_metadata();
-
         meta.index = self.applied_index;
-        // This must exist.
         meta.term = self.term(self.applied_index).unwrap();
-
         meta.set_conf_state(self.raft_state.conf_state.clone());
+
+        snapshot.set_data(self.consensus_config.encode_to_vec());
 
         Ok(snapshot)
     }
@@ -504,6 +532,9 @@ impl WalStorageCore {
             );
             return Err(StorageError::SnapshotOutOfDate);
         }
+
+        self.consensus_config = ConsensusConfiguration::decode(snapshot.data.as_slice())
+            .expect("decode snapshot data failed");
 
         self.snapshot_metadata = meta.clone();
 
@@ -536,6 +567,21 @@ impl WalStorageCore {
         self.mut_active_log().write_all(&buf).await;
     }
 
+    // ----
+
+    fn update_block_height(&mut self, h: u64) {
+        self.consensus_config.height = h;
+    }
+
+    async fn log_update_block_height(&mut self, h: u64) {
+        let mut buf = BytesMut::new();
+        buf.put_u8(WalOpType::UpdateBlockHeight as u8);
+        buf.put_u64(h);
+        self.mut_active_log().write_all(&buf).await;
+    }
+
+    // ----
+
     fn update_consensus_config(&mut self, config: ConsensusConfiguration) {
         self.consensus_config = config;
     }
@@ -547,6 +593,8 @@ impl WalStorageCore {
         self.mut_active_log().write_all(&buf).await;
     }
 
+    // ----
+
     // This is also used for log compaction.
     async fn generate_new_active_log(&mut self) {
         if let Some(mut old_log) = self.active_log.take() {
@@ -556,20 +604,20 @@ impl WalStorageCore {
 
         let temp_log_path = self.log_dir.join(WAL_TEMP_LOG_NAME);
         self.active_log
-            .replace(LogFile::create_truncate(temp_log_path).await.unwrap());
+            .replace(LogFile::create_truncated(temp_log_path).await.unwrap());
 
         let snapshot = self.snapshot(self.applied_index).unwrap();
         self.log_apply_snapshot(&snapshot).await;
+        // to compact log
         self.apply_snapshot(snapshot).unwrap();
+
+        // This is used for update committed index, because the snapshot only contains applied index.
+        self.log_update_hard_state(&self.raft_state.hard_state.clone())
+            .await;
 
         // TODO: clone due to borrow checker, maybe remove it.
         // Persist unapplied entries.
         self.log_append_entries(&self.entries.clone()).await;
-        // This is used for update committed index, because the snapshot only contains applied index.
-        self.log_update_hard_state(&self.raft_state.hard_state.clone())
-            .await;
-        self.log_update_consensus_config(&self.consensus_config.clone())
-            .await;
 
         let acitve_log = self.mut_active_log();
         acitve_log.flush().await;
@@ -621,21 +669,17 @@ impl WalStorage {
         &self.0.raft_state.conf_state
     }
 
-    pub fn get_consensus_config(&self) -> &ConsensusConfiguration {
-        &self.0.consensus_config
+    pub fn get_block_height(&self) -> u64 {
+        self.0.consensus_config.height
     }
 
-    // pub fn get_block_height(&self) -> u64 {
-    //     self.0.consensus_config.block_height
-    // }
+    pub fn get_block_interval(&self) -> u32 {
+        self.0.consensus_config.block_interval
+    }
 
-    // pub fn get_block_interval(&self) -> u64 {
-    //     self.0.consensus_config.block_interval
-    // }
-
-    // pub fn get_validators(&self) -> u64 {
-    //     self.0.consensus_config.block_interval
-    // }
+    pub fn get_validators(&self) -> &[Vec<u8>] {
+        &self.0.consensus_config.validators
+    }
 
     pub async fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<(), StorageError> {
         self.0.log_apply_snapshot(&snapshot).await;
@@ -671,6 +715,12 @@ impl WalStorage {
         self.0.log_advance_applied_index(applied_index).await;
         self.0.flush().await;
         self.0.advance_applied_index(applied_index);
+    }
+
+    pub async fn update_block_height(&mut self, h: u64) {
+        self.0.log_update_block_height(h).await;
+        self.0.flush().await;
+        self.0.update_block_height(h);
     }
 
     pub async fn update_consensus_config(&mut self, config: ConsensusConfiguration) {
@@ -728,6 +778,8 @@ fn limit_size<T: Message + Clone>(entries: &mut Vec<T>, max: Option<u64>) {
     let limit = entries
         .iter()
         .take_while(|&e| {
+            // This clippy suggestion introduces a *BUG* which wastes me a day!!!
+            #[allow(clippy::branches_sharing_code)]
             if size == 0 {
                 size += e.encoded_len() as u64;
                 true

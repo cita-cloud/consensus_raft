@@ -5,7 +5,7 @@ authors = ["whfuyn <whfuyn@outlook.com>"]
 edition = "2018"
 
 [dependencies]
-clap = "3.0.0-beta.2"
+clap = "=3.0.0-beta.4"
 git-version = "0.3.4"
 cita_cloud_proto = { git = "https://github.com/cita-cloud/cita_cloud_proto" }
 tonic = "0.5" 

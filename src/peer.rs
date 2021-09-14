@@ -1,230 +1,161 @@
-// Copyright Rivtower Technologies LLC.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 use std::collections::HashSet;
 use std::path::Path;
-use std::path::PathBuf;
-
-use tokio::sync::mpsc;
-use tokio::time;
-
-use slog::debug;
-use slog::error;
-use slog::info;
-use slog::o;
-use slog::warn;
-use slog::Logger;
-
-use anyhow::anyhow;
-use anyhow::Result;
+use std::time::Duration;
 
 use raft::eraftpb::ConfChangeType;
+use raft::eraftpb::Snapshot;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time;
+
 use raft::eraftpb::Message as RaftMsg;
-use raft::eraftpb::MessageType;
 use raft::prelude::ConfChangeSingle;
 use raft::prelude::ConfChangeV2;
-use raft::prelude::Config;
+use raft::prelude::Config as RaftConfig;
 use raft::prelude::Entry;
 use raft::prelude::EntryType;
 use raft::prelude::Message;
-use raft::prelude::RawNode;
-use raft::prelude::Snapshot;
-use raft::StateRole;
+use raft::RawNode;
 
-use cita_cloud_proto::common::Proposal;
+use slog::o;
+use slog::Logger;
+use slog::{debug, error, info, warn};
 
 use prost::Message as _;
 
-use crate::address_to_peer_id;
-use crate::mailbox::Letter;
-use crate::mailbox::MailboxControl;
+use tonic::transport::Server;
+
+use cita_cloud_proto::common::ConsensusConfiguration;
+use cita_cloud_proto::common::Proposal;
+use cita_cloud_proto::common::ProposalWithProof;
+use cita_cloud_proto::common::SimpleResponse;
+use cita_cloud_proto::consensus::consensus_service_server::ConsensusService;
+use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServer;
+use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
+
+use crate::client::{Controller, Network};
 use crate::storage::WalStorage;
+use crate::utils::{addr_to_peer_id, short_hex};
 
 // Compact wal log if file size > 64MB.
 const WAL_COMPACT_LIMIT: u64 = 64 * 1024 * 1024;
 
-/// An unified msg type for both local control messages
-/// and raft internal messages. It's used by the mailbox.
-#[derive(Debug, Clone)]
-#[allow(clippy::large_enum_variant)]
-pub enum PeerMsg {
-    // Local message to control this peer.
-    Control(ControlMsg),
-    // Raft message to and from peers.
-    Normal(RaftMsg),
-}
+#[derive(Debug)]
+pub struct RaftConsensusService(mpsc::Sender<ConsensusConfiguration>);
 
-impl Letter for PeerMsg {
-    type Address = u64;
-    type ReadError = anyhow::Error;
-
-    fn to(&self) -> Option<Self::Address> {
-        match self {
-            PeerMsg::Normal(raft_msg) => Some(raft_msg.to),
-            PeerMsg::Control(_) => panic!("attempt to send local msg"),
-        }
+#[tonic::async_trait]
+impl ConsensusService for RaftConsensusService {
+    async fn reconfigure(
+        &self,
+        request: tonic::Request<ConsensusConfiguration>,
+    ) -> std::result::Result<tonic::Response<SimpleResponse>, tonic::Status> {
+        let config = request.into_inner();
+        let tx = self.0.clone();
+        // FIXME: it's not safe; but if we wait for it, it may cause a deadlock
+        tokio::spawn(async move {
+            let _ = tx.send(config).await;
+        });
+        let reply = SimpleResponse { is_success: true };
+        Ok(tonic::Response::new(reply))
     }
 
-    fn from(&self) -> Self::Address {
-        match self {
-            PeerMsg::Normal(raft_msg) => raft_msg.from,
-            PeerMsg::Control(_) => panic!("attempt to send local msg"),
-        }
+    async fn check_block(
+        &self,
+        _request: tonic::Request<ProposalWithProof>,
+    ) -> Result<tonic::Response<SimpleResponse>, tonic::Status> {
+        // Reply true since we assume no byzantine faults.
+        let reply = SimpleResponse { is_success: true };
+        Ok(tonic::Response::new(reply))
     }
-
-    fn write_down(&self) -> Vec<u8> {
-        match self {
-            PeerMsg::Normal(raft_msg) => {
-                let mut buf = Vec::with_capacity(raft_msg.encoded_len());
-                raft_msg.encode(&mut buf).unwrap();
-                buf
-            }
-            PeerMsg::Control(_) => panic!("attempt to send local msg"),
-        }
-    }
-
-    fn read_from(paper: &[u8]) -> std::result::Result<Self, Self::ReadError> {
-        Ok(PeerMsg::Normal(RaftMsg::decode(paper)?))
-    }
-}
-
-/// Control msg to interact with the peer.
-#[derive(Debug, Clone)]
-pub enum ControlMsg {
-    // Use mpsc channel for `reply_tx` instead of oneshot since we requires the msg to be Clone.
-    Propose {
-        data: Vec<u8>,
-    },
-    GetBlockInterval {
-        reply_tx: mpsc::UnboundedSender<u32>,
-    },
-    SetConsensusConfig {
-        config: ConsensusConfiguration,
-        reply_tx: mpsc::UnboundedSender<bool>,
-    },
-    IsLeader {
-        reply_tx: mpsc::UnboundedSender<bool>,
-    },
-    Tick,
 }
 
 pub struct Peer {
-    peer_id: u64,
-    node_addr: Vec<u8>,
-    node: Option<RawNode<WalStorage>>,
+    // raft core
+    core: RawNode<WalStorage>,
 
-    msg_tx: mpsc::UnboundedSender<PeerMsg>,
-    msg_rx: mpsc::UnboundedReceiver<PeerMsg>,
-    mailbox_control: MailboxControl<PeerMsg>,
+    // peers' raft msg receiver.
+    peer_rx: mpsc::Receiver<RaftMsg>,
 
-    ready_for_proposal_notifier: Option<mpsc::UnboundedSender<()>>,
+    // controller msg receiver. Currently only used for `reconfigure`.
+    controller_rx: mpsc::Receiver<ConsensusConfiguration>,
 
-    data_dir: PathBuf,
+    // grpc client to talk with other micro-services.
+    controller: Controller,
+    network: Network,
 
+    // pending_conf_change
+    pending_conf_change: Option<ConfChangeV2>,
+    pending_conf_change_proposed: bool,
+
+    // pending proposal
+    pending_proposal: Option<Proposal>,
+    pending_proposal_proposed: bool,
+
+    // slog logger
     logger: Logger,
 }
 
 impl Peer {
-    pub async fn new(
+    pub async fn setup(
         node_addr: Vec<u8>,
-        msg_tx: mpsc::UnboundedSender<PeerMsg>,
-        msg_rx: mpsc::UnboundedReceiver<PeerMsg>,
-        mailbox_control: MailboxControl<PeerMsg>,
+        local_port: u16,
+        controller_port: u16,
+        network_port: u16,
         data_dir: impl AsRef<Path>,
         logger: Logger,
     ) -> Self {
-        let peer_id = address_to_peer_id(&node_addr);
-        let logger = logger.new(o!("tag" => format!("peer_{}", peer_id)));
+        let local_id = addr_to_peer_id(&node_addr);
 
-        Self {
-            peer_id,
-            node_addr,
-            node: None,
-            msg_tx,
-            msg_rx,
-            mailbox_control,
-            ready_for_proposal_notifier: None,
-            data_dir: data_dir.as_ref().to_path_buf(),
-            logger,
-        }
-    }
+        // Controller grpc client
+        let controller = {
+            let logger = logger.new(o!("tag" => "controller"));
+            Controller::new(controller_port, logger)
+        };
 
-    fn node(&self) -> &RawNode<WalStorage> {
-        match self.node.as_ref() {
-            Some(node) => node,
-            None => {
-                let error_msg = "try to access uninitialized node.";
-                error!(self.logger, "{}", error_msg);
-                panic!("{}", error_msg)
-            }
-        }
-    }
+        // Communicate with controller
+        let (controller_tx, mut controller_rx) = mpsc::channel::<ConsensusConfiguration>(1);
+        let raft_svc = RaftConsensusService(controller_tx);
 
-    fn mut_node(&mut self) -> &mut RawNode<WalStorage> {
-        match self.node.as_mut() {
-            Some(node) => node,
-            None => {
-                let error_msg = "try to access uninitialized node.";
-                error!(self.logger, "{}", error_msg);
-                panic!("{}", error_msg)
-            }
-        }
-    }
+        // Network grpc client
+        let (peer_tx, peer_rx) = mpsc::channel(64);
+        let network = {
+            let logger = logger.new(o!("tag" => "network"));
+            Network::setup(local_id, local_port, network_port, peer_tx, logger).await
+        };
+        let network_svc = network.clone();
 
-    pub async fn run(&mut self) {
-        let storage = WalStorage::new(&self.data_dir, WAL_COMPACT_LIMIT, self.logger.clone()).await;
+        let logger_cloned = logger.clone();
+        tokio::spawn(async move {
+            let addr = format!("127.0.0.1:{}", local_port).parse().unwrap();
+            let _ = Server::builder()
+                .add_service(ConsensusServiceServer::new(raft_svc))
+                .add_service(NetworkMsgHandlerServiceServer::new(network_svc))
+                .serve(addr)
+                .await;
+            info!(logger_cloned, "grpc service exit");
+        });
 
-        if storage.is_initialized() {
-            info!(self.logger, "start initialized node");
-            self.start_raft(storage);
-        } else {
-            self.wait_init(storage).await;
-        }
+        // Recover data from log
+        let mut storage = {
+            let logger = logger.new(o!("tag" => "storage"));
+            WalStorage::new(&data_dir, WAL_COMPACT_LIMIT, logger.clone()).await
+        };
 
-        while let Some(msg) = self.msg_rx.recv().await {
-            self.handle_msg(msg).await;
-        }
-    }
-
-    async fn wait_init(&mut self, mut storage: WalStorage) {
-        while let Some(msg) = self.msg_rx.recv().await {
-            if let PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) = msg {
-                info!(
-                    self.logger,
-                    "node_addr: `{}`, incoming config: `{:?}`",
-                    hex::encode(&self.node_addr),
-                    config
-                        .validators
-                        .iter()
-                        .map(hex::encode)
-                        .collect::<Vec<String>>()
-                );
-
-                storage.update_consensus_config(config.clone()).await;
-
-                if let Some(index) = config
-                    .validators
-                    .iter()
-                    .position(|addr| addr == &self.node_addr)
-                {
+        // Wait for controller's reconfigure.
+        info!(logger, "waiting for `reconfigure` from controller..");
+        let (wants_campaign, trigger_config) = loop {
+            let config = controller_rx.recv().await.unwrap();
+            if let Some(index) = config.validators.iter().position(|addr| addr == &node_addr) {
+                let mut wants_compaign = false;
+                if !storage.is_initialized() {
                     let snapshot = {
                         let voters = config
                             .validators
                             .iter()
-                            .map(|addr| address_to_peer_id(addr))
+                            .map(|addr| addr_to_peer_id(addr))
                             .collect();
 
+                        // We start with index 5 and term 5
                         let mut s = Snapshot::default();
                         s.mut_metadata().index = 5;
                         s.mut_metadata().term = 5;
@@ -233,221 +164,350 @@ impl Peer {
                     };
 
                     storage.apply_snapshot(snapshot).await.unwrap();
-                    self.start_raft(storage);
-
-                    if index == 0 {
-                        self.mut_node().campaign().unwrap();
-                    }
-
-                    if let Err(e) = reply_tx.send(true) {
-                        error!(
-                            self.logger,
-                            "[During started] reply SetConsensusConfig request failed: `{}`", e
-                        );
-                    }
-
-                    break;
-                } else {
-                    info!(self.logger, "Consensus config doesn't contain this node.");
+                    wants_compaign = index == 0;
                 }
 
-                if let Err(e) = reply_tx.send(true) {
-                    error!(
-                        self.logger,
-                        "[During started] reply SetConsensusConfig request failed: `{}`", e
-                    );
-                }
+                break (wants_compaign, config);
+            } else {
+                info!(
+                    logger,
+                    "incoming config doesn't contain this node, wait for next one"
+                );
             }
-        }
-    }
-
-    fn start_raft(&mut self, storage: WalStorage) {
-        info!(self.logger, "Starting raft node..");
-
-        // Load applied index from stable storage.
-        let applied = storage.get_applied_index();
-        let cfg = Config {
-            id: self.id(),
-            election_tick: 15,
-            heartbeat_tick: 5,
-            check_quorum: true,
-            applied,
-            ..Default::default()
         };
 
-        let node = RawNode::new(&cfg, storage, &self.logger).unwrap();
-        self.node.replace(node);
-
-        // Try to get a proposal every block interval secs.
-        let (ready_tx, ready_rx) = mpsc::unbounded_channel();
-        ready_tx.send(()).unwrap();
-        self.ready_for_proposal_notifier.replace(ready_tx);
-        tokio::spawn(Self::wait_proposal(
-            self.service(),
-            ready_rx,
-            self.logger.clone(),
-        ));
-
-        // Send tick msg to raft periodically.
-        tokio::spawn(Self::pacemaker(self.msg_tx.clone()));
-        debug!(self.logger, "Raft node started");
-    }
-
-    fn id(&self) -> u64 {
-        self.peer_id
-    }
-
-    async fn handle_msg(&mut self, msg: PeerMsg) {
-        match msg {
-            PeerMsg::Control(ControlMsg::Propose { data }) => {
-                let proposal = Proposal::decode(data.as_slice()).unwrap();
-                let current_block_height = self.node().store().get_consensus_config().height;
-
-                if proposal.height == current_block_height + 1 {
-                    info!(self.logger, "propose"; "hash" => short_hex(&data));
-                    if let Err(e) = self.mut_node().propose(vec![], data) {
-                        warn!(self.logger, "propose failed: `{}`", e);
-                    }
-                } else {
-                    warn!(
-                        self.logger,
-                        "skip proposing for proposal {:?}, current committed block height is {}",
-                        proposal,
-                        current_block_height,
-                    );
-                }
-            }
-            PeerMsg::Control(ControlMsg::GetBlockInterval { reply_tx }) => {
-                let block_interval = self.node().store().get_consensus_config().block_interval;
-                if let Err(e) = reply_tx.send(block_interval) {
-                    warn!(
-                        self.logger,
-                        "reply GetBlockInterval request failed: `{}`", e
-                    );
-                }
-            }
-            // Changing config is to change:
-            //   1. block interval
-            //   2. membership of peers
-            PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
-                info!(self.logger, "change consensus config"; "new config" => ?config);
-
-                let is_success = self.update_consensus_config(config).await;
-                if let Err(e) = reply_tx.send(is_success) {
-                    error!(
-                        self.logger,
-                        "reply SetConsensusConfig request failed: `{}`", e
-                    );
-                }
-            }
-            PeerMsg::Control(ControlMsg::IsLeader { reply_tx }) => {
-                if let Err(e) = reply_tx.send(self.is_leader()) {
-                    warn!(self.logger, "reply IsLeader request failed: `{}`", e);
-                }
-            }
-            PeerMsg::Control(ControlMsg::Tick) => {
-                self.mut_node().tick();
-            }
-            PeerMsg::Normal(raft_msg) => {
-                // If the msg is to append entries, check it first.
-                let mut is_ok = true;
-                if let Some(MessageType::MsgAppend) = MessageType::from_i32(raft_msg.msg_type) {
-                    // Spawn tasks to check proposal and wait for their result.
-                    let mut check_results = Vec::with_capacity(raft_msg.entries.len());
-                    for ent in raft_msg.entries.iter().filter(|ent| !ent.data.is_empty()) {
-                        if let Some(EntryType::EntryNormal) = EntryType::from_i32(ent.entry_type) {
-                            let mailbox_control = self.mailbox_control.clone();
-                            let proposal = match Proposal::decode(ent.data.as_slice()) {
-                                Ok(proposal) => proposal,
-                                Err(e) => {
-                                    error!(
-                                        self.logger,
-                                        "can't decode proposal data: `{}`, error: `{}`",
-                                        short_hex(&ent.data),
-                                        e
-                                    );
-                                    return;
-                                }
-                            };
-
-                            // Skip check proposal if we are lagging behind.
-                            if proposal.height <= self.node().store().get_consensus_config().height
-                            {
-                                continue;
-                            }
-
-                            let logger = self.logger.clone();
-                            let handle = tokio::spawn(async move {
-                                match mailbox_control.check_proposal(proposal.clone()).await {
-                                    Ok(true) => true,
-                                    Ok(false) => {
-                                        warn!(
-                                            logger,
-                                            "check proposal failed, height: `{}` data: `{}`",
-                                            proposal.height,
-                                            short_hex(&proposal.data)
-                                        );
-                                        false
-                                    }
-                                    Err(e) => {
-                                        warn!(logger, "can't check proposal: {}", e);
-                                        false
-                                    }
-                                }
-                            });
-                            check_results.push(handle);
-                        }
-                    }
-
-                    for result in check_results {
-                        if !result.await.unwrap() {
-                            is_ok = false;
-                            break;
-                        }
-                    }
-                }
-
-                // Step this msg if:
-                //   1. It's a append msg and pass controller's check.
-                //   2. It's other msg.
-                if is_ok {
-                    if let Err(e) = self.mut_node().step(raft_msg) {
-                        warn!(self.logger, "raft step failed: `{}`", e);
-                    }
-                }
-            }
+        let recorded_height = storage.get_block_height();
+        #[allow(clippy::comparison_chain)]
+        if trigger_config.height > recorded_height {
+            storage.update_consensus_config(trigger_config).await;
+        } else if trigger_config.height < recorded_height {
+            warn!(
+                logger, "block height in intial reconfigure is lower than recorded; skip it";
+                "reconfigure" => trigger_config.height,
+                "recorded" => recorded_height
+            );
         }
-        if let Err(e) = self.handle_ready().await {
-            warn!(self.logger, "handle ready failed: `{}`", e);
+
+        info!(logger, "reconfigure ack");
+
+        let core = {
+            // Load applied index from stable storage.
+            let applied = storage.get_applied_index();
+            // TODO: customize config
+            let cfg = RaftConfig {
+                id: local_id,
+                election_tick: 15,
+                heartbeat_tick: 5,
+                check_quorum: true,
+                applied,
+                ..Default::default()
+            };
+            RawNode::new(&cfg, storage, &logger).expect("cannot create raft raw node")
+        };
+
+        let mut this = Self {
+            core,
+            peer_rx,
+
+            controller_rx,
+
+            controller,
+            network,
+
+            pending_proposal: None,
+            pending_proposal_proposed: false,
+
+            pending_conf_change: None,
+            pending_conf_change_proposed: false,
+
+            logger,
+        };
+
+        this.maybe_pending_conf_change();
+
+        if wants_campaign {
+            this.core.campaign().unwrap();
         }
+
+        this
     }
 
     fn is_leader(&self) -> bool {
-        self.node().raft.state == StateRole::Leader
+        self.core.raft.state == raft::StateRole::Leader
     }
 
-    pub fn control(&self) -> PeerControl {
-        PeerControl {
-            id: self.id(),
-            msg_tx: self.msg_tx.clone(),
+    fn block_height(&self) -> u64 {
+        self.core.store().get_block_height()
+    }
+
+    fn block_interval(&self) -> u32 {
+        self.core.store().get_block_interval()
+    }
+
+    async fn send_msgs(&self, msgs: Vec<Message>) {
+        for msg in msgs {
+            // TODO: should we send it in parallel?
+            self.network.send_msg(msg).await;
         }
     }
 
-    pub fn service(&self) -> RaftService<PeerMsg> {
-        RaftService {
-            mailbox_control: self.mailbox_control.clone(),
-            peer_control: self.control(),
+    pub async fn run(&mut self) {
+        let mut fetching_proposal: Option<JoinHandle<Result<Proposal, tonic::Status>>> = None;
+
+        let tick_interval = Duration::from_millis(200);
+        let tick_timeout = time::sleep(tick_interval);
+        tokio::pin!(tick_timeout);
+
+        let fetching_timeout = time::sleep(Duration::from_secs(0));
+        tokio::pin!(fetching_timeout);
+
+        loop {
+            tokio::select! {
+                // timing
+                _ = &mut tick_timeout => {
+                    self.core.tick();
+                    tick_timeout
+                        .as_mut()
+                        .reset(time::Instant::now() + tick_interval);
+                }
+                _ = &mut fetching_timeout, if self.is_leader() && fetching_proposal.is_none() && self.pending_proposal.is_none() => {
+                    // fetching new proposal
+                    info!(self.logger, "fetching proposal..");
+                    let controller = self.controller.clone();
+                    fetching_proposal.replace(tokio::spawn(async move {
+                        controller.get_proposal().await
+                    }));
+                }
+
+                // future for fetching proposal from controller
+                // the async {..} wrapper is for lazy evaluation
+                Ok(fetch_result) = async { fetching_proposal.as_mut().unwrap().await }, if fetching_proposal.is_some() => {
+                    fetching_proposal.take();
+                    fetching_timeout.as_mut().reset(time::Instant::now() + Duration::from_secs(self.block_interval().into()));
+
+                    match fetch_result {
+                        Ok(proposal) => {
+                            info!(self.logger, "new proposal"; "height" => proposal.height, "data" => short_hex(&proposal.data));
+                            self.pending_proposal.replace(proposal);
+                            self.pending_proposal_proposed = false;
+                        }
+                        Err(e) => {
+                            warn!(self.logger, "fetching proposal failed: `{}`", e);
+                        }
+                    }
+                }
+
+                // reconfigure
+                Some(config) = self.controller_rx.recv() => {
+                    info!(self.logger, "incoming reconfigure request: `{:?}`", config);
+                    self.core.mut_store().update_consensus_config(config).await;
+                    self.maybe_pending_conf_change();
+                }
+                // raft msg from remote peers
+                Some(raft_msg) = self.peer_rx.recv() => {
+                    if let Err(e) = self.core.step(raft_msg) {
+                        error!(self.logger, "step raft msg failed: `{}`", e);
+                    }
+                }
+            }
+
+            if self.is_leader() {
+                // propose pending conf change
+                if !self.pending_conf_change_proposed && self.pending_conf_change.is_some() {
+                    match self
+                        .core
+                        .propose_conf_change(vec![], self.pending_conf_change.clone().unwrap())
+                    {
+                        Ok(()) => {
+                            info!(self.logger, "pending conf change proposed");
+                            self.pending_conf_change_proposed = true;
+                        }
+                        Err(e) => warn!(self.logger, "propose conf change failed: `{}`", e),
+                    }
+                }
+
+                // propose pending proposal
+                if !self.pending_proposal_proposed
+                    && self.pending_proposal.is_some()
+                    && self.pending_conf_change.is_none()
+                {
+                    let proposal = self.pending_proposal.as_ref().unwrap();
+                    let epxected_height = self.block_height() + 1;
+                    if proposal.height == epxected_height {
+                        let proposal_bytes = proposal.encode_to_vec();
+
+                        if let Err(e) = self.core.propose(vec![], proposal_bytes) {
+                            warn!(self.logger, "can't propose proposal: `{}`", e);
+                        } else {
+                            info!(self.logger, "pending proposal proposed"; "height" => proposal.height, "data" => short_hex(&proposal.data));
+                            self.pending_proposal_proposed = true;
+                        }
+                    } else {
+                        warn!(
+                            self.logger,
+                            "receive a proposal with invalid height, drop it";
+                            "proposal height" => proposal.height,
+                            "expect height" => epxected_height,
+                        );
+                        self.pending_proposal.take();
+                    }
+                }
+            } else {
+                if let Some(h) = fetching_proposal.take() {
+                    h.abort();
+                }
+                self.pending_proposal.take();
+                self.pending_proposal_proposed = false;
+                // If we step down and become leader again, we need to re-propose pending conf change.
+                self.pending_conf_change_proposed = false;
+            }
+
+            self.handle_ready().await;
         }
     }
 
-    async fn update_consensus_config(&mut self, config: ConsensusConfiguration) -> bool {
-        let new_peers: HashSet<u64> = config
-            .validators
-            .iter()
-            .map(|addr| address_to_peer_id(addr))
-            .collect();
+    async fn handle_ready(&mut self) {
+        if !self.core.has_ready() {
+            return;
+        }
+
+        let mut ready = self.core.ready();
+        self.send_msgs(ready.take_messages()).await;
+
+        // Apply the snapshot.
+        if *ready.snapshot() != Snapshot::default() {
+            let s = ready.snapshot().clone();
+            if let Err(e) = self.core.mut_store().apply_snapshot(s).await {
+                error!(self.logger, "cannot apply snapshot: `{}`", e);
+            }
+        }
+
+        self.handle_committed_entries(ready.take_committed_entries())
+            .await;
+
+        // Persistent raft logs.
+        if !ready.entries().is_empty() {
+            self.core.mut_store().append_entries(ready.entries()).await;
+        }
+
+        // Raft HardState changed, and we need to persist it.
+        if let Some(hs) = ready.hs() {
+            self.core.mut_store().update_hard_state(hs.clone()).await;
+        }
+
+        if !ready.persisted_messages().is_empty() {
+            self.send_msgs(ready.take_persisted_messages()).await;
+        }
+
+        // Call `RawNode::advance` interface to update position flags in the raft.
+        let mut light_rd = self.core.advance(ready);
+
+        // Update commit index.
+        if let Some(commit) = light_rd.commit_index() {
+            let store = self.core.mut_store();
+            store.update_committed_index(commit).await;
+        }
+
+        // Send out the messages.
+        self.send_msgs(light_rd.take_messages()).await;
+
+        // Apply all committed entries.
+        self.handle_committed_entries(light_rd.take_committed_entries())
+            .await;
+
+        // Advance the apply index.
+        self.core.advance_apply();
+
+        // Maybe compact log file.
+        self.core.mut_store().maybe_compact().await;
+    }
+
+    async fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) {
+        // Fitler out empty entries produced by new elected leaders.
+        for entry in committed_entries
+            .into_iter()
+            .filter(|ent| !ent.data.is_empty())
+        {
+            match entry.get_entry_type() {
+                EntryType::EntryNormal => {
+                    let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
+                    let proposal_height = proposal.height;
+                    let proposal_data_hex = &short_hex(&proposal.data);
+
+                    info!(self.logger, "checking proposal.."; "height" => proposal_height, "data" => proposal_data_hex);
+                    match self.controller.check_proposal(proposal.clone()).await {
+                        Ok(true) => {
+                            let pwp = ProposalWithProof {
+                                proposal: Some(proposal),
+                                proof: vec![],
+                            };
+                            info!(self.logger, "commiting proposal..");
+                            match self.controller.commit_block(pwp).await {
+                                Ok(config) => {
+                                    info!(self.logger, "block committed"; "height" => proposal_height, "data" => proposal_data_hex);
+                                    self.core.mut_store().update_consensus_config(config).await;
+                                    self.maybe_pending_conf_change();
+                                }
+                                Err(e) => {
+                                    warn!(self.logger, "commit block failed: {}", e);
+                                }
+                            }
+                        }
+                        Ok(false) => warn!(
+                            self.logger,
+                            "check proposal failed, controller replies a false"
+                        ),
+                        Err(e) => warn!(self.logger, "check proposal failed: {}", e),
+                    }
+
+                    if let Some(pending) = self.pending_proposal.as_ref() {
+                        if pending.height <= proposal_height {
+                            debug!(self.logger, "pending proposal removed");
+                            self.pending_proposal.take();
+                        } else {
+                            debug!(
+                                self.logger, "pending proposal is higher than committed";
+                                "pending_height" => pending.height, "committed_height" => proposal_height
+                            );
+                        }
+                    }
+
+                    if proposal_height > self.block_height() {
+                        self.core
+                            .mut_store()
+                            .update_block_height(proposal_height)
+                            .await;
+                    }
+                }
+                // All conf changes are v2.
+                EntryType::EntryConfChange => panic!("unexpected EntryConfChange(V1)"),
+                EntryType::EntryConfChangeV2 => {
+                    let cc = ConfChangeV2::decode(entry.data.as_slice())
+                        .expect("cannot decode ConfChangeV2");
+                    let cs = self
+                        .core
+                        .apply_conf_change(&cc)
+                        .expect("apply conf change failed");
+                    info!(
+                        self.logger,
+                        "apply config change `{:?}`; now config state is: {:?}", cc, cs
+                    );
+                    self.core.mut_store().update_conf_state(cs).await;
+                    // maybe clean the pending conf change.
+                    self.maybe_pending_conf_change();
+                }
+            }
+
+            self.core
+                .mut_store()
+                .advance_applied_index(entry.index)
+                .await;
+        }
+    }
+
+    fn maybe_pending_conf_change(&mut self) {
         let current_peers: HashSet<u64> = self
-            .node()
+            .core
             .store()
             .get_conf_state()
             .voters
@@ -455,10 +515,18 @@ impl Peer {
             .copied()
             .collect();
 
-        let added: Vec<u64> = new_peers.difference(&current_peers).copied().collect();
-        let removed: Vec<u64> = current_peers.difference(&new_peers).copied().collect();
+        let target_peers: HashSet<u64> = self
+            .core
+            .store()
+            .get_validators()
+            .iter()
+            .map(|v| addr_to_peer_id(v))
+            .collect();
 
         let cc = {
+            let added: Vec<u64> = target_peers.difference(&current_peers).copied().collect();
+            let removed: Vec<u64> = current_peers.difference(&target_peers).copied().collect();
+
             let mut changes = vec![];
             for id in added {
                 let ccs = ConfChangeSingle {
@@ -480,413 +548,12 @@ impl Peer {
             }
         };
 
-        // FIXME:
-        // we should refactor the reconfigure part. It's not safe if
-        // it crash during the reconfigure proccess.
-        self.mut_node()
-            .mut_store()
-            .update_consensus_config(config)
-            .await;
-
-        let mut is_success = true;
         if !cc.changes.is_empty() {
-            if let Err(e) = self.mut_node().propose_conf_change(vec![], cc) {
-                warn!(self.logger, "propose conf change failed: `{}`", e);
-                is_success = false;
-            }
-        }
-
-        is_success
-    }
-
-    // The current leader will get proposal
-    // from controller every block interval secs.
-    async fn wait_proposal(
-        service: RaftService<PeerMsg>,
-        mut ready_rx: mpsc::UnboundedReceiver<()>,
-        logger: Logger,
-    ) {
-        let mut propose_time = time::Instant::now();
-        loop {
-            time::sleep_until(propose_time).await;
-            if service.peer_control.is_leader().await {
-                ready_rx.recv().await.unwrap();
-                debug!(logger, "get proposal..");
-                match service.mailbox_control.get_proposal().await {
-                    Ok(proposal) => {
-                        let data = {
-                            let mut buf = Vec::with_capacity(proposal.encoded_len());
-                            proposal.encode(&mut buf).unwrap();
-                            buf
-                        };
-                        service.peer_control.propose(data);
-                    }
-                    Err(e) => {
-                        warn!(logger, "get proposal failed: `{}`", e);
-                        continue;
-                    }
-                }
-            }
-
-            let block_interval = service.peer_control.get_block_interval().await;
-            propose_time = time::Instant::now() + time::Duration::from_secs(block_interval as u64);
-        }
-    }
-
-    // Tick raft's logical clock.
-    async fn pacemaker(msg_tx: mpsc::UnboundedSender<PeerMsg>) {
-        let pace = time::Duration::from_millis(100);
-        let mut ticker = time::interval(pace);
-        loop {
-            ticker.tick().await;
-            msg_tx.send(PeerMsg::Control(ControlMsg::Tick)).unwrap();
-        }
-    }
-
-    // Handle the ready state produced by raft.
-    async fn handle_ready(&mut self) -> Result<()> {
-        if !self.node().has_ready() {
-            return Ok(());
-        }
-
-        // Get the `Ready` with `RawNode::ready` interface.
-        let mut ready = self.mut_node().ready();
-
-        // Send out the message come from the node.
-        self.send_messages(ready.take_messages());
-
-        // Apply the snapshot.
-        if *ready.snapshot() != Snapshot::default() {
-            let store = self.mut_node().mut_store();
-            let s = ready.snapshot().clone();
-            if let Err(e) = store.apply_snapshot(s).await {
-                return Err(anyhow!("apply snapshot failed: {}", e));
-            }
-        }
-
-        // Apply committed_entries, this includes:
-        //   1. Commit block to controller
-        //   2. Apply raft config change
-        self.handle_committed_entries(ready.take_committed_entries())
-            .await?;
-
-        // Persistent raft logs.
-        if !ready.entries().is_empty() {
-            let store = self.mut_node().mut_store();
-            store.append_entries(ready.entries()).await;
-        }
-
-        // Raft HardState changed, and we need to persist it.
-        if let Some(hs) = ready.hs() {
-            let store = self.mut_node().mut_store();
-            store.update_hard_state(hs.clone()).await;
-        }
-
-        if !ready.persisted_messages().is_empty() {
-            self.send_messages(ready.take_persisted_messages());
-        }
-
-        // Call `RawNode::advance` interface to update position flags in the raft.
-        let mut light_rd = self.mut_node().advance(ready);
-
-        // Update commit index.
-        if let Some(commit) = light_rd.commit_index() {
-            let store = self.mut_node().mut_store();
-            store.update_committed_index(commit).await;
-        }
-
-        // Send out the messages.
-        self.send_messages(light_rd.take_messages());
-
-        // Apply all committed entries.
-        self.handle_committed_entries(light_rd.take_committed_entries())
-            .await?;
-
-        // Advance the apply index.
-        self.mut_node().advance_apply();
-
-        // Maybe compact log file.
-        self.mut_node().mut_store().maybe_compact().await;
-
-        Ok(())
-    }
-
-    fn send_messages(&self, msgs: Vec<Message>) {
-        if !msgs.is_empty() {
-            let mailbox_control = self.mailbox_control.clone();
-            let logger = self.logger.clone();
-            tokio::spawn(async move {
-                for msg in msgs {
-                    let pm = PeerMsg::Normal(msg);
-                    if let Err(e) = mailbox_control.send_message(pm).await {
-                        warn!(logger, "send msg failed: {}", e);
-                    }
-                }
-            });
-        }
-    }
-
-    async fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) -> Result<()> {
-        // Fitler out empty entries produced by new elected leaders.
-        for entry in committed_entries
-            .into_iter()
-            .filter(|ent| !ent.data.is_empty())
-        {
-            match entry.get_entry_type() {
-                EntryType::EntryNormal => {
-                    let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
-                    let proposal_height = proposal.height;
-                    let current_block_height = self.node().store().get_consensus_config().height;
-
-                    debug!(
-                        self.logger,
-                        "try to commit proposal `{}` with height `{}`",
-                        short_hex(&entry.data),
-                        proposal_height,
-                    );
-
-                    if proposal.height == current_block_height + 1 {
-                        let pwp = ProposalWithProof {
-                            proposal: Some(proposal),
-                            // Empty proof for non-BFT consensus.
-                            proof: vec![],
-                        };
-
-                        let mut retry_interval = time::interval(time::Duration::from_secs(3));
-                        loop {
-                            retry_interval.tick().await;
-                            match self.mailbox_control.commit_block(pwp.clone()).await {
-                                Ok(new_config) => {
-                                    if !self.update_consensus_config(new_config).await {
-                                        warn!(
-                                            self.logger,
-                                            "fail to update consensus config after commit_block. ",
-                                        );
-                                    }
-
-                                    info!(
-                                        self.logger,
-                                        "proposal `{}` committed at block height `{}`",
-                                        short_hex(&entry.data),
-                                        current_block_height + 1,
-                                    );
-
-                                    self.ready_for_proposal_notifier
-                                        .as_ref()
-                                        .unwrap()
-                                        .send(())
-                                        .unwrap();
-
-                                    break;
-                                }
-                                Err(e) => {
-                                    let err_msg = format!(
-                                        "commit block {} failed: {}",
-                                        current_block_height + 1,
-                                        e
-                                    );
-                                    error!(self.logger, "{}", err_msg);
-                                }
-                            }
-                        }
-                    } else {
-                        warn!(
-                            self.logger,
-                            "skip commit_block for proposal `{}` with height `{}`, because current committed block height is `{}`",
-                            short_hex(&entry.data),
-                            proposal_height,
-                            current_block_height,
-                        );
-                    }
-                }
-                EntryType::EntryConfChange => {
-                    error!(self.logger, "unexpected EntryConfChange(V1)");
-                }
-                EntryType::EntryConfChangeV2 => {
-                    let cc = ConfChangeV2::decode(entry.data.as_slice())?;
-                    let cs = self.mut_node().apply_conf_change(&cc)?;
-                    info!(self.logger, "conf change: {:?}", cc);
-                    info!(self.logger, "now config state is: {:?}", cs);
-                    self.mut_node().mut_store().update_conf_state(cs).await;
-                }
-            }
-
-            // Persist applied index.
-            self.mut_node()
-                .mut_store()
-                .advance_applied_index(entry.index)
-                .await;
-        }
-        Ok(())
-    }
-}
-
-// Helper to interact with peers.
-#[derive(Clone)]
-pub struct PeerControl {
-    id: u64,
-    msg_tx: mpsc::UnboundedSender<PeerMsg>,
-}
-
-impl PeerControl {
-    pub fn propose(&self, data: Vec<u8>) {
-        let msg = PeerMsg::Control(ControlMsg::Propose { data });
-        self.msg_tx.send(msg).unwrap();
-    }
-
-    pub async fn is_leader(&self) -> bool {
-        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
-        let msg = PeerMsg::Control(ControlMsg::IsLeader { reply_tx });
-        self.msg_tx.send(msg).unwrap();
-        reply_rx.recv().await.unwrap()
-    }
-
-    pub async fn get_block_interval(&self) -> u32 {
-        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
-        let msg = PeerMsg::Control(ControlMsg::GetBlockInterval { reply_tx });
-        self.msg_tx.send(msg).unwrap();
-        reply_rx.recv().await.unwrap()
-    }
-
-    pub async fn update_consensus_config(&self, config: ConsensusConfiguration) -> bool {
-        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
-        let msg = PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx });
-        self.msg_tx.send(msg).unwrap();
-        // FIXME: conf change may fail to propose if there is no leader.
-        tokio::spawn(async move {
-            reply_rx.recv().await.unwrap();
-        });
-        true
-    }
-}
-
-use cita_cloud_proto::common::ConsensusConfiguration;
-use cita_cloud_proto::common::ProposalWithProof;
-use cita_cloud_proto::common::SimpleResponse;
-use cita_cloud_proto::consensus::consensus_service_server::ConsensusService;
-use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerService;
-use cita_cloud_proto::network::NetworkMsg;
-
-#[derive(Clone)]
-pub struct RaftService<T: Letter> {
-    pub mailbox_control: MailboxControl<T>,
-    pub peer_control: PeerControl,
-}
-
-#[tonic::async_trait]
-impl<T: Letter> NetworkMsgHandlerService for RaftService<T> {
-    async fn process_network_msg(
-        &self,
-        request: tonic::Request<NetworkMsg>,
-    ) -> std::result::Result<tonic::Response<SimpleResponse>, tonic::Status> {
-        let msg = request.into_inner();
-        if msg.module != "consensus" {
-            Err(tonic::Status::invalid_argument("wrong module"))
+            info!(self.logger, "new pending conf change: `{:?}`", cc);
+            self.pending_conf_change.replace(cc);
         } else {
-            let letter = Letter::read_from(msg.msg.as_slice()).map_err(|e| {
-                tonic::Status::invalid_argument(format!("msg fail to decode: `{}`", e))
-            })?;
-            let origin = msg.origin;
-            self.mailbox_control.put_mail(origin, letter).await.unwrap();
-            let reply = SimpleResponse { is_success: true };
-            Ok(tonic::Response::new(reply))
+            self.pending_conf_change.take();
         }
-    }
-}
-
-#[tonic::async_trait]
-impl<T: Letter> ConsensusService for RaftService<T> {
-    async fn reconfigure(
-        &self,
-        request: tonic::Request<ConsensusConfiguration>,
-    ) -> std::result::Result<tonic::Response<SimpleResponse>, tonic::Status> {
-        let config = request.into_inner();
-        let is_success = self.peer_control.update_consensus_config(config).await;
-        let reply = SimpleResponse { is_success };
-        Ok(tonic::Response::new(reply))
-    }
-
-    async fn check_block(
-        &self,
-        _request: tonic::Request<ProposalWithProof>,
-    ) -> Result<tonic::Response<SimpleResponse>, tonic::Status> {
-        // Reply true since we assume no byzantine faults.
-        let reply = SimpleResponse { is_success: true };
-        Ok(tonic::Response::new(reply))
-    }
-}
-
-fn short_hex(data: &[u8]) -> String {
-    if data.len() <= 8 {
-        hex::encode(data)
-    } else {
-        let head = hex::encode(&data[..4]);
-        let tail = hex::encode(&data[data.len() - 4..]);
-        format!("{}..{}", head, tail)
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    #[tokio::test]
-    async fn test_peer_control() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let control = PeerControl { id: 1, msg_tx: tx };
-
-        let handle = tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                match msg {
-                    PeerMsg::Control(ControlMsg::Propose { data }) => {
-                        assert_eq!(&data[..], b"Akari!");
-                    }
-                    PeerMsg::Control(ControlMsg::IsLeader { reply_tx }) => {
-                        reply_tx.send(true).unwrap();
-                    }
-                    PeerMsg::Control(ControlMsg::GetBlockInterval { reply_tx }) => {
-                        reply_tx.send(6).unwrap();
-                    }
-                    PeerMsg::Control(ControlMsg::SetConsensusConfig { config, reply_tx }) => {
-                        let ConsensusConfiguration {
-                            height,
-                            block_interval,
-                            validators,
-                        } = config;
-                        assert_eq!(height, 42);
-                        assert_eq!(block_interval, 6);
-                        assert_eq!(validators, vec![vec![1, 2, 3]]);
-                        reply_tx.send(true).unwrap();
-                    }
-                    msg => panic!("unexpected msg: `{:?}`", msg),
-                }
-            }
-        });
-
-        control.propose(b"Akari!"[..].into());
-        assert!(control.is_leader().await);
-        assert_eq!(control.get_block_interval().await, 6);
-        let config = ConsensusConfiguration {
-            height: 42,
-            block_interval: 6,
-            validators: vec![vec![1, 2, 3]],
-        };
-        control.update_consensus_config(config).await;
-        drop(control);
-        handle.await.unwrap();
-    }
-
-    #[test]
-    fn test_short_hex() {
-        assert_eq!(short_hex(&[]), "");
-        assert_eq!(short_hex(&[0, 1]), "0001");
-
-        let mut long = vec![0u8; 16];
-        long[0] = 0xab;
-        long[15] = 0xcd;
-        let expect = {
-            let hex = hex::encode(&long);
-            format!("{}..{}", &hex[..8], &hex[(hex.len() - 8)..])
-        };
-        assert_eq!(short_hex(&long), expect);
+        self.pending_conf_change_proposed = false;
     }
 }
