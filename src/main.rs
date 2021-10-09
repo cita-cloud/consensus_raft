@@ -114,10 +114,10 @@ async fn run(local_port: u16, log_type: &str) -> anyhow::Result<()> {
             log_builder.level(log_level);
             log_builder.build().expect("can't build terminal logger")
         }
-        _unexpected => {
+        unexpected => {
             panic!(
                 "unexpected log type `{}`, only `file` and `terminal` are allowed.",
-                _unexpected
+                unexpected
             );
         }
     };

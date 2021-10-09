@@ -258,6 +258,7 @@ impl Peer {
         let tick_timeout = time::sleep(tick_interval);
         tokio::pin!(tick_timeout);
 
+        // fetch it now
         let fetching_timeout = time::sleep(Duration::from_secs(0));
         tokio::pin!(fetching_timeout);
 
