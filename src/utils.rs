@@ -75,6 +75,7 @@ mod tests {
     fn test_address_to_peer_id() {
         let addrs: Vec<&[u8]> = vec![b"", b"1", b"1234"];
         for addr in addrs {
+            // check coherence
             let first = addr_to_peer_id(addr);
             let second = addr_to_peer_id(addr);
             assert_eq!(first, second);

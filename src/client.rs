@@ -6,15 +6,6 @@ use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio::time;
 
-use cita_cloud_proto::{
-    common::{ConsensusConfiguration, Empty, Proposal, ProposalWithProof, SimpleResponse},
-    controller::consensus2_controller_service_client::Consensus2ControllerServiceClient as ControllerClient,
-    network::{
-        network_msg_handler_service_server::NetworkMsgHandlerService,
-        network_service_client::NetworkServiceClient as NetworkClient, NetworkMsg, RegisterInfo,
-    },
-};
-
 use tonic::transport::channel::{Channel, Endpoint};
 
 use prost::Message as _;
@@ -23,6 +14,15 @@ use raft::eraftpb::Message as RaftMsg;
 use slog::debug;
 use slog::info;
 use slog::Logger;
+
+use cita_cloud_proto::{
+    common::{ConsensusConfiguration, Empty, Proposal, ProposalWithProof, SimpleResponse},
+    controller::consensus2_controller_service_client::Consensus2ControllerServiceClient as ControllerClient,
+    network::{
+        network_msg_handler_service_server::NetworkMsgHandlerService,
+        network_service_client::NetworkServiceClient as NetworkClient, NetworkMsg, RegisterInfo,
+    },
+};
 
 #[derive(Debug, Clone)]
 pub struct Controller {
@@ -179,7 +179,7 @@ impl Inner {
         let origin = self.mailbook.read().await.get(&to).copied();
         if let Some(origin) = origin {
             msg.origin = origin;
-            let _ = self.client.clone().send_msg(msg).await.map(|_| ());
+            let _ = self.client.clone().send_msg(msg).await;
         } else {
             // We don't know about the targeting peer. Drop the msg and probe.
             // It's ok because the raft peer will automatically retry.

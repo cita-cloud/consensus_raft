@@ -178,7 +178,7 @@ impl Peer {
 
         let recorded_height = storage.get_block_height();
         #[allow(clippy::comparison_chain)]
-        if trigger_config.height > recorded_height {
+        if trigger_config.height > recorded_height || recorded_height == 0 {
             storage.update_consensus_config(trigger_config).await;
         } else if trigger_config.height < recorded_height {
             warn!(
@@ -258,6 +258,7 @@ impl Peer {
         let tick_timeout = time::sleep(tick_interval);
         tokio::pin!(tick_timeout);
 
+        // fetch it now
         let fetching_timeout = time::sleep(Duration::from_secs(0));
         tokio::pin!(fetching_timeout);
 
