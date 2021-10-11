@@ -16,7 +16,10 @@ use slog::info;
 use slog::Logger;
 
 use cita_cloud_proto::{
-    common::{ConsensusConfiguration, Empty, Proposal, ProposalWithProof, SimpleResponse},
+    common::{
+        ConsensusConfiguration, ConsensusConfigurationResponse, Empty, Proposal, ProposalResponse,
+        ProposalWithProof, StatusCode,
+    },
     controller::consensus2_controller_service_client::Consensus2ControllerServiceClient as ControllerClient,
     network::{
         network_msg_handler_service_server::NetworkMsgHandlerService,
@@ -44,30 +47,58 @@ impl Controller {
     }
 
     pub async fn get_proposal(&self) -> Result<Proposal, tonic::Status> {
-        self.client
+        let resp = self
+            .client
             .clone()
             .get_proposal(Empty {})
             .await
-            .map(|resp| resp.into_inner())
+            .map(|resp| resp.into_inner())?;
+
+        // horrible
+        if let ProposalResponse {
+            status: Some(StatusCode { code: 0 }),
+            proposal: Some(proposal),
+        } = resp
+        {
+            Ok(proposal)
+        } else {
+            Err(tonic::Status::internal(format!("bad resp: {:?}", resp)))
+        }
     }
 
     pub async fn check_proposal(&self, proposal: Proposal) -> Result<bool, tonic::Status> {
-        self.client
+        let resp = self
+            .client
             .clone()
             .check_proposal(proposal)
             .await
-            .map(|resp| resp.into_inner().is_success)
+            .map(|resp| resp.into_inner())?;
+
+        // horrible
+        Ok(resp.code == 0)
     }
 
     pub async fn commit_block(
         &self,
         pwp: ProposalWithProof,
     ) -> Result<ConsensusConfiguration, tonic::Status> {
-        self.client
+        let resp = self
+            .client
             .clone()
             .commit_block(pwp)
             .await
-            .map(|resp| resp.into_inner())
+            .map(|resp| resp.into_inner())?;
+
+        // horrible
+        if let ConsensusConfigurationResponse {
+            status: Some(StatusCode { code: 0 }),
+            config: Some(config),
+        } = resp
+        {
+            Ok(config)
+        } else {
+            Err(tonic::Status::internal(format!("bad resp: {:?}", resp)))
+        }
     }
 }
 
@@ -158,7 +189,8 @@ impl Inner {
                 .register_network_msg_handler(request.clone())
                 .await
             {
-                if resp.into_inner().is_success {
+                // horrible
+                if resp.into_inner().code == 0 {
                     break;
                 }
             }
@@ -231,7 +263,7 @@ impl NetworkMsgHandlerService for Network {
     async fn process_network_msg(
         &self,
         request: tonic::Request<NetworkMsg>,
-    ) -> Result<tonic::Response<SimpleResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<StatusCode>, tonic::Status> {
         let msg = request.into_inner();
         if msg.module != "consensus" {
             return Err(tonic::Status::invalid_argument("wrong module"));
@@ -289,8 +321,8 @@ impl NetworkMsgHandlerService for Network {
             }
         }
 
-        let reply = SimpleResponse { is_success: true };
-        Ok(tonic::Response::new(reply))
+        // horrible
+        Ok(tonic::Response::new(StatusCode { code: 0 }))
     }
 }
 

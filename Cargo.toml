@@ -7,13 +7,12 @@ edition = "2018"
 [dependencies]
 clap = "=3.0.0-beta.4"
 git-version = "0.3.4"
-cita_cloud_proto = { git = "https://github.com/cita-cloud/cita_cloud_proto" }
+cita_cloud_proto = { git = "https://github.com/cita-cloud/cita_cloud_proto", branch = "wip-7.0.0" }
 tonic = "0.5" 
 toml = "0.5.8"
 rand = "0.8.3"
 slog = "2.7.0"
 sloggers = "1.0.1"
-crossbeam = "0.8.0"
 hex = "0.4.3"
 raft = { git = "https://github.com/whfuyn/raft-rs", version = "0.6.0", default-features = false, features = ["prost-codec"] }
 prost = "0.8.0"
