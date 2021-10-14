@@ -56,7 +56,7 @@ impl Controller {
 
         // horrible
         if let ProposalResponse {
-            status: Some(StatusCode { code: 0 } | StatusCode { code: 109 }),
+            status: Some(StatusCode { code: 0 | 109 }),
             proposal: Some(proposal),
         } = resp
         {
