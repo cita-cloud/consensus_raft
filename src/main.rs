@@ -18,6 +18,9 @@ mod peer;
 mod storage;
 mod utils;
 
+use std::path::Path;
+use std::path::PathBuf;
+
 use clap::App;
 use clap::Arg;
 
@@ -26,12 +29,11 @@ use git_version::git_version;
 use slog::info;
 use sloggers::file::FileLoggerBuilder;
 use sloggers::terminal::TerminalLoggerBuilder;
-use sloggers::types::Severity;
 use sloggers::Build as _;
 
-use tokio::fs;
-
 use peer::Peer;
+
+use config::load_config;
 
 use utils::set_panic_handler;
 
@@ -41,27 +43,37 @@ const GIT_VERSION: &str = git_version!(
 );
 const GIT_HOMEPAGE: &str = "https://github.com/cita-cloud/consensus_raft";
 
-const DEFAULT_GRPC_LISTEN_PORT: u16 = 50001;
-const DEFAULT_LOG_TYPE: &str = "file";
-
 fn main() {
-    let default_grpc_listen_port = DEFAULT_GRPC_LISTEN_PORT.to_string();
     let run_cmd = App::new("run")
         .about("run the service")
         .arg(
-            Arg::new("port")
-                .about("grpc listen port")
-                .long("port")
-                .short('p')
+            Arg::new("config")
+                .about("the consensus config")
                 .takes_value(true)
-                .validator(|s| s.parse::<u16>())
-                .default_value(&default_grpc_listen_port),
+                .validator(|s| s.parse::<PathBuf>())
+                .default_value("config.toml"),
         )
         .arg(
-            Arg::new("log")
-                .about("log type")
-                .possible_values(&["file", "terminal"])
-                .default_value(DEFAULT_LOG_TYPE),
+            Arg::new("stdout")
+                .about("if specified, log to stdout. Overrides the config")
+                .long("stdout")
+                .conflicts_with_all(&["log-dir", "log-file-name"]),
+        )
+        .arg(
+            Arg::new("log-dir")
+                .about("the log dir. Overrides the config")
+                .short('d')
+                .long("log-dir")
+                .takes_value(true)
+                .validator(|s| s.parse::<PathBuf>()),
+        )
+        .arg(
+            Arg::new("log-file-name")
+                .about("the log file name. Overrride the config")
+                .short('f')
+                .long("log-file-name")
+                .takes_value(true)
+                .validator(|s| s.parse::<PathBuf>()),
         );
     let git_cmd = App::new("git").about("show git info");
 
@@ -72,86 +84,55 @@ fn main() {
 
     let matches = app.get_matches();
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
     match matches.subcommand() {
         Some(("run", m)) => {
-            let local_port = m.value_of("port").unwrap().parse::<u16>().unwrap();
-            let log_type = m.value_of("log").unwrap();
-            rt.block_on(run(local_port, log_type)).unwrap();
+            let config = {
+                let path = m.value_of("config").unwrap();
+                load_config(path)
+            };
+
+            let log_level = config.log_level.parse().expect("unrecognized log level");
+            let logger = if m.is_present("stdout") || config.log_to_stdout {
+                let mut log_builder = TerminalLoggerBuilder::new();
+                log_builder.level(config.log_level.parse().expect("unrecognized log level"));
+                log_builder.build().expect("can't build terminal logger")
+            } else {
+                // File log
+                let log_path = {
+                    let log_dir = Path::new(m.value_of("log-dir").unwrap_or(&config.log_dir));
+                    let log_file_name =
+                        m.value_of("log-file-name").unwrap_or(&config.log_file_name);
+
+                    if !log_dir.exists() {
+                        std::fs::create_dir_all(&log_dir).expect("cannot create log dir");
+                    }
+                    log_dir.join(log_file_name)
+                };
+                let mut log_builder = FileLoggerBuilder::new(log_path);
+                log_builder.level(log_level);
+                // 50 MB
+                log_builder.rotate_size(config.log_rotate_size);
+                log_builder.rotate_keep(config.log_rotate_keep);
+                log_builder.rotate_compress(config.log_rotate_compress);
+                log_builder.build().expect("can't build file logger")
+            };
+
+            set_panic_handler(logger.clone());
+
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let mut peer = Peer::setup(config, logger.clone()).await;
+                peer.run().await;
+                info!(logger, "raft service exit");
+            });
         }
         Some(("git", _)) => {
             println!("git version: {}", GIT_VERSION);
             println!("homepage: {}", GIT_HOMEPAGE);
         }
         None => {
-            rt.block_on(run(DEFAULT_GRPC_LISTEN_PORT, DEFAULT_LOG_TYPE))
-                .unwrap();
+            println!("no subcommand provided");
         }
         _ => unreachable!(),
     }
-}
-
-async fn run(local_port: u16, log_type: &str) -> anyhow::Result<()> {
-    let log_level = Severity::Debug;
-    let logger = match log_type {
-        "file" => {
-            // File log
-            let log_path = {
-                let log_dir = std::env::current_dir().unwrap().join("logs");
-                let _ = std::fs::create_dir(&log_dir);
-                log_dir.join("consensus-service.log")
-            };
-            let mut log_builder = FileLoggerBuilder::new(log_path);
-            log_builder.level(log_level);
-            // 50 MB
-            log_builder.rotate_size(50 * 1024 * 1024);
-            log_builder.rotate_keep(5);
-            log_builder.rotate_compress(true);
-            log_builder.build().expect("can't build file logger")
-        }
-        "terminal" => {
-            let mut log_builder = TerminalLoggerBuilder::new();
-            log_builder.level(log_level);
-            log_builder.build().expect("can't build terminal logger")
-        }
-        unexpected => {
-            panic!(
-                "unexpected log type `{}`, only `file` and `terminal` are allowed.",
-                unexpected
-            );
-        }
-    };
-
-    set_panic_handler(logger.clone());
-
-    // read consensus-config.toml
-    let config = {
-        let buf = fs::read_to_string("consensus-config.toml").await?;
-        config::RaftConfig::new(&buf)
-    };
-
-    let node_addr = {
-        let s = fs::read_to_string("node_address").await?;
-        hex::decode(s.strip_prefix("0x").unwrap_or(&s))?
-    };
-
-    let network_port = config.network_port;
-    let controller_port = config.controller_port;
-
-    let data_dir = std::env::current_dir()?.join("raft-data-dir");
-    let mut peer = Peer::setup(
-        node_addr,
-        local_port,
-        controller_port,
-        network_port,
-        data_dir,
-        logger.clone(),
-    )
-    .await;
-
-    peer.run().await;
-
-    info!(logger, "raft service exit");
-
-    Ok(())
 }

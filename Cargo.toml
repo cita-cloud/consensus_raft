@@ -11,7 +11,8 @@ cita_cloud_proto = { git = "https://github.com/cita-cloud/cita_cloud_proto" }
 tonic = "0.5" 
 toml = "0.5.8"
 rand = "0.8.3"
-slog = "2.7.0"
+# `release_max_level_trace` enables configuring log level at runtime.
+slog = { version = "2.7.0", features = ["release_max_level_trace"] }
 sloggers = "1.0.1"
 crossbeam = "0.8.0"
 hex = "0.4.3"

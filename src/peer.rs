@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::path::Path;
 use std::time::Duration;
 
 use raft::eraftpb::ConfChangeType;
@@ -34,11 +33,9 @@ use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServe
 use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
 
 use crate::client::{Controller, Network};
+use crate::config::Config;
 use crate::storage::WalStorage;
 use crate::utils::{addr_to_peer_id, short_hex};
-
-// Compact wal log if file size > 64MB.
-const WAL_COMPACT_LIMIT: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct RaftConsensusService(mpsc::Sender<ConsensusConfiguration>);
@@ -96,20 +93,18 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub async fn setup(
-        node_addr: Vec<u8>,
-        local_port: u16,
-        controller_port: u16,
-        network_port: u16,
-        data_dir: impl AsRef<Path>,
-        logger: Logger,
-    ) -> Self {
+    pub async fn setup(config: Config, logger: Logger) -> Self {
+        let node_addr = {
+            let s = &config.node_addr;
+            hex::decode(s.strip_prefix("0x").unwrap_or(s)).expect("decode node_addr failed")
+        };
+
         let local_id = addr_to_peer_id(&node_addr);
 
         // Controller grpc client
         let controller = {
             let logger = logger.new(o!("tag" => "controller"));
-            Controller::new(controller_port, logger)
+            Controller::new(config.controller_port, logger)
         };
 
         // Communicate with controller
@@ -120,25 +115,44 @@ impl Peer {
         let (peer_tx, peer_rx) = mpsc::channel(64);
         let network = {
             let logger = logger.new(o!("tag" => "network"));
-            Network::setup(local_id, local_port, network_port, peer_tx, logger).await
+            Network::setup(
+                local_id,
+                config.grpc_listen_port,
+                config.network_port,
+                peer_tx,
+                logger,
+            )
+            .await
         };
         let network_svc = network.clone();
 
         let logger_cloned = logger.clone();
+        let grpc_listen_port = config.grpc_listen_port;
         tokio::spawn(async move {
-            let addr = format!("127.0.0.1:{}", local_port).parse().unwrap();
-            let _ = Server::builder()
+            let addr = format!("127.0.0.1:{}", grpc_listen_port).parse().unwrap();
+            let res = Server::builder()
                 .add_service(ConsensusServiceServer::new(raft_svc))
                 .add_service(NetworkMsgHandlerServiceServer::new(network_svc))
                 .serve(addr)
                 .await;
-            info!(logger_cloned, "grpc service exit");
+
+            if let Err(e) = res {
+                info!(logger_cloned, "grpc service exit with error: `{}`", e);
+            } else {
+                info!(logger_cloned, "grpc service exit");
+            }
         });
 
         // Recover data from log
         let mut storage = {
             let logger = logger.new(o!("tag" => "storage"));
-            WalStorage::new(&data_dir, WAL_COMPACT_LIMIT, logger.clone()).await
+            WalStorage::new(
+                &config.raft_data_dir,
+                config.wal_log_file_compact_limit,
+                config.max_wal_log_file_preserved,
+                logger.clone(),
+            )
+            .await
         };
 
         // Wait for controller's reconfigure.
@@ -196,9 +210,9 @@ impl Peer {
             // TODO: customize config
             let cfg = RaftConfig {
                 id: local_id,
-                election_tick: 15,
-                heartbeat_tick: 5,
-                check_quorum: true,
+                election_tick: config.election_tick as usize,
+                heartbeat_tick: config.heartbeat_tick as usize,
+                check_quorum: config.check_quorum,
                 applied,
                 ..Default::default()
             };

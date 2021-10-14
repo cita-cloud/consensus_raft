@@ -51,8 +51,6 @@ use thiserror::Error as ThisError;
 use cita_cloud_proto::common::ConsensusConfiguration;
 
 const NO_LIMIT: u64 = u64::MAX;
-// raft-log.backup, raft-log.1.backup, ... , raft-log.${MAX_LOG_FILE_PRESERVED}.backup
-const MAX_LOG_FILE_PRESERVED: u64 = 5;
 const WAL_ACTIVE_LOG_NAME: &str = "raft-wal-log.active";
 const WAL_BACKUP_LOG_NAME: &str = "raft-wal-log.backup";
 // Use as a temp file for creating new active log
@@ -66,8 +64,8 @@ struct LogFile {
 }
 
 impl LogFile {
-    async fn create<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
-        preserve_path(&path, MAX_LOG_FILE_PRESERVED).await;
+    async fn create<P: AsRef<Path>>(path: P, max_preserved: u64) -> Result<Self, io::Error> {
+        preserve_path(&path, max_preserved).await;
         let file = fs::OpenOptions::new()
             .create_new(true)
             .read(true)
@@ -107,9 +105,9 @@ impl LogFile {
         Ok(Self { file, path })
     }
 
-    async fn rename_to(&mut self, file_name: &str) {
+    async fn rename_to(&mut self, file_name: &str, max_preserved: u64) {
         let new_path = self.path.with_file_name(file_name);
-        preserve_path(&new_path, MAX_LOG_FILE_PRESERVED).await;
+        preserve_path(&new_path, max_preserved).await;
         fs::rename(&self.path, &new_path).await.unwrap();
         self.path = new_path;
     }
@@ -201,16 +199,25 @@ struct WalStorageCore {
     log_dir: PathBuf,
     active_log: Option<LogFile>,
     compact_limit: u64,
+    // raft-log.backup, raft-log.1.backup, ... , raft-log.${MAX_LOG_FILE_PRESERVED}.backup
+    max_preserved: u64,
 
     // slog logger
     logger: Logger,
 }
 
 impl WalStorageCore {
-    async fn new<P: AsRef<Path>>(log_dir: P, compact_limit: u64, logger: Logger) -> Self {
+    async fn new<P: AsRef<Path>>(
+        log_dir: P,
+        compact_limit: u64,
+        max_preserved: u64,
+        logger: Logger,
+    ) -> Self {
         let log_dir = log_dir.as_ref().to_path_buf();
         if !log_dir.exists() {
-            fs::create_dir_all(&log_dir).await.unwrap();
+            fs::create_dir_all(&log_dir)
+                .await
+                .expect("cannot create raft wal log dir");
         }
         let mut store = Self {
             raft_state: RaftState::default(),
@@ -221,6 +228,7 @@ impl WalStorageCore {
             log_dir,
             active_log: None,
             compact_limit,
+            max_preserved,
             logger,
         };
 
@@ -336,7 +344,9 @@ impl WalStorageCore {
 
                         // backup corrupt data
                         let backup_path = self.log_dir.join("corrupt-raft-log.backup");
-                        let mut backup_file = LogFile::create(backup_path).await.unwrap();
+                        let mut backup_file = LogFile::create(backup_path, self.max_preserved)
+                            .await
+                            .unwrap();
                         backup_file.write_all(log_data.as_mut_slice()).await;
                         backup_file.flush().await;
 
@@ -599,7 +609,9 @@ impl WalStorageCore {
     async fn generate_new_active_log(&mut self) {
         if let Some(mut old_log) = self.active_log.take() {
             old_log.flush().await;
-            old_log.rename_to(WAL_BACKUP_LOG_NAME).await;
+            old_log
+                .rename_to(WAL_BACKUP_LOG_NAME, self.max_preserved)
+                .await;
         }
 
         let temp_log_path = self.log_dir.join(WAL_TEMP_LOG_NAME);
@@ -619,9 +631,12 @@ impl WalStorageCore {
         // Persist unapplied entries.
         self.log_append_entries(&self.entries.clone()).await;
 
+        let max_preserved = self.max_preserved;
         let acitve_log = self.mut_active_log();
         acitve_log.flush().await;
-        acitve_log.rename_to(WAL_ACTIVE_LOG_NAME).await;
+        acitve_log
+            .rename_to(WAL_ACTIVE_LOG_NAME, max_preserved)
+            .await;
     }
 
     // panic if active log is none
@@ -651,8 +666,13 @@ pub struct WalStorage(WalStorageCore);
 
 // The public interface, the WAL operations.
 impl WalStorage {
-    pub async fn new<P: AsRef<Path>>(log_dir: P, compact_limit: u64, logger: Logger) -> Self {
-        let core = WalStorageCore::new(log_dir, compact_limit, logger).await;
+    pub async fn new<P: AsRef<Path>>(
+        log_dir: P,
+        compact_limit: u64,
+        max_preserved: u64,
+        logger: Logger,
+    ) -> Self {
+        let core = WalStorageCore::new(log_dir, compact_limit, max_preserved, logger).await;
         WalStorage(core)
     }
 
@@ -815,13 +835,13 @@ fn next_log_path<P: AsRef<Path>>(log_path: P) -> PathBuf {
 
 // Rename the path if exists.
 // Examples:
-// raft-log.backup -> raft-log.1.backup -> raft-log.2.bakcup -> ... -> raft-log.${max_preserve}.backup
-async fn preserve_path<P: AsRef<Path>>(path: P, max_preserve: u64) {
+// raft-log.backup -> raft-log.1.backup -> raft-log.2.bakcup -> ... -> raft-log.${max_preserved}.backup
+async fn preserve_path<P: AsRef<Path>>(path: P, max_preserved: u64) {
     // Do recursion manually due to async-fn's limitation.
     let mut current = path.as_ref().to_path_buf();
     let mut stack: Vec<PathBuf> = vec![];
 
-    while current.exists() && (stack.len() as u64) < max_preserve {
+    while current.exists() && (stack.len() as u64) < max_preserved {
         stack.push(current.clone());
         let next = next_log_path(current);
         current = next;
@@ -839,6 +859,8 @@ mod tests {
     use std::ffi::OsString;
     use tempfile::tempdir;
 
+    const MAX_TEST_LOG_FILE_PRESERVED: u64 = 5;
+
     async fn new_store<P: AsRef<Path>>(log_dir: &P) -> WalStorage {
         let logger = {
             use sloggers::file::FileLoggerBuilder;
@@ -851,7 +873,7 @@ mod tests {
             log_builder.level(log_level);
             log_builder.build().expect("can't build terminal logger")
         };
-        WalStorage::new(log_dir, 0, logger).await
+        WalStorage::new(log_dir, 0, MAX_TEST_LOG_FILE_PRESERVED, logger).await
     }
 
     fn entry(term: u64, index: u64) -> Entry {
@@ -880,12 +902,14 @@ mod tests {
                 buf
             };
             // Path preservation is triggered here.
-            let _ = LogFile::create(log_path).await.unwrap();
+            let _ = LogFile::create(log_path, MAX_TEST_LOG_FILE_PRESERVED)
+                .await
+                .unwrap();
         }
 
         let expected = {
             let mut log_set = HashSet::<OsString>::new();
-            for i in 0..cmp::min(dup_cnt as u64, MAX_LOG_FILE_PRESERVED + 1) {
+            for i in 0..cmp::min(dup_cnt as u64, MAX_TEST_LOG_FILE_PRESERVED + 1) {
                 if i == 0 {
                     log_set.insert("test-raft-log.backup".into());
                 } else {
