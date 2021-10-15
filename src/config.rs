@@ -91,6 +91,11 @@ mod default {
         // 128 MB
         128 * 1024 * 1024
     }
+
+    // active wal log may contain incomplete tail data
+    pub fn allow_corrupt_wal_log_tail() -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,6 +146,8 @@ pub struct Config {
     pub max_wal_log_file_preserved: u64,
     #[serde(default = "default::wal_log_file_compact_limit")]
     pub wal_log_file_compact_limit: u64,
+    #[serde(default = "default::allow_corrupt_wal_log_tail")]
+    pub allow_corrupt_wal_log_tail: bool,
 }
 
 pub fn load_config(path: impl AsRef<Path>) -> Config {
