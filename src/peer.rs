@@ -150,6 +150,7 @@ impl Peer {
                 &config.raft_data_dir,
                 config.wal_log_file_compact_limit,
                 config.max_wal_log_file_preserved,
+                config.allow_corrupt_wal_log_tail,
                 logger.clone(),
             )
             .await

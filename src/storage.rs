@@ -199,7 +199,7 @@ struct WalStorageCore {
     log_dir: PathBuf,
     active_log: Option<LogFile>,
     compact_limit: u64,
-    // raft-log.backup, raft-log.1.backup, ... , raft-log.${MAX_LOG_FILE_PRESERVED}.backup
+    // raft-log.backup, raft-log.1.backup, ... , raft-log.${max_preserved}.backup
     max_preserved: u64,
 
     // slog logger
@@ -211,6 +211,7 @@ impl WalStorageCore {
         log_dir: P,
         compact_limit: u64,
         max_preserved: u64,
+        allow_corrupt_log_tail: bool,
         logger: Logger,
     ) -> Self {
         let log_dir = log_dir.as_ref().to_path_buf();
@@ -237,7 +238,9 @@ impl WalStorageCore {
             info!(store.logger, "recover from active_path.");
             let mut active_log = LogFile::open(active_path).await.unwrap();
             // Active log may have corrupt log tail.
-            store.recover_from_log(&mut active_log, true).await;
+            store
+                .recover_from_log(&mut active_log, allow_corrupt_log_tail)
+                .await;
             store.active_log.replace(active_log);
         } else {
             let backup_path = store.log_dir.join(WAL_BACKUP_LOG_NAME);
@@ -670,9 +673,17 @@ impl WalStorage {
         log_dir: P,
         compact_limit: u64,
         max_preserved: u64,
+        allow_corrupt_log_tail: bool,
         logger: Logger,
     ) -> Self {
-        let core = WalStorageCore::new(log_dir, compact_limit, max_preserved, logger).await;
+        let core = WalStorageCore::new(
+            log_dir,
+            compact_limit,
+            max_preserved,
+            allow_corrupt_log_tail,
+            logger,
+        )
+        .await;
         WalStorage(core)
     }
 
@@ -873,7 +884,7 @@ mod tests {
             log_builder.level(log_level);
             log_builder.build().expect("can't build terminal logger")
         };
-        WalStorage::new(log_dir, 0, MAX_TEST_LOG_FILE_PRESERVED, logger).await
+        WalStorage::new(log_dir, 0, MAX_TEST_LOG_FILE_PRESERVED, true, logger).await
     }
 
     fn entry(term: u64, index: u64) -> Entry {
