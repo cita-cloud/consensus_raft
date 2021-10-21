@@ -79,6 +79,10 @@ mod default {
         false
     }
 
+    pub fn transfer_leader_timeout_in_s() -> u64 {
+        12
+    }
+
     pub fn raft_data_dir() -> String {
         "raft-data-dir".into()
     }
@@ -138,6 +142,10 @@ pub struct Config {
 
     #[serde(default = "default::check_quorum")]
     pub check_quorum: bool,
+
+    // transfer leader if no receiving valid proposal from controller
+    #[serde(default = "default::transfer_leader_timeout_in_s")]
+    pub transfer_leader_timeout_in_s: u64,
 
     // raft wal log
     #[serde(default = "default::raft_data_dir")]
