@@ -1,6 +1,6 @@
 use std::collections::HashSet;
-use std::path::Path;
 use std::time::Duration;
+use std::time::Instant;
 
 use raft::eraftpb::ConfChangeType;
 use raft::eraftpb::Snapshot;
@@ -15,6 +15,7 @@ use raft::prelude::Config as RaftConfig;
 use raft::prelude::Entry;
 use raft::prelude::EntryType;
 use raft::prelude::Message;
+use raft::ProgressState;
 use raft::RawNode;
 
 use slog::o;
@@ -34,11 +35,9 @@ use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServe
 use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
 
 use crate::client::{Controller, Network};
+use crate::config::Config;
 use crate::storage::WalStorage;
 use crate::utils::{addr_to_peer_id, short_hex};
-
-// Compact wal log if file size > 64MB.
-const WAL_COMPACT_LIMIT: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct RaftConsensusService(mpsc::Sender<ConsensusConfiguration>);
@@ -91,25 +90,26 @@ pub struct Peer {
     pending_proposal: Option<Proposal>,
     pending_proposal_proposed: bool,
 
+    // transfer leader if no receiving valid proposal from controller.
+    transfer_leader_timeout: u64,
+
     // slog logger
     logger: Logger,
 }
 
 impl Peer {
-    pub async fn setup(
-        node_addr: Vec<u8>,
-        local_port: u16,
-        controller_port: u16,
-        network_port: u16,
-        data_dir: impl AsRef<Path>,
-        logger: Logger,
-    ) -> Self {
+    pub async fn setup(config: Config, logger: Logger) -> Self {
+        let node_addr = {
+            let s = &config.node_addr;
+            hex::decode(s.strip_prefix("0x").unwrap_or(s)).expect("decode node_addr failed")
+        };
+
         let local_id = addr_to_peer_id(&node_addr);
 
         // Controller grpc client
         let controller = {
             let logger = logger.new(o!("tag" => "controller"));
-            Controller::new(controller_port, logger)
+            Controller::new(config.controller_port, logger)
         };
 
         // Communicate with controller
@@ -120,36 +120,60 @@ impl Peer {
         let (peer_tx, peer_rx) = mpsc::channel(64);
         let network = {
             let logger = logger.new(o!("tag" => "network"));
-            Network::setup(local_id, local_port, network_port, peer_tx, logger).await
+            Network::setup(
+                local_id,
+                config.grpc_listen_port,
+                config.network_port,
+                peer_tx,
+                logger,
+            )
+            .await
         };
         let network_svc = network.clone();
 
         let logger_cloned = logger.clone();
+        let grpc_listen_port = config.grpc_listen_port;
         tokio::spawn(async move {
-            let addr = format!("127.0.0.1:{}", local_port).parse().unwrap();
-            let _ = Server::builder()
+            let addr = format!("127.0.0.1:{}", grpc_listen_port).parse().unwrap();
+            let res = Server::builder()
                 .add_service(ConsensusServiceServer::new(raft_svc))
                 .add_service(NetworkMsgHandlerServiceServer::new(network_svc))
                 .serve(addr)
                 .await;
-            info!(logger_cloned, "grpc service exit");
+
+            if let Err(e) = res {
+                info!(logger_cloned, "grpc service exit with error: `{}`", e);
+            } else {
+                info!(logger_cloned, "grpc service exit");
+            }
         });
 
         // Recover data from log
         let mut storage = {
             let logger = logger.new(o!("tag" => "storage"));
-            WalStorage::new(&data_dir, WAL_COMPACT_LIMIT, logger.clone()).await
+            WalStorage::new(
+                &config.raft_data_dir,
+                config.wal_log_file_compact_limit,
+                config.max_wal_log_file_preserved,
+                config.allow_corrupt_wal_log_tail,
+                logger.clone(),
+            )
+            .await
         };
 
         // Wait for controller's reconfigure.
         info!(logger, "waiting for `reconfigure` from controller..");
         let (wants_campaign, trigger_config) = loop {
-            let config = controller_rx.recv().await.unwrap();
-            if let Some(index) = config.validators.iter().position(|addr| addr == &node_addr) {
+            let trigger_config = controller_rx.recv().await.unwrap();
+            if let Some(index) = trigger_config
+                .validators
+                .iter()
+                .position(|addr| addr == &node_addr)
+            {
                 let mut wants_compaign = false;
                 if !storage.is_initialized() {
                     let snapshot = {
-                        let voters = config
+                        let voters = trigger_config
                             .validators
                             .iter()
                             .map(|addr| addr_to_peer_id(addr))
@@ -167,7 +191,7 @@ impl Peer {
                     wants_compaign = index == 0;
                 }
 
-                break (wants_compaign, config);
+                break (wants_compaign, trigger_config);
             } else {
                 info!(
                     logger,
@@ -196,9 +220,9 @@ impl Peer {
             // TODO: customize config
             let cfg = RaftConfig {
                 id: local_id,
-                election_tick: 15,
-                heartbeat_tick: 5,
-                check_quorum: true,
+                election_tick: config.election_tick as usize,
+                heartbeat_tick: config.heartbeat_tick as usize,
+                check_quorum: config.check_quorum,
                 applied,
                 ..Default::default()
             };
@@ -219,6 +243,8 @@ impl Peer {
 
             pending_conf_change: None,
             pending_conf_change_proposed: false,
+
+            transfer_leader_timeout: config.transfer_leader_timeout_in_s,
 
             logger,
         };
@@ -262,6 +288,9 @@ impl Peer {
         let fetching_timeout = time::sleep(Duration::from_secs(0));
         tokio::pin!(fetching_timeout);
 
+        // used for transfering leader when we can't get a valid proposal from controller
+        let mut last_time_start_fetching: Option<Instant> = None;
+
         loop {
             tokio::select! {
                 // timing
@@ -278,6 +307,10 @@ impl Peer {
                     fetching_proposal.replace(tokio::spawn(async move {
                         controller.get_proposal().await
                     }));
+
+                    if last_time_start_fetching.is_none() {
+                        last_time_start_fetching.replace(Instant::now());
+                    }
                 }
 
                 // future for fetching proposal from controller
@@ -335,6 +368,9 @@ impl Peer {
                     let proposal = self.pending_proposal.as_ref().unwrap();
                     let epxected_height = self.block_height() + 1;
                     if proposal.height == epxected_height {
+                        // received a valid proposal.
+                        last_time_start_fetching.take();
+
                         let proposal_bytes = proposal.encode_to_vec();
 
                         if let Err(e) = self.core.propose(vec![], proposal_bytes) {
@@ -353,10 +389,48 @@ impl Peer {
                         self.pending_proposal.take();
                     }
                 }
+
+                if let Some(t) = last_time_start_fetching.as_ref() {
+                    if t.elapsed().as_secs() > self.transfer_leader_timeout {
+                        // transfer leader only if not in conf change
+                        if self
+                            .core
+                            .store()
+                            .get_conf_state()
+                            .voters_outgoing
+                            .is_empty()
+                        {
+                            use rand::prelude::IteratorRandom;
+                            use rand::thread_rng;
+                            // random pick a up-to-date transferee
+                            let transferee = self
+                                .core
+                                .raft
+                                .prs()
+                                .iter()
+                                .filter_map(|(&id, pr)| {
+                                    if pr.recent_active
+                                        && pr.state == ProgressState::Replicate
+                                        && pr.matched == self.core.raft.raft_log.last_index()
+                                    {
+                                        Some(id)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .choose(&mut thread_rng());
+                            if let Some(transferee) = transferee {
+                                last_time_start_fetching.take();
+                                self.core.transfer_leader(transferee);
+                            }
+                        }
+                    }
+                }
             } else {
                 if let Some(h) = fetching_proposal.take() {
                     h.abort();
                 }
+                last_time_start_fetching.take();
                 self.pending_proposal.take();
                 self.pending_proposal_proposed = false;
                 // If we step down and become leader again, we need to re-propose pending conf change.
