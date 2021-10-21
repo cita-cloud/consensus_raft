@@ -56,6 +56,7 @@ impl Controller {
 
         // horrible
         if let ProposalResponse {
+            // These mysterious numbers come from https://github.com/cita-cloud/status_code
             status: Some(StatusCode { code: 0 | 109 }),
             proposal: Some(proposal),
         } = resp
