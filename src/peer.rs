@@ -244,7 +244,7 @@ impl Peer {
             pending_conf_change: None,
             pending_conf_change_proposed: false,
 
-            transfer_leader_timeout: config.transfer_leader_timeout_in_s,
+            transfer_leader_timeout: config.transfer_leader_timeout_in_secs,
 
             logger,
         };

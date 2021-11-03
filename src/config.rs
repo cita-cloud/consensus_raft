@@ -22,18 +22,6 @@ use toml::Value;
 // Default literals for serde is not supported yet.
 // https://github.com/serde-rs/serde/issues/368
 mod default {
-    pub fn grpc_listen_port() -> u16 {
-        50001
-    }
-
-    pub fn network_port() -> u16 {
-        50000
-    }
-
-    pub fn controller_port() -> u16 {
-        50004
-    }
-
     pub fn log_level() -> String {
         "info".into()
     }
@@ -63,7 +51,7 @@ mod default {
         false
     }
 
-    pub fn tick_interval_in_ms() -> u64 {
+    pub fn tick_interval_in_millis() -> u64 {
         200
     }
 
@@ -79,7 +67,7 @@ mod default {
         false
     }
 
-    pub fn transfer_leader_timeout_in_s() -> u64 {
+    pub fn transfer_leader_timeout_in_secs() -> u64 {
         12
     }
 
@@ -106,12 +94,9 @@ mod default {
 pub struct Config {
     pub node_addr: String,
 
-    #[serde(default = "default::grpc_listen_port")]
     pub grpc_listen_port: u16,
 
-    #[serde(default = "default::network_port")]
     pub network_port: u16,
-    #[serde(default = "default::controller_port")]
     pub controller_port: u16,
 
     // log
@@ -133,8 +118,8 @@ pub struct Config {
     pub log_rotate_compress: bool,
 
     // raft
-    #[serde(default = "default::tick_interval_in_ms")]
-    pub tick_interval_in_ms: u64,
+    #[serde(default = "default::tick_interval_in_millis")]
+    pub tick_interval_in_millis: u64,
     #[serde(default = "default::heartbeat_tick")]
     pub heartbeat_tick: u64,
     #[serde(default = "default::election_tick")]
@@ -144,8 +129,8 @@ pub struct Config {
     pub check_quorum: bool,
 
     // transfer leader if no receiving valid proposal from controller
-    #[serde(default = "default::transfer_leader_timeout_in_s")]
-    pub transfer_leader_timeout_in_s: u64,
+    #[serde(default = "default::transfer_leader_timeout_in_secs")]
+    pub transfer_leader_timeout_in_secs: u64,
 
     // raft wal log
     #[serde(default = "default::raft_data_dir")]
@@ -176,9 +161,8 @@ mod tests {
 
     #[test]
     fn test_default_config() {
-        let s = "[consensus]\nnode_addr = \"0x1234\"";
+        let s = "[consensus]\ngrpc_listen_port = 50001\nnetwork_port = 50000\ncontroller_port = 50004\nnode_addr = \"0x1234\"";
         let config: Value = s.parse().unwrap();
-        let consensus_config = Config::deserialize(config["consensus"].clone()).unwrap();
-        dbg!(consensus_config);
+        Config::deserialize(config["consensus"].clone()).unwrap();
     }
 }

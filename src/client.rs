@@ -28,7 +28,8 @@ use cita_cloud_proto::{
 pub struct Controller {
     // grpc client
     client: ControllerClient<Channel>,
-    // slog logger
+    // slog logger, currently unused
+    #[allow(unused)]
     logger: Logger,
 }
 
@@ -37,6 +38,9 @@ impl Controller {
         let client = {
             // TODO: maybe return a result
             let uri = format!("http://127.0.0.1:{}", port);
+
+            info!(logger, "controller grpc addr: {}", uri);
+
             let channel = Endpoint::from_shared(uri).unwrap().connect_lazy().unwrap();
             ControllerClient::new(channel)
         };
@@ -127,6 +131,9 @@ impl Inner {
         let client = {
             // TODO: maybe return a result
             let uri = format!("http://127.0.0.1:{}", network_port);
+
+            info!(logger, "network grpc addr: {}", uri);
+
             let channel = Endpoint::from_shared(uri).unwrap().connect_lazy().unwrap();
             NetworkClient::new(channel)
         };
