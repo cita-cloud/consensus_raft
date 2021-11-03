@@ -334,8 +334,19 @@ impl Peer {
                 // reconfigure
                 Some(config) = self.controller_rx.recv() => {
                     info!(self.logger, "incoming reconfigure request: `{:?}`", config);
-                    self.core.mut_store().update_consensus_config(config).await;
-                    self.maybe_pending_conf_change();
+
+                    let current_block_height = self.block_height();
+                    if config.height > current_block_height {
+                        self.core.mut_store().update_consensus_config(config).await;
+                        self.maybe_pending_conf_change();
+                    } else {
+                        warn!(
+                            self.logger,
+                            "ignoring reconfigure request with lower height";
+                            "current_block_height" => current_block_height,
+                            "reconfigure_height" => config.height,
+                        );
+                    }
                 }
                 // raft msg from remote peers
                 Some(raft_msg) = self.peer_rx.recv() => {
