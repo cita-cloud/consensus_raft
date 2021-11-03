@@ -35,7 +35,7 @@ use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServe
 use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
 
 use crate::client::{Controller, Network};
-use crate::config::Config;
+use crate::config::ConsensusServiceConfig;
 use crate::storage::WalStorage;
 use crate::utils::{addr_to_peer_id, short_hex};
 
@@ -98,7 +98,7 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub async fn setup(config: Config, logger: Logger) -> Self {
+    pub async fn setup(config: ConsensusServiceConfig, logger: Logger) -> Self {
         let node_addr = {
             let s = &config.node_addr;
             hex::decode(s.strip_prefix("0x").unwrap_or(s)).expect("decode node_addr failed")

@@ -17,7 +17,6 @@ use std::io::prelude::*;
 use std::path::Path;
 
 use serde::Deserialize;
-use toml::Value;
 
 // Default literals for serde is not supported yet.
 // https://github.com/serde-rs/serde/issues/368
@@ -91,7 +90,7 @@ mod default {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct Config {
+pub struct ConsensusServiceConfig {
     pub node_addr: String,
 
     pub grpc_listen_port: u16,
@@ -143,7 +142,13 @@ pub struct Config {
     pub allow_corrupt_wal_log_tail: bool,
 }
 
-pub fn load_config(path: impl AsRef<Path>) -> Config {
+#[derive(Debug, Clone, Deserialize)]
+pub struct Config {
+    #[serde(rename = "consensus_raft")]
+    consensus: ConsensusServiceConfig,
+}
+
+pub fn load_config(path: impl AsRef<Path>) -> ConsensusServiceConfig {
     let s = {
         let mut f = File::open(path).unwrap();
         let mut buf = String::new();
@@ -151,8 +156,8 @@ pub fn load_config(path: impl AsRef<Path>) -> Config {
         buf
     };
 
-    let config: Value = s.parse().unwrap();
-    Config::deserialize(config["consensus"].clone()).unwrap()
+    let config: Config = toml::from_str(&s).unwrap();
+    config.consensus
 }
 
 #[cfg(test)]
@@ -161,8 +166,7 @@ mod tests {
 
     #[test]
     fn test_default_config() {
-        let s = "[consensus]\ngrpc_listen_port = 50001\nnetwork_port = 50000\ncontroller_port = 50004\nnode_addr = \"0x1234\"";
-        let config: Value = s.parse().unwrap();
-        Config::deserialize(config["consensus"].clone()).unwrap();
+        let s = "[consensus_raft]\ngrpc_listen_port = 50001\nnetwork_port = 50000\ncontroller_port = 50004\nnode_addr = \"0x1234\"";
+        let _: Config = toml::from_str(s).unwrap();
     }
 }
