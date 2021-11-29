@@ -303,13 +303,12 @@ impl WalStorageCore {
             return Err(raft::Error::Store(StorageError::Compacted));
         }
 
-        if high > self.last_index() + 1 {
-            panic!(
-                "index out of bound (last: {}, high: {})",
-                self.last_index() + 1,
-                high
-            );
-        }
+        assert!(
+            high <= self.last_index() + 1,
+            "index out of bound (last: {}, high: {})",
+            self.last_index() + 1,
+            high,
+        );
 
         let offset = self.entries[0].index;
         let lo = (low - offset) as usize;
@@ -436,21 +435,19 @@ impl WalStorageCore {
             None => return,
         };
 
-        if incoming_index < self.first_index() {
-            panic!(
-                "overwrite compacted raft logs, compacted_index: {}, incoming_index: {}",
-                self.first_index() - 1,
-                incoming_index,
-            );
-        }
+        assert!(
+            incoming_index >= self.first_index(),
+            "overwrite compacted raft logs, compacted_index: {}, incoming_index: {}",
+            self.first_index() - 1,
+            incoming_index,
+        );
 
-        if incoming_index > self.last_index() + 1 {
-            panic!(
-                "raft logs should be continuous, last index: {}, new appended: {}",
-                self.last_index(),
-                incoming_index,
-            );
-        }
+        assert!(
+            incoming_index <= self.last_index() + 1,
+            "raft logs should be continuous, last index: {}, new appended: {}",
+            self.last_index(),
+            incoming_index,
+        );
 
         let offset = incoming_index - self.first_index();
         self.entries.truncate(offset as usize);
