@@ -148,12 +148,13 @@ impl LogFile {
 enum WalOpType {
     UpdateHardState = 1,
     UpdateConfState = 2,
-    ApplySnapshot = 3,
-    AppendEntries = 4,
-    AdvanceAppliedIndex = 5,
+    UpdateConsensusConfig = 3,
 
-    UpdateBlockHeight = 6,
-    UpdateConsensusConfig = 7,
+    ApplySnapshot = 4,
+    AppendEntries = 5,
+    AdvanceAppliedIndex = 6,
+
+    UpdateBlockHeight = 7,
 }
 
 #[derive(ThisError, Debug)]
@@ -173,11 +174,11 @@ impl TryFrom<u8> for WalOpType {
         let ty = match value {
             1 => Self::UpdateHardState,
             2 => Self::UpdateConfState,
-            3 => Self::ApplySnapshot,
-            4 => Self::AppendEntries,
-            5 => Self::AdvanceAppliedIndex,
-            6 => Self::UpdateBlockHeight,
-            7 => Self::UpdateConsensusConfig,
+            3 => Self::UpdateConsensusConfig,
+            4 => Self::ApplySnapshot,
+            5 => Self::AppendEntries,
+            6 => Self::AdvanceAppliedIndex,
+            7 => Self::UpdateBlockHeight,
             _ => return Err(DecodeLogError::CorruptedWalOpType),
         };
         Ok(ty)
