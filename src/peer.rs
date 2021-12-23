@@ -29,7 +29,7 @@ use tonic::transport::Server;
 use cita_cloud_proto::common::ConsensusConfiguration;
 use cita_cloud_proto::common::Proposal;
 use cita_cloud_proto::common::ProposalWithProof;
-use cita_cloud_proto::common::SimpleResponse;
+use cita_cloud_proto::common::StatusCode;
 use cita_cloud_proto::consensus::consensus_service_server::ConsensusService;
 use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServer;
 use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
@@ -47,24 +47,24 @@ impl ConsensusService for RaftConsensusService {
     async fn reconfigure(
         &self,
         request: tonic::Request<ConsensusConfiguration>,
-    ) -> std::result::Result<tonic::Response<SimpleResponse>, tonic::Status> {
+    ) -> std::result::Result<tonic::Response<StatusCode>, tonic::Status> {
         let config = request.into_inner();
         let tx = self.0.clone();
         // FIXME: it's not safe; but if we wait for it, it may cause a deadlock
         tokio::spawn(async move {
             let _ = tx.send(config).await;
         });
-        let reply = SimpleResponse { is_success: true };
-        Ok(tonic::Response::new(reply))
+        // horrible
+        Ok(tonic::Response::new(StatusCode { code: 0 }))
     }
 
     async fn check_block(
         &self,
         _request: tonic::Request<ProposalWithProof>,
-    ) -> Result<tonic::Response<SimpleResponse>, tonic::Status> {
-        // Reply true since we assume no byzantine faults.
-        let reply = SimpleResponse { is_success: true };
-        Ok(tonic::Response::new(reply))
+    ) -> Result<tonic::Response<StatusCode>, tonic::Status> {
+        // Reply ok since we assume no byzantine faults.
+        // horrible
+        Ok(tonic::Response::new(StatusCode { code: 0 }))
     }
 }
 
