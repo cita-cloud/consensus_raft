@@ -48,20 +48,20 @@ fn main() {
         .about("run the service")
         .arg(
             Arg::new("config")
-                .about("the consensus config")
+                .help("the consensus config")
                 .takes_value(true)
                 .validator(|s| s.parse::<PathBuf>())
                 .default_value("config.toml"),
         )
         .arg(
             Arg::new("stdout")
-                .about("if specified, log to stdout. Overrides the config")
+                .help("if specified, log to stdout. Overrides the config")
                 .long("stdout")
                 .conflicts_with_all(&["log-dir", "log-file-name"]),
         )
         .arg(
             Arg::new("log-dir")
-                .about("the log dir. Overrides the config")
+                .help("the log dir. Overrides the config")
                 .short('d')
                 .long("log-dir")
                 .takes_value(true)
@@ -69,7 +69,7 @@ fn main() {
         )
         .arg(
             Arg::new("log-file-name")
-                .about("the log file name. Overrride the config")
+                .help("the log file name. Overrride the config")
                 .short('f')
                 .long("log-file-name")
                 .takes_value(true)
