@@ -21,8 +21,7 @@ mod utils;
 use std::path::Path;
 use std::path::PathBuf;
 
-use clap::App;
-use clap::Arg;
+use clap::{Arg, Command};
 
 use git_version::git_version;
 
@@ -44,7 +43,7 @@ const GIT_VERSION: &str = git_version!(
 const GIT_HOMEPAGE: &str = "https://github.com/cita-cloud/consensus_raft";
 
 fn main() {
-    let run_cmd = App::new("run")
+    let run_cmd = Command::new("run")
         .about("run the service")
         .arg(
             Arg::new("config")
@@ -77,9 +76,9 @@ fn main() {
                 .takes_value(true)
                 .validator(|s| s.parse::<PathBuf>()),
         );
-    let git_cmd = App::new("git").about("show git info");
+    let git_cmd = Command::new("git").about("show git info");
 
-    let app = App::new("consensus_raft")
+    let app = Command::new("consensus_raft")
         .author("Rivtower Technology")
         .about("Consensus service for CITA-Cloud")
         .subcommands([run_cmd, git_cmd]);
