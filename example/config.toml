@@ -1,0 +1,5 @@
+[consensus_raft]
+controller_port = 50004
+grpc_listen_port = 50001
+network_port = 50000
+node_addr = '7e29cd5aef9b02bba74019c444bdc13a4d3b1bad'

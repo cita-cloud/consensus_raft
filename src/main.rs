@@ -21,7 +21,7 @@ mod utils;
 use std::path::Path;
 use std::path::PathBuf;
 
-use clap::{Arg, Command};
+use clap::{Arg, Command, crate_version, crate_authors};
 
 use git_version::git_version;
 
@@ -79,7 +79,8 @@ fn main() {
     let git_cmd = Command::new("git").about("show git info");
 
     let app = Command::new("consensus_raft")
-        .author("Rivtower Technology")
+        .author(crate_authors!())
+        .version(crate_version!())
         .about("Consensus service for CITA-Cloud")
         .subcommands([run_cmd, git_cmd]);
 
