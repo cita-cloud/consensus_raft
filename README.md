@@ -80,6 +80,7 @@ $ cat consensus.log
 Mar 14 08:32:55.131 INFO controller grpc addr: http://127.0.0.1:50004, tag: controller, module: consensus::client:45
 Mar 14 08:32:55.131 INFO network grpc addr: http://127.0.0.1:50000, tag: network, module: consensus::client:167
 Mar 14 08:32:55.131 INFO registering network msg handler..., tag: network, module: consensus::client:191
+
 ```
 
 输出到标注输出：
@@ -89,6 +90,7 @@ Mar 14 08:34:00.124 INFO controller grpc addr: http://127.0.0.1:50004, tag: cont
 Mar 14 08:34:00.125 INFO network grpc addr: http://127.0.0.1:50000, tag: network, module: consensus::client:167
 Mar 14 08:34:00.125 INFO registering network msg handler..., tag: network, module: consensus::client:191
 ```
+
 
 ## 设计
 

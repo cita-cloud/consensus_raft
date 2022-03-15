@@ -20,8 +20,8 @@ mod utils;
 
 use std::path::Path;
 use std::path::PathBuf;
+use clap::{crate_authors, crate_version, Arg, Command};
 
-use clap::{Arg, Command, crate_version, crate_authors};
 
 use git_version::git_version;
 
