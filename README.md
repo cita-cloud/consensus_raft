@@ -114,3 +114,71 @@ which tells the network to forward the messages you are concerned about.
 
 After all of that, you can send your messages to others by [`SendMsg`](https://github.com/cita-cloud/cita_cloud_proto/blob/master/protos/network.proto#L26) 
 or [`Broadcast`](https://github.com/cita-cloud/cita_cloud_proto/blob/master/protos/network.proto#L29) provided by the network service.
+
+
+## 实现
+
+[raft-rs](https://github.com/tikv/raft-rs) 提供了最核心的 `Consensus Module`，而其他的组件，包括 `Log`，`State Machine`，`Transport`，都是需要应用去定制实现。
+
+- **Storage**  
+  基于`storage trait`实现`WalStorage`，并委托`WalStorageCore`代理实现其逻辑
+    - **WalStorage**
+    ``` 
+    #[derive(Debug)]
+    pub struct WalStorage(WalStorageCore);
+    ```
+
+    ``` 
+    impl Storage for WalStorage {
+        fn initial_state(&self) -> raft::Result<RaftState> {
+            Ok(self.0.initial_state())
+        }
+    
+        fn first_index(&self) -> raft::Result<u64> {
+            Ok(self.0.first_index())
+        }
+    
+        fn last_index(&self) -> raft::Result<u64> {
+            Ok(self.0.last_index())
+        }
+    
+        fn term(&self, idx: u64) -> raft::Result<u64> {
+            self.0.term(idx)
+        }
+    
+        fn entries(
+            &self,
+            low: u64,
+            high: u64,
+            max_size: impl Into<Option<u64>>,
+        ) -> raft::Result<Vec<Entry>> {
+            self.0.entries(low, high, max_size)
+        }
+    
+        fn snapshot(&self, request_index: u64) -> raft::Result<Snapshot> {
+            self.0.snapshot(request_index)
+        }
+    }
+    ```
+    
+- **Log and State Machine**  
+
+    `log`文件内容如下图所示  
+    
+    ![raft_log](img/raft_log.png)
+    
+    `log`文件类型如下图所示  
+    ![raft_log_type](img/raft_log_type.png)  
+    
+    针对系统内不同消息，按此方式写入日志文件，`peer`启动时、或者日志文件长度大于`compact_limit`参数，会将原有日志文件备份，保留最近`max_preserved`份备份文件
+
+- **Transport**  
+
+    该能力由[network](https://cita-cloud-docs.readthedocs.io/zh_CN/latest/architecture.html#network) 实现
+
+
+- **启动及运行流程**  
+    ![setup](img/raft_setup.png)
+  
+    运行流程中的`handle ready`步骤按照[raft-rs文档](https://docs.rs/raft/latest/raft/#processing-the-ready-state) 实现
+
