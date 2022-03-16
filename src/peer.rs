@@ -152,7 +152,7 @@ impl Peer {
         let mut storage = {
             let logger = logger.new(o!("tag" => "storage"));
             WalStorage::new(
-                &config.raft_data_dir,
+                &config.wal_path,
                 config.wal_log_file_compact_limit,
                 config.max_wal_log_file_preserved,
                 config.allow_corrupt_wal_log_tail,

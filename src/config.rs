@@ -70,7 +70,7 @@ mod default {
         12
     }
 
-    pub fn raft_data_dir() -> String {
+    pub fn wal_path() -> String {
         "raft-data-dir".into()
     }
 
@@ -132,8 +132,8 @@ pub struct ConsensusServiceConfig {
     pub transfer_leader_timeout_in_secs: u64,
 
     // raft wal log
-    #[serde(default = "default::raft_data_dir")]
-    pub raft_data_dir: String,
+    #[serde(default = "default::wal_path")]
+    pub wal_path: String,
     #[serde(default = "default::max_wal_log_file_preserved")]
     pub max_wal_log_file_preserved: u64,
     #[serde(default = "default::wal_log_file_compact_limit")]
