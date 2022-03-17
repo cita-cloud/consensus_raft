@@ -83,7 +83,7 @@ Mar 14 08:32:55.131 INFO registering network msg handler..., tag: network, modul
 
 ```
 
-输出到标注输出：
+输出到标准输出：
 ```
 $ consensus run -c example/config.toml --stdout
 Mar 14 08:34:00.124 INFO controller grpc addr: http://127.0.0.1:50004, tag: controller, module: consensus::client:45
