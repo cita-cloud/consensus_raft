@@ -172,7 +172,7 @@ or [`Broadcast`](https://github.com/cita-cloud/cita_cloud_proto/blob/master/prot
     `log`文件类型如下图所示  
     ![raft_log_type](img/raft_log_type.png)  
     
-    针对系统内不同消息，按此方式写入日志文件，`peer`启动时、或者日志文件长度大于`compact_limit`参数，会将原有日志文件备份，保留最近`max_preserved`份备份文件
+    针对系统内不同消息，按此方式写入日志文件，`peer`启动时且`raft-wal-log.active`目录不存在、或者日志文件长度大于`compact_limit`参数，会将原有日志文件备份，保留最近`max_preserved`份备份文件
 
 - **Transport**  
 
