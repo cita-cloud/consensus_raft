@@ -18,10 +18,9 @@ mod peer;
 mod storage;
 mod utils;
 
+use clap::{crate_authors, crate_version, Arg, Command};
 use std::path::Path;
 use std::path::PathBuf;
-
-use clap::{crate_authors, crate_version, Arg, Command};
 
 use git_version::git_version;
 
