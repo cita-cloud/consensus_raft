@@ -31,8 +31,7 @@ use sloggers::Build as _;
 
 use peer::Peer;
 
-use config::load_config;
-
+use config::ConsensusServiceConfig;
 use utils::set_panic_handler;
 
 const GIT_VERSION: &str = git_version!(
@@ -89,7 +88,7 @@ fn main() {
         Some(("run", m)) => {
             let config = {
                 let path = m.value_of("config").unwrap();
-                load_config(path)
+                ConsensusServiceConfig::new(path)
             };
 
             let log_level = config.log_level.parse().expect("unrecognized log level");
