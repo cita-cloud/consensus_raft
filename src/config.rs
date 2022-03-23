@@ -12,10 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fs::File;
-use std::io::prelude::*;
-use std::path::Path;
-
+use cloud_util::common::read_toml;
 use serde::Deserialize;
 
 // Default literals for serde is not supported yet.
@@ -142,22 +139,10 @@ pub struct ConsensusServiceConfig {
     pub allow_corrupt_wal_log_tail: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct Config {
-    #[serde(rename = "consensus_raft")]
-    consensus: ConsensusServiceConfig,
-}
-
-pub fn load_config(path: impl AsRef<Path>) -> ConsensusServiceConfig {
-    let s = {
-        let mut f = File::open(path).unwrap();
-        let mut buf = String::new();
-        f.read_to_string(&mut buf).unwrap();
-        buf
-    };
-
-    let config: Config = toml::from_str(&s).unwrap();
-    config.consensus
+impl ConsensusServiceConfig {
+    pub fn new(config_str: &str) -> Self {
+        read_toml(config_str, "consensus_raft")
+    }
 }
 
 #[cfg(test)]
@@ -165,8 +150,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_config() {
-        let s = "[consensus_raft]\ngrpc_listen_port = 50001\nnetwork_port = 50000\ncontroller_port = 50004\nnode_addr = \"0x1234\"";
-        let _: Config = toml::from_str(s).unwrap();
+    fn basic_test() {
+        let config = ConsensusServiceConfig::new("example/config.toml");
+
+        assert_eq!(config.controller_port, 51234);
+        assert_eq!(config.network_port, 51230);
+        assert_eq!(config.grpc_listen_port, 51231);
+        assert_eq!(
+            config.node_addr,
+            "7e29cd5aef9b02bba74019c444bdc13a4d3b1bad".to_string()
+        );
     }
 }
