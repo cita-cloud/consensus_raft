@@ -32,10 +32,12 @@ use cita_cloud_proto::common::ProposalWithProof;
 use cita_cloud_proto::common::StatusCode;
 use cita_cloud_proto::consensus::consensus_service_server::ConsensusService;
 use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServer;
+use cita_cloud_proto::health_check::health_server::HealthServer;
 use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
 
 use crate::client::{Controller, Network};
 use crate::config::ConsensusServiceConfig;
+use crate::health_check::HealthCheckServer;
 use crate::storage::WalStorage;
 use crate::utils::{addr_to_peer_id, short_hex};
 
@@ -138,6 +140,7 @@ impl Peer {
             let res = Server::builder()
                 .add_service(ConsensusServiceServer::new(raft_svc))
                 .add_service(NetworkMsgHandlerServiceServer::new(network_svc))
+                .add_service(HealthServer::new(HealthCheckServer {}))
                 .serve(addr)
                 .await;
 
