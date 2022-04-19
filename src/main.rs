@@ -14,6 +14,7 @@
 
 mod client;
 mod config;
+mod health_check;
 mod peer;
 mod storage;
 mod utils;

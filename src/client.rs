@@ -335,7 +335,6 @@ impl NetworkMsgHandlerService for Network {
 }
 
 fn parse_peer_id(data: &[u8]) -> Result<u64, tonic::Status> {
-    use std::convert::TryInto;
     let buf = data
         .try_into()
         .map_err(|_| tonic::Status::invalid_argument("invalid peer id"))?;
