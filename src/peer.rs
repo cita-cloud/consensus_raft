@@ -555,7 +555,6 @@ impl Peer {
                         }
                     }
 
-
                     if let Some(pending) = self.pending_proposal.as_ref() {
                         if pending.height <= proposal_height {
                             debug!(self.logger, "pending proposal removed");
@@ -574,7 +573,7 @@ impl Peer {
                             .update_block_height(proposal_height)
                             .await;
                     }
-                },
+                }
                 // All conf changes are v2.
                 EntryType::EntryConfChange => panic!("unexpected EntryConfChange(V1)"),
                 EntryType::EntryConfChangeV2 => {
