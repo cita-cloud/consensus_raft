@@ -13,8 +13,7 @@ rand = "0.8.3"
 # `release_max_level_trace` enables configuring log level at runtime.
 slog = { version = "2.7.0", features = ["release_max_level_trace"] }
 sloggers = "1.0.1"
-# slog unable to compile because the latest version: 0.4.16 modifies the interface, todo delete
-log = "=0.4.14"
+log = "0.4.14"
 hex = "0.4.3"
 raft = { git = "https://github.com/whfuyn/raft-rs", version = "0.6.0", default-features = false, features = ["prost-codec"] }
 prost = "0.8.0"
