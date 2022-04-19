@@ -201,9 +201,11 @@ impl Peer {
         };
 
         let recorded_height = storage.get_block_height();
+        let trigger_height = trigger_config.height;
         #[allow(clippy::comparison_chain)]
-        if trigger_config.height > recorded_height || recorded_height == 0 {
+        if trigger_height > recorded_height || recorded_height == 0 {
             storage.update_consensus_config(trigger_config).await;
+            storage.update_block_height(trigger_height).await;
         } else if trigger_config.height < recorded_height {
             warn!(
                 logger, "block height in intial reconfigure is lower than recorded; skip it";
@@ -336,8 +338,10 @@ impl Peer {
                     info!(self.logger, "incoming reconfigure request: `{:?}`", config);
 
                     let current_block_height = self.block_height();
-                    if config.height > current_block_height {
+                    let config_height = config.height;
+                    if config_height > current_block_height {
                         self.core.mut_store().update_consensus_config(config).await;
+                        self.core.mut_store().update_block_height(config_height).await;
                         self.maybe_pending_conf_change();
                     } else {
                         warn!(
@@ -519,31 +523,36 @@ impl Peer {
                     let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
                     let proposal_height = proposal.height;
                     let proposal_data_hex = &short_hex(&proposal.data);
+                    let current_height = self.block_height();
+                    if proposal_height < current_height {
+                        info!(self.logger, "proposal height lower than current block height, don't check proposal"; "proposal_height" => proposal_height, "current_height" => current_height);
+                    } else {
+                        info!(self.logger, "checking proposal.."; "height" => proposal_height, "data" => proposal_data_hex);
 
-                    info!(self.logger, "checking proposal.."; "height" => proposal_height, "data" => proposal_data_hex);
-                    match self.controller.check_proposal(proposal.clone()).await {
-                        Ok(true) => {
-                            let pwp = ProposalWithProof {
-                                proposal: Some(proposal),
-                                proof: vec![],
-                            };
-                            info!(self.logger, "commiting proposal..");
-                            match self.controller.commit_block(pwp).await {
-                                Ok(config) => {
-                                    info!(self.logger, "block committed"; "height" => proposal_height, "data" => proposal_data_hex);
-                                    self.core.mut_store().update_consensus_config(config).await;
-                                    self.maybe_pending_conf_change();
-                                }
-                                Err(e) => {
-                                    warn!(self.logger, "commit block failed: {}", e);
+                        match self.controller.check_proposal(proposal.clone()).await {
+                            Ok(true) => {
+                                let pwp = ProposalWithProof {
+                                    proposal: Some(proposal),
+                                    proof: vec![],
+                                };
+                                info!(self.logger, "commiting proposal..");
+                                match self.controller.commit_block(pwp).await {
+                                    Ok(config) => {
+                                        info!(self.logger, "block committed"; "height" => proposal_height, "data" => proposal_data_hex);
+                                        self.core.mut_store().update_consensus_config(config).await;
+                                        self.maybe_pending_conf_change();
+                                    }
+                                    Err(e) => {
+                                        warn!(self.logger, "commit block failed: {}", e);
+                                    }
                                 }
                             }
+                            Ok(false) => warn!(
+                                self.logger,
+                                "check proposal failed, controller replies a false"
+                            ),
+                            Err(e) => warn!(self.logger, "check proposal failed: {}", e),
                         }
-                        Ok(false) => warn!(
-                            self.logger,
-                            "check proposal failed, controller replies a false"
-                        ),
-                        Err(e) => warn!(self.logger, "check proposal failed: {}", e),
                     }
 
                     if let Some(pending) = self.pending_proposal.as_ref() {
