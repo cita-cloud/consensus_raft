@@ -20,26 +20,17 @@ mod storage;
 mod utils;
 
 use clap::{crate_authors, crate_version, Arg, Command};
-use std::path::Path;
-use std::path::PathBuf;
-
-use git_version::git_version;
-
 use slog::info;
 use sloggers::file::FileLoggerBuilder;
 use sloggers::terminal::TerminalLoggerBuilder;
 use sloggers::Build as _;
+use std::path::Path;
+use std::path::PathBuf;
 
 use peer::Peer;
 
 use config::ConsensusServiceConfig;
 use utils::set_panic_handler;
-
-const GIT_VERSION: &str = git_version!(
-    args = ["--tags", "--always", "--dirty=-modified"],
-    fallback = "unknown"
-);
-const GIT_HOMEPAGE: &str = "https://github.com/cita-cloud/consensus_raft";
 
 fn main() {
     let run_cmd = Command::new("run")
@@ -75,13 +66,12 @@ fn main() {
                 .takes_value(true)
                 .validator(|s| s.parse::<PathBuf>()),
         );
-    let git_cmd = Command::new("git").about("show git info");
 
     let app = Command::new("consensus_raft")
         .author(crate_authors!())
         .version(crate_version!())
         .about("Consensus service for CITA-Cloud")
-        .subcommands([run_cmd, git_cmd]);
+        .subcommands([run_cmd]);
 
     let matches = app.get_matches();
 
@@ -126,10 +116,6 @@ fn main() {
                 peer.run().await;
                 info!(logger, "raft service exit");
             });
-        }
-        Some(("git", _)) => {
-            println!("git version: {}", GIT_VERSION);
-            println!("homepage: {}", GIT_HOMEPAGE);
         }
         None => {
             println!("no subcommand provided");

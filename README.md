@@ -12,8 +12,8 @@ docker build -t citacloud/consensus_raft .
 
 ```
 $ consensus -h
-consensus_raft 6.3.3
-whfuyn <whfuyn@outlook.com>
+consensus_raft 6.4.0
+Rivtower Technologies <contact@rivtower.com>
 Consensus service for CITA-Cloud
 
 USAGE:
@@ -24,19 +24,8 @@ OPTIONS:
     -V, --version    Print version information
 
 SUBCOMMANDS:
-    git     show git info
     help    Print this message or the help of the given subcommand(s)
     run     run the service
-```
-
-### consensus-git
-
-打印`git`相关的信息。
-
-```
-$ consensus git
-git version: 7268884
-homepage: https://github.com/cita-cloud/consensus_raft
 ```
 
 ### consensus-run
