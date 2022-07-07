@@ -344,7 +344,6 @@ impl Peer {
                     let config_height = config.height;
                     if config_height > current_block_height {
                         self.core.mut_store().update_consensus_config(config).await;
-                        self.core.mut_store().update_block_height(config_height).await;
                         self.maybe_pending_conf_change();
                     } else {
                         warn!(
@@ -527,7 +526,6 @@ impl Peer {
                     let proposal_height = proposal.height;
                     let proposal_data_hex = &short_hex(&proposal.data);
                     let current_height = self.block_height();
-                    let mut height_increase = false;
                     if proposal_height < current_height {
                         info!(self.logger, "proposal height lower than current block height, don't check proposal"; "proposal_height" => proposal_height, "current_height" => current_height);
                     } else {
@@ -545,7 +543,6 @@ impl Peer {
                                         info!(self.logger, "block committed"; "height" => proposal_height, "data" => proposal_data_hex);
                                         self.core.mut_store().update_consensus_config(config).await;
                                         self.maybe_pending_conf_change();
-                                        height_increase = true;
                                     }
                                     Err(e) => {
                                         warn!(self.logger, "commit block failed: {}", e);
@@ -570,13 +567,6 @@ impl Peer {
                                 "pending_height" => pending.height, "committed_height" => proposal_height
                             );
                         }
-                    }
-
-                    if proposal_height > self.block_height() && height_increase {
-                        self.core
-                            .mut_store()
-                            .update_block_height(proposal_height)
-                            .await;
                     }
                 }
                 // All conf changes are v2.
