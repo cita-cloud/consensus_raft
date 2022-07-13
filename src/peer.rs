@@ -344,7 +344,6 @@ impl Peer {
                     let config_height = config.height;
                     if config_height > current_block_height {
                         self.core.mut_store().update_consensus_config(config).await;
-                        self.core.mut_store().update_block_height(config_height).await;
                         self.maybe_pending_conf_change();
                     } else {
                         warn!(
@@ -568,13 +567,6 @@ impl Peer {
                                 "pending_height" => pending.height, "committed_height" => proposal_height
                             );
                         }
-                    }
-
-                    if proposal_height > self.block_height() {
-                        self.core
-                            .mut_store()
-                            .update_block_height(proposal_height)
-                            .await;
                     }
                 }
                 // All conf changes are v2.
