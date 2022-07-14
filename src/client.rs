@@ -44,7 +44,7 @@ impl Controller {
 
             info!(logger, "controller grpc addr: {}", uri);
 
-            let channel = Endpoint::from_shared(uri).unwrap().connect_lazy().unwrap();
+            let channel = Endpoint::from_shared(uri).unwrap().connect_lazy();
             ControllerClient::new(channel)
         };
         Self { client, logger }
@@ -166,7 +166,7 @@ impl Inner {
 
             info!(logger, "network grpc addr: {}", uri);
 
-            let channel = Endpoint::from_shared(uri).unwrap().connect_lazy().unwrap();
+            let channel = Endpoint::from_shared(uri).unwrap().connect_lazy();
             NetworkClient::new(channel)
         };
 

@@ -6,7 +6,7 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "3.1", features = ["cargo"] }
-tonic = "0.5" 
+tonic = "0.7"
 toml = "0.5"
 rand = "0.8"
 # `release_max_level_trace` enables configuring log level at runtime.
@@ -14,8 +14,8 @@ slog = { version = "2.7.0", features = ["release_max_level_trace"] }
 sloggers = "1.0.1"
 log = "0.4"
 hex = "0.4"
-raft = { git = "https://github.com/whfuyn/raft-rs", version = "0.6.0", default-features = false, features = ["prost-codec"] }
-prost = "0.8"
+raft = { git = "https://github.com/cita-cloud/raft-rs", version = "0.6.0", default-features = false, features = ["prost-codec"] }
+prost = "0.10"
 tokio = { version = "1.17", features = ["fs", "io-util", "rt", "macros"] }
 thiserror = "1.0"
 serde = "1.0"
