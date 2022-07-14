@@ -208,7 +208,6 @@ impl Peer {
         #[allow(clippy::comparison_chain)]
         if trigger_height > recorded_height || recorded_height == 0 {
             storage.update_consensus_config(trigger_config).await;
-            storage.update_block_height(trigger_height).await;
         } else if trigger_config.height < recorded_height {
             warn!(
                 logger, "block height in intial reconfigure is lower than recorded; skip it";
@@ -567,6 +566,13 @@ impl Peer {
                                 "pending_height" => pending.height, "committed_height" => proposal_height
                             );
                         }
+                    }
+
+                    if proposal_height > self.block_height() {
+                        self.core
+                            .mut_store()
+                            .update_block_height(proposal_height)
+                            .await;
                     }
                 }
                 // All conf changes are v2.
