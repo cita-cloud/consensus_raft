@@ -6,8 +6,6 @@ use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio::time;
 
-use tonic::transport::channel::{Channel, Endpoint};
-
 use prost::Message as _;
 use raft::eraftpb::Message as RaftMsg;
 
@@ -16,6 +14,7 @@ use slog::info;
 use slog::Logger;
 
 use cita_cloud_proto::{
+    client::{ClientOptions, ControllerClientTrait, InterceptedSvc, NetworkClientTrait},
     common::{
         ConsensusConfiguration, ConsensusConfigurationResponse, Empty, Proposal, ProposalResponse,
         ProposalWithProof, StatusCode,
@@ -25,12 +24,15 @@ use cita_cloud_proto::{
         network_msg_handler_service_server::NetworkMsgHandlerService,
         network_service_client::NetworkServiceClient as NetworkClient, NetworkMsg, RegisterInfo,
     },
+    retry::RetryClient,
 };
+
+const CLIENT_NAME: &str = "consensus";
 
 #[derive(Debug, Clone)]
 pub struct Controller {
     // grpc client
-    client: ControllerClient<Channel>,
+    client: RetryClient<ControllerClient<InterceptedSvc>>,
     // slog logger, currently unused
     #[allow(unused)]
     logger: Logger,
@@ -38,25 +40,19 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(port: u16, logger: Logger) -> Self {
-        let client = {
-            // TODO: maybe return a result
-            let uri = format!("http://127.0.0.1:{}", port);
-
-            info!(logger, "controller grpc addr: {}", uri);
-
-            let channel = Endpoint::from_shared(uri).unwrap().connect_lazy();
-            ControllerClient::new(channel)
+        let client_options = ClientOptions::new(
+            CLIENT_NAME.to_string(),
+            format!("http://127.0.0.1:{}", port),
+        );
+        let client = match client_options.connect_controller() {
+            Ok(retry_client) => retry_client,
+            Err(e) => panic!("client init error: {:?}", &e),
         };
         Self { client, logger }
     }
 
     pub async fn get_proposal(&self) -> Result<Proposal, tonic::Status> {
-        let resp = self
-            .client
-            .clone()
-            .get_proposal(Empty {})
-            .await
-            .map(|resp| resp.into_inner())?;
+        let resp = self.client.clone().get_proposal(Empty {}).await?;
 
         // horrible
         if let ProposalResponse {
@@ -72,27 +68,17 @@ impl Controller {
     }
 
     pub async fn check_proposal(&self, proposal: Proposal) -> Result<bool, tonic::Status> {
-        let resp = self
-            .client
-            .clone()
-            .check_proposal(proposal)
-            .await
-            .map(|resp| resp.into_inner())?;
+        let scode = self.client.clone().check_proposal(proposal).await?;
 
         // horrible
-        Ok(resp.code == 0)
+        Ok(scode.code == 0)
     }
 
     pub async fn commit_block(
         &self,
         pwp: ProposalWithProof,
     ) -> Result<ConsensusConfiguration, tonic::Status> {
-        let resp = self
-            .client
-            .clone()
-            .commit_block(pwp)
-            .await
-            .map(|resp| resp.into_inner())?;
+        let resp = self.client.clone().commit_block(pwp).await?;
 
         // horrible
         if let ConsensusConfigurationResponse {
@@ -147,7 +133,7 @@ pub struct Inner {
     mailbook: RwLock<HashMap<u64, u64>>,
 
     // grpc client
-    client: NetworkClient<Channel>,
+    client: RetryClient<NetworkClient<InterceptedSvc>>,
 
     // slog logger
     logger: Logger,
@@ -160,14 +146,13 @@ impl Inner {
         msg_tx: mpsc::Sender<RaftMsg>,
         logger: Logger,
     ) -> Self {
-        let client = {
-            // TODO: maybe return a result
-            let uri = format!("http://127.0.0.1:{}", network_port);
-
-            info!(logger, "network grpc addr: {}", uri);
-
-            let channel = Endpoint::from_shared(uri).unwrap().connect_lazy();
-            NetworkClient::new(channel)
+        let client_options = ClientOptions::new(
+            CLIENT_NAME.to_string(),
+            format!("http://127.0.0.1:{}", network_port),
+        );
+        let client = match client_options.connect_network() {
+            Ok(retry_client) => retry_client,
+            Err(e) => panic!("client init error: {:?}", &e),
         };
 
         Self {
@@ -192,13 +177,13 @@ impl Inner {
         loop {
             retry.tick().await;
 
-            if let Ok(resp) = self
+            if let Ok(scode) = self
                 .client
                 .register_network_msg_handler(request.clone())
                 .await
             {
                 // horrible
-                if resp.into_inner().code == 0 {
+                if scode.code == 0 {
                     break;
                 }
             }
