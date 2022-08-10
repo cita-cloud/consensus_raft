@@ -12,7 +12,7 @@ docker build -t citacloud/consensus_raft .
 
 ```
 $ consensus -h
-consensus_raft 6.4.0
+consensus_raft 6.6.0
 Rivtower Technologies <contact@rivtower.com>
 Consensus service for CITA-Cloud
 
