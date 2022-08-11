@@ -1,6 +1,6 @@
 [package]
 name = "consensus"
-version = "6.4.0"
+version = "6.6.0"
 authors = ["Rivtower Technologies <contact@rivtower.com>"]
 edition = "2021"
 
@@ -11,7 +11,7 @@ toml = "0.5"
 rand = "0.8"
 # `release_max_level_trace` enables configuring log level at runtime.
 slog = { version = "2.7.0", features = ["release_max_level_trace"] }
-sloggers = "1.0.1"
+sloggers = "2.1.1"
 log = "0.4"
 hex = "0.4"
 raft = { git = "https://github.com/cita-cloud/raft-rs", version = "0.6.0", default-features = false, features = ["prost-codec"] }
