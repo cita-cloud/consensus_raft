@@ -292,11 +292,28 @@ impl Peer {
         let fetching_timeout = time::sleep(Duration::from_secs(0));
         tokio::pin!(fetching_timeout);
 
+        // ping controller
+        let init_timeout = time::sleep(Duration::from_secs(1));
+        tokio::pin!(init_timeout);
+
         // used for transfering leader when we can't get a valid proposal from controller
         let mut last_time_start_fetching: Option<Instant> = None;
 
         loop {
             tokio::select! {
+                // ping controller
+                _ = &mut init_timeout => {
+                    if self.core.mut_store().get_validators().is_empty() {
+                        self.ping_controller().await;
+                        init_timeout
+                            .as_mut()
+                            .reset(time::Instant::now() + Duration::from_secs(1));
+                    } else {
+                        init_timeout
+                            .as_mut()
+                            .reset(time::Instant::now() + Duration::from_secs(0xdeadbeef));
+                    }
+                }
                 // timing
                 _ = &mut tick_timeout => {
                     self.core.tick();
@@ -651,5 +668,25 @@ impl Peer {
             self.pending_conf_change.take();
         }
         self.pending_conf_change_proposed = false;
+    }
+
+    async fn ping_controller(&mut self) {
+        let pwp = ProposalWithProof {
+            proposal: Some(Proposal {
+                height: u64::MAX,
+                data: vec![],
+            }),
+            proof: vec![],
+        };
+        info!(self.logger, "ping_controller..");
+        match self.controller.commit_block(pwp).await {
+            Ok(config) => {
+                self.core.mut_store().update_consensus_config(config).await;
+                self.maybe_pending_conf_change();
+            }
+            Err(e) => {
+                warn!(self.logger, "commit block failed: {}", e);
+            }
+        }
     }
 }
