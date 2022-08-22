@@ -27,9 +27,8 @@ use sloggers::Build as _;
 use std::path::Path;
 use std::path::PathBuf;
 
-use peer::Peer;
-
 use config::ConsensusServiceConfig;
+use peer::Peer;
 use utils::set_panic_handler;
 
 fn main() {
