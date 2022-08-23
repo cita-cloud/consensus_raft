@@ -84,6 +84,23 @@ mod default {
     pub fn allow_corrupt_wal_log_tail() -> bool {
         true
     }
+
+    // enable metrics or not
+    pub fn enable_metrics() -> bool {
+        true
+    }
+
+    // metrics exporter port
+    pub fn metrics_port() -> u16 {
+        60001
+    }
+
+    // metrics histogram buckets
+    pub fn metrics_buckets() -> Vec<f64> {
+        vec![
+            0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0,
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -137,6 +154,14 @@ pub struct ConsensusServiceConfig {
     pub wal_log_file_compact_limit: u64,
     #[serde(default = "default::allow_corrupt_wal_log_tail")]
     pub allow_corrupt_wal_log_tail: bool,
+
+    //metrics
+    #[serde(default = "default::enable_metrics")]
+    pub enable_metrics: bool,
+    #[serde(default = "default::metrics_port")]
+    pub metrics_port: u16,
+    #[serde(default = "default::metrics_buckets")]
+    pub metrics_buckets: Vec<f64>,
 }
 
 impl ConsensusServiceConfig {

@@ -34,6 +34,7 @@ use cita_cloud_proto::consensus::consensus_service_server::ConsensusService;
 use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServer;
 use cita_cloud_proto::health_check::health_server::HealthServer;
 use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
+use cloud_util::metrics::{run_metrics_exporter, MiddlewareLayer};
 
 use crate::client::{Controller, Network};
 use crate::config::ConsensusServiceConfig;
@@ -135,21 +136,62 @@ impl Peer {
 
         let logger_cloned = logger.clone();
         let grpc_listen_port = config.grpc_listen_port;
-        tokio::spawn(async move {
-            let addr = format!("127.0.0.1:{}", grpc_listen_port).parse().unwrap();
-            let res = Server::builder()
-                .add_service(ConsensusServiceServer::new(raft_svc))
-                .add_service(NetworkMsgHandlerServiceServer::new(network_svc))
-                .add_service(HealthServer::new(HealthCheckServer {}))
-                .serve(addr)
-                .await;
+        info!(
+            logger_cloned,
+            "grpc port of consensus_raft: {}", grpc_listen_port
+        );
 
-            if let Err(e) = res {
-                info!(logger_cloned, "grpc service exit with error: `{}`", e);
-            } else {
-                info!(logger_cloned, "grpc service exit");
-            }
-        });
+        let layer = if config.enable_metrics {
+            tokio::spawn(async move {
+                run_metrics_exporter(config.metrics_port).await.unwrap();
+            });
+
+            Some(
+                tower::ServiceBuilder::new()
+                    .layer(MiddlewareLayer::new(config.metrics_buckets))
+                    .into_inner(),
+            )
+        } else {
+            None
+        };
+
+        info!(logger_cloned, "start consensus_raft grpc server");
+        if layer.is_some() {
+            tokio::spawn(async move {
+                info!(logger_cloned, "metrics on");
+                let addr = format!("127.0.0.1:{}", grpc_listen_port).parse().unwrap();
+                let res = Server::builder()
+                    .layer(layer.unwrap())
+                    .add_service(ConsensusServiceServer::new(raft_svc))
+                    .add_service(NetworkMsgHandlerServiceServer::new(network_svc))
+                    .add_service(HealthServer::new(HealthCheckServer {}))
+                    .serve(addr)
+                    .await;
+
+                if let Err(e) = res {
+                    info!(logger_cloned, "grpc service exit with error: `{}`", e);
+                } else {
+                    info!(logger_cloned, "grpc service exit");
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                info!(logger_cloned, "metrics off");
+                let addr = format!("127.0.0.1:{}", grpc_listen_port).parse().unwrap();
+                let res = Server::builder()
+                    .add_service(ConsensusServiceServer::new(raft_svc))
+                    .add_service(NetworkMsgHandlerServiceServer::new(network_svc))
+                    .add_service(HealthServer::new(HealthCheckServer {}))
+                    .serve(addr)
+                    .await;
+
+                if let Err(e) = res {
+                    info!(logger_cloned, "grpc service exit with error: `{}`", e);
+                } else {
+                    info!(logger_cloned, "grpc service exit");
+                }
+            });
+        }
 
         // Recover data from log
         let mut storage = {
@@ -292,11 +334,28 @@ impl Peer {
         let fetching_timeout = time::sleep(Duration::from_secs(0));
         tokio::pin!(fetching_timeout);
 
+        // ping controller
+        let init_timeout = time::sleep(Duration::from_secs(1));
+        tokio::pin!(init_timeout);
+
         // used for transfering leader when we can't get a valid proposal from controller
         let mut last_time_start_fetching: Option<Instant> = None;
 
         loop {
             tokio::select! {
+                // ping controller
+                _ = &mut init_timeout => {
+                    if self.core.mut_store().get_validators().is_empty() {
+                        self.ping_controller().await;
+                        init_timeout
+                            .as_mut()
+                            .reset(time::Instant::now() + Duration::from_secs(1));
+                    } else {
+                        init_timeout
+                            .as_mut()
+                            .reset(time::Instant::now() + Duration::from_secs(0xdeadbeef));
+                    }
+                }
                 // timing
                 _ = &mut tick_timeout => {
                     self.core.tick();
@@ -651,5 +710,25 @@ impl Peer {
             self.pending_conf_change.take();
         }
         self.pending_conf_change_proposed = false;
+    }
+
+    async fn ping_controller(&mut self) {
+        let pwp = ProposalWithProof {
+            proposal: Some(Proposal {
+                height: u64::MAX,
+                data: vec![],
+            }),
+            proof: vec![],
+        };
+        info!(self.logger, "ping_controller..");
+        match self.controller.commit_block(pwp).await {
+            Ok(config) => {
+                self.core.mut_store().update_consensus_config(config).await;
+                self.maybe_pending_conf_change();
+            }
+            Err(e) => {
+                warn!(self.logger, "commit block failed: {}", e);
+            }
+        }
     }
 }
