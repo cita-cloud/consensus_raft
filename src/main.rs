@@ -110,6 +110,8 @@ fn main() {
             set_panic_handler(logger.clone());
 
             let rt = tokio::runtime::Runtime::new().unwrap();
+
+            rt.spawn(cloud_util::signal::handle_signals());
             rt.block_on(async move {
                 let mut peer = Peer::setup(config, logger.clone()).await;
                 peer.run().await;
