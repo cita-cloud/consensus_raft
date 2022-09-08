@@ -57,7 +57,7 @@ OPTIONS:
     * `controller_port` 为依赖的`controller`微服务的`gRPC`服务监听的端口号。
     * `grpc_listen_port` 为本微服务`gRPC`服务监听的端口号。
     * `network_port` 为依赖的`network`微服务的`gRPC`服务监听的端口号。
-    * `node_addr` 为本节点的标识。
+    * `node_addr` 为本节点地址文件路径。
 2. `log-dir` 日志的输出目录。
 3. `log-file-name` 日志输出的文件名。
 4. `--stdout` 不传该参数时，日志输出到文件；传递该参数时，日志输出到标准输出。

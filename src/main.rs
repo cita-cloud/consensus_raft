@@ -38,7 +38,7 @@ fn main() {
             Arg::new("config")
                 .short('c')
                 .long("config")
-                .help("the consensus config")
+                .help("specify consensus config file path")
                 .takes_value(true)
                 .validator(|s| s.parse::<PathBuf>())
                 .default_value("config.toml"),

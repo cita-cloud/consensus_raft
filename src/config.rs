@@ -14,6 +14,7 @@
 
 use cloud_util::common::read_toml;
 use serde::Deserialize;
+use std::fs;
 
 // Default literals for serde is not supported yet.
 // https://github.com/serde-rs/serde/issues/368
@@ -166,7 +167,10 @@ pub struct ConsensusServiceConfig {
 
 impl ConsensusServiceConfig {
     pub fn new(config_str: &str) -> Self {
-        read_toml(config_str, "consensus_raft")
+        let mut config: ConsensusServiceConfig = read_toml(config_str, "consensus_raft");
+        let node_address_path = config.node_addr.clone();
+        config.node_addr = fs::read_to_string(node_address_path).unwrap();
+        config
     }
 }
 
@@ -178,12 +182,12 @@ mod tests {
     fn basic_test() {
         let config = ConsensusServiceConfig::new("example/config.toml");
 
-        assert_eq!(config.controller_port, 51234);
-        assert_eq!(config.network_port, 51230);
-        assert_eq!(config.grpc_listen_port, 51231);
+        assert_eq!(config.controller_port, 50004);
+        assert_eq!(config.network_port, 50000);
+        assert_eq!(config.grpc_listen_port, 50001);
         assert_eq!(
             config.node_addr,
-            "7e29cd5aef9b02bba74019c444bdc13a4d3b1bad".to_string()
+            "f805cf7df8dffc4fd9c98791d72d00c9587dc1d9".to_string()
         );
     }
 }

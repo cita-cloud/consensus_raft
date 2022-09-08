@@ -1,5 +1,7 @@
 [consensus_raft]
-controller_port = 51234
-grpc_listen_port = 51231
-network_port = 51230
-node_addr = '7e29cd5aef9b02bba74019c444bdc13a4d3b1bad'
+controller_port = 50004
+enable_metrics = true
+grpc_listen_port = 50001
+metrics_port = 60001
+network_port = 50000
+node_addr = 'example/node_address'
