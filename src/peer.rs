@@ -98,6 +98,10 @@ pub struct Peer {
 
     // slog logger
     logger: Logger,
+
+    node_address: Vec<u8>,
+
+    is_validator: bool,
 }
 
 impl Peer {
@@ -249,7 +253,9 @@ impl Peer {
         let trigger_height = trigger_config.height;
         #[allow(clippy::comparison_chain)]
         if trigger_height > recorded_height || recorded_height == 0 {
-            storage.update_consensus_config(trigger_config).await;
+            storage
+                .update_consensus_config(trigger_config.clone())
+                .await;
         } else if trigger_config.height < recorded_height {
             warn!(
                 logger, "block height in intial reconfigure is lower than recorded; skip it";
@@ -293,6 +299,9 @@ impl Peer {
             transfer_leader_timeout: config.transfer_leader_timeout_in_secs,
 
             logger,
+
+            node_address: node_addr.clone(),
+            is_validator: trigger_config.validators.contains(&node_addr),
         };
 
         this.maybe_pending_conf_change();
@@ -421,6 +430,33 @@ impl Peer {
             }
 
             if self.is_leader() {
+                // transfer_leader if is not validator
+                if !self.is_validator {
+                    use rand::prelude::IteratorRandom;
+                    use rand::thread_rng;
+                    // random pick a up-to-date transferee
+                    let transferee = self
+                        .core
+                        .raft
+                        .prs()
+                        .iter()
+                        .filter_map(|(&id, pr)| {
+                            if pr.recent_active
+                                && pr.state == ProgressState::Replicate
+                                && pr.matched == self.core.raft.raft_log.last_index()
+                            {
+                                Some(id)
+                            } else {
+                                None
+                            }
+                        })
+                        .choose(&mut thread_rng());
+                    if let Some(transferee) = transferee {
+                        last_time_start_fetching.take();
+                        self.core.transfer_leader(transferee);
+                    }
+                }
+
                 // propose pending conf change
                 if !self.pending_conf_change_proposed && self.pending_conf_change.is_some() {
                     match self
@@ -599,6 +635,10 @@ impl Peer {
                                 match self.controller.commit_block(pwp).await {
                                     Ok(config) => {
                                         info!(self.logger, "block committed"; "height" => proposal_height, "data" => proposal_data_hex);
+
+                                        if !config.validators.contains(&self.node_address) {
+                                            self.is_validator = false;
+                                        }
                                         self.core.mut_store().update_consensus_config(config).await;
                                         self.maybe_pending_conf_change();
                                     }
@@ -723,6 +763,9 @@ impl Peer {
         info!(self.logger, "ping_controller..");
         match self.controller.commit_block(pwp).await {
             Ok(config) => {
+                if !config.validators.contains(&self.node_address) {
+                    self.is_validator = false;
+                }
                 self.core.mut_store().update_consensus_config(config).await;
                 self.maybe_pending_conf_change();
             }
