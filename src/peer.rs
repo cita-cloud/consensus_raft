@@ -98,6 +98,10 @@ pub struct Peer {
 
     // slog logger
     logger: Logger,
+
+    node_address: Vec<u8>,
+
+    is_validator: bool,
 }
 
 impl Peer {
@@ -293,6 +297,9 @@ impl Peer {
             transfer_leader_timeout: config.transfer_leader_timeout_in_secs,
 
             logger,
+
+            node_address: node_addr.clone(),
+            is_validator: true,
         };
 
         this.maybe_pending_conf_change();
@@ -398,6 +405,10 @@ impl Peer {
                 Some(config) = self.controller_rx.recv() => {
                     info!(self.logger, "incoming reconfigure request: `{:?}`", config);
 
+                    if config.validators.contains(&self.node_address) {
+                        info!(self.logger, "this node is added to validators");
+                        self.is_validator = true;
+                    }
                     let current_block_height = self.block_height();
                     let config_height = config.height;
                     if config_height > current_block_height {
@@ -421,82 +432,109 @@ impl Peer {
             }
 
             if self.is_leader() {
-                // propose pending conf change
-                if !self.pending_conf_change_proposed && self.pending_conf_change.is_some() {
-                    match self
+                if !self.is_validator {
+                    // transfer_leader if this node is not validator
+                    use rand::prelude::IteratorRandom;
+                    use rand::thread_rng;
+                    // random pick a up-to-date transferee
+                    let transferee = self
                         .core
-                        .propose_conf_change(vec![], self.pending_conf_change.clone().unwrap())
-                    {
-                        Ok(()) => {
-                            info!(self.logger, "pending conf change proposed");
-                            self.pending_conf_change_proposed = true;
-                        }
-                        Err(e) => warn!(self.logger, "propose conf change failed: `{}`", e),
-                    }
-                }
-
-                // propose pending proposal
-                if !self.pending_proposal_proposed
-                    && self.pending_proposal.is_some()
-                    && self.pending_conf_change.is_none()
-                {
-                    let proposal = self.pending_proposal.as_ref().unwrap();
-                    let epxected_height = self.block_height() + 1;
-                    if proposal.height == epxected_height {
-                        // received a valid proposal.
+                        .raft
+                        .prs()
+                        .iter()
+                        .filter_map(|(&id, pr)| {
+                            if pr.recent_active
+                                && pr.state == ProgressState::Replicate
+                                && pr.matched == self.core.raft.raft_log.last_index()
+                            {
+                                Some(id)
+                            } else {
+                                None
+                            }
+                        })
+                        .choose(&mut thread_rng());
+                    if let Some(transferee) = transferee {
                         last_time_start_fetching.take();
-
-                        let proposal_bytes = proposal.encode_to_vec();
-
-                        if let Err(e) = self.core.propose(vec![], proposal_bytes) {
-                            warn!(self.logger, "can't propose proposal: `{}`", e);
-                        } else {
-                            info!(self.logger, "pending proposal proposed"; "height" => proposal.height, "data" => short_hex(&proposal.data));
-                            self.pending_proposal_proposed = true;
-                        }
-                    } else {
-                        warn!(
-                            self.logger,
-                            "receive a proposal with invalid height, drop it";
-                            "proposal height" => proposal.height,
-                            "expect height" => epxected_height,
-                        );
-                        self.pending_proposal.take();
+                        self.core.transfer_leader(transferee);
                     }
-                }
-
-                if let Some(t) = last_time_start_fetching.as_ref() {
-                    if t.elapsed().as_secs() > self.transfer_leader_timeout {
-                        // transfer leader only if not in conf change
-                        if self
+                } else {
+                    // propose pending conf change
+                    if !self.pending_conf_change_proposed && self.pending_conf_change.is_some() {
+                        match self
                             .core
-                            .store()
-                            .get_conf_state()
-                            .voters_outgoing
-                            .is_empty()
+                            .propose_conf_change(vec![], self.pending_conf_change.clone().unwrap())
                         {
-                            use rand::prelude::IteratorRandom;
-                            use rand::thread_rng;
-                            // random pick a up-to-date transferee
-                            let transferee = self
+                            Ok(()) => {
+                                info!(self.logger, "pending conf change proposed");
+                                self.pending_conf_change_proposed = true;
+                            }
+                            Err(e) => warn!(self.logger, "propose conf change failed: `{}`", e),
+                        }
+                    }
+
+                    // propose pending proposal
+                    if !self.pending_proposal_proposed
+                        && self.pending_proposal.is_some()
+                        && self.pending_conf_change.is_none()
+                    {
+                        let proposal = self.pending_proposal.as_ref().unwrap();
+                        let epxected_height = self.block_height() + 1;
+                        if proposal.height == epxected_height {
+                            // received a valid proposal.
+                            last_time_start_fetching.take();
+
+                            let proposal_bytes = proposal.encode_to_vec();
+
+                            if let Err(e) = self.core.propose(vec![], proposal_bytes) {
+                                warn!(self.logger, "can't propose proposal: `{}`", e);
+                            } else {
+                                info!(self.logger, "pending proposal proposed"; "height" => proposal.height, "data" => short_hex(&proposal.data));
+                                self.pending_proposal_proposed = true;
+                            }
+                        } else {
+                            warn!(
+                                self.logger,
+                                "receive a proposal with invalid height, drop it";
+                                "proposal height" => proposal.height,
+                                "expect height" => epxected_height,
+                            );
+                            self.pending_proposal.take();
+                        }
+                    }
+
+                    if let Some(t) = last_time_start_fetching.as_ref() {
+                        if t.elapsed().as_secs() > self.transfer_leader_timeout {
+                            // transfer leader only if not in conf change
+                            if self
                                 .core
-                                .raft
-                                .prs()
-                                .iter()
-                                .filter_map(|(&id, pr)| {
-                                    if pr.recent_active
-                                        && pr.state == ProgressState::Replicate
-                                        && pr.matched == self.core.raft.raft_log.last_index()
-                                    {
-                                        Some(id)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .choose(&mut thread_rng());
-                            if let Some(transferee) = transferee {
-                                last_time_start_fetching.take();
-                                self.core.transfer_leader(transferee);
+                                .store()
+                                .get_conf_state()
+                                .voters_outgoing
+                                .is_empty()
+                            {
+                                use rand::prelude::IteratorRandom;
+                                use rand::thread_rng;
+                                // random pick a up-to-date transferee
+                                let transferee = self
+                                    .core
+                                    .raft
+                                    .prs()
+                                    .iter()
+                                    .filter_map(|(&id, pr)| {
+                                        if pr.recent_active
+                                            && pr.state == ProgressState::Replicate
+                                            && pr.matched == self.core.raft.raft_log.last_index()
+                                        {
+                                            Some(id)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .choose(&mut thread_rng());
+                                if let Some(transferee) = transferee {
+                                    last_time_start_fetching.take();
+                                    self.core.transfer_leader(transferee);
+                                }
                             }
                         }
                     }
@@ -599,6 +637,14 @@ impl Peer {
                                 match self.controller.commit_block(pwp).await {
                                     Ok(config) => {
                                         info!(self.logger, "block committed"; "height" => proposal_height, "data" => proposal_data_hex);
+
+                                        if !config.validators.contains(&self.node_address) {
+                                            warn!(
+                                                self.logger,
+                                                "this node is removed from validators"
+                                            );
+                                            self.is_validator = false;
+                                        }
                                         self.core.mut_store().update_consensus_config(config).await;
                                         self.maybe_pending_conf_change();
                                     }
@@ -723,6 +769,10 @@ impl Peer {
         info!(self.logger, "ping_controller..");
         match self.controller.commit_block(pwp).await {
             Ok(config) => {
+                if !config.validators.contains(&self.node_address) {
+                    warn!(self.logger, "this node is removed from validators");
+                    self.is_validator = false;
+                }
                 self.core.mut_store().update_consensus_config(config).await;
                 self.maybe_pending_conf_change();
             }
