@@ -1,18 +1,3 @@
-use std::collections::HashMap;
-use std::ops::Deref;
-use std::sync::Arc;
-
-use tokio::sync::mpsc;
-use tokio::sync::RwLock;
-use tokio::time;
-
-use prost::Message as _;
-use raft::eraftpb::Message as RaftMsg;
-
-use slog::debug;
-use slog::info;
-use slog::Logger;
-
 use cita_cloud_proto::{
     client::{ClientOptions, ControllerClientTrait, InterceptedSvc, NetworkClientTrait},
     common::{
@@ -26,6 +11,17 @@ use cita_cloud_proto::{
     },
     retry::RetryClient,
 };
+use prost::Message as _;
+use raft::eraftpb::Message as RaftMsg;
+use slog::debug;
+use slog::info;
+use slog::Logger;
+use std::collections::HashMap;
+use std::ops::Deref;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio::sync::RwLock;
+use tokio::time;
 
 const CLIENT_NAME: &str = "consensus";
 

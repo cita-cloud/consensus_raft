@@ -1,31 +1,8 @@
-use std::collections::HashSet;
-use std::time::Duration;
-use std::time::Instant;
-
-use raft::eraftpb::ConfChangeType;
-use raft::eraftpb::Snapshot;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio::time;
-
-use raft::eraftpb::Message as RaftMsg;
-use raft::prelude::ConfChangeSingle;
-use raft::prelude::ConfChangeV2;
-use raft::prelude::Config as RaftConfig;
-use raft::prelude::Entry;
-use raft::prelude::EntryType;
-use raft::prelude::Message;
-use raft::ProgressState;
-use raft::RawNode;
-
-use slog::o;
-use slog::Logger;
-use slog::{debug, error, info, warn};
-
-use prost::Message as _;
-
-use tonic::transport::Server;
-
+use crate::client::{Controller, Network};
+use crate::config::ConsensusServiceConfig;
+use crate::health_check::HealthCheckServer;
+use crate::storage::WalStorage;
+use crate::utils::{addr_to_peer_id, short_hex};
 use cita_cloud_proto::common::ConsensusConfiguration;
 use cita_cloud_proto::common::Proposal;
 use cita_cloud_proto::common::ProposalWithProof;
@@ -35,12 +12,28 @@ use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServe
 use cita_cloud_proto::health_check::health_server::HealthServer;
 use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
 use cloud_util::metrics::{run_metrics_exporter, MiddlewareLayer};
-
-use crate::client::{Controller, Network};
-use crate::config::ConsensusServiceConfig;
-use crate::health_check::HealthCheckServer;
-use crate::storage::WalStorage;
-use crate::utils::{addr_to_peer_id, short_hex};
+use prost::Message as _;
+use raft::eraftpb::ConfChangeType;
+use raft::eraftpb::Message as RaftMsg;
+use raft::eraftpb::Snapshot;
+use raft::prelude::ConfChangeSingle;
+use raft::prelude::ConfChangeV2;
+use raft::prelude::Config as RaftConfig;
+use raft::prelude::Entry;
+use raft::prelude::EntryType;
+use raft::prelude::Message;
+use raft::ProgressState;
+use raft::RawNode;
+use slog::o;
+use slog::Logger;
+use slog::{debug, error, info, warn};
+use std::collections::HashSet;
+use std::time::Duration;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time;
+use tonic::transport::Server;
 
 #[derive(Debug)]
 pub struct RaftConsensusService(mpsc::Sender<ConsensusConfiguration>);
@@ -95,6 +88,8 @@ pub struct Peer {
 
     // transfer leader if no receiving valid proposal from controller.
     transfer_leader_timeout: u64,
+    need_to_transfer_leader: bool,
+    send_time_out_to_transferee: bool,
 
     // slog logger
     logger: Logger,
@@ -291,6 +286,8 @@ impl Peer {
             pending_conf_change_proposed: false,
 
             transfer_leader_timeout: config.transfer_leader_timeout_in_secs,
+            need_to_transfer_leader: false,
+            send_time_out_to_transferee: false,
 
             logger,
         };
@@ -420,9 +417,41 @@ impl Peer {
                 }
             }
 
+            if self.need_to_transfer_leader && !self.send_time_out_to_transferee {
+                // try to transfer leader
+                use rand::prelude::IteratorRandom;
+                use rand::thread_rng;
+                // random pick a up-to-date transferee
+                let transferee = self
+                    .core
+                    .raft
+                    .prs()
+                    .iter()
+                    .filter_map(|(&id, pr)| {
+                        if pr.recent_active
+                            && pr.state == ProgressState::Replicate
+                            && pr.matched == self.core.raft.raft_log.last_index()
+                        {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
+                    .choose(&mut thread_rng());
+                if let Some(transferee) = transferee {
+                    self.core.transfer_leader(transferee);
+                    self.send_time_out_to_transferee = true;
+                } else {
+                    warn!(self.logger, "transferee is none");
+                }
+            }
+
             if self.is_leader() {
                 // propose pending conf change
-                if !self.pending_conf_change_proposed && self.pending_conf_change.is_some() {
+                if !self.pending_conf_change_proposed
+                    && self.pending_conf_change.is_some()
+                    && !self.need_to_transfer_leader
+                {
                     match self
                         .core
                         .propose_conf_change(vec![], self.pending_conf_change.clone().unwrap())
@@ -510,6 +539,8 @@ impl Peer {
                 self.pending_proposal_proposed = false;
                 // If we step down and become leader again, we need to re-propose pending conf change.
                 self.pending_conf_change_proposed = false;
+                self.need_to_transfer_leader = false;
+                self.send_time_out_to_transferee = false;
             }
 
             self.handle_ready().await;
@@ -574,10 +605,9 @@ impl Peer {
 
     async fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) {
         // Fitler out empty entries produced by new elected leaders.
-        for entry in committed_entries
-            .into_iter()
-            .filter(|ent| !ent.data.is_empty())
-        {
+        for entry in committed_entries.into_iter().filter(|ent| {
+            !ent.data.is_empty() || ent.get_entry_type() == EntryType::EntryConfChangeV2
+        }) {
             match entry.get_entry_type() {
                 EntryType::EntryNormal => {
                     let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
@@ -681,6 +711,10 @@ impl Peer {
         let cc = {
             let added: Vec<u64> = target_peers.difference(&current_peers).copied().collect();
             let removed: Vec<u64> = current_peers.difference(&target_peers).copied().collect();
+
+            if self.is_leader() && removed.contains(&self.core.raft.id) {
+                self.need_to_transfer_leader = true;
+            }
 
             let mut changes = vec![];
             for id in added {
