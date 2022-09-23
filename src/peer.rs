@@ -1,31 +1,8 @@
-use std::collections::HashSet;
-use std::time::Duration;
-use std::time::Instant;
-
-use raft::eraftpb::ConfChangeType;
-use raft::eraftpb::Snapshot;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio::time;
-
-use raft::eraftpb::Message as RaftMsg;
-use raft::prelude::ConfChangeSingle;
-use raft::prelude::ConfChangeV2;
-use raft::prelude::Config as RaftConfig;
-use raft::prelude::Entry;
-use raft::prelude::EntryType;
-use raft::prelude::Message;
-use raft::ProgressState;
-use raft::RawNode;
-
-use slog::o;
-use slog::Logger;
-use slog::{debug, error, info, warn};
-
-use prost::Message as _;
-
-use tonic::transport::Server;
-
+use crate::client::{Controller, Network};
+use crate::config::ConsensusServiceConfig;
+use crate::health_check::HealthCheckServer;
+use crate::storage::WalStorage;
+use crate::utils::{addr_to_peer_id, short_hex};
 use cita_cloud_proto::common::ConsensusConfiguration;
 use cita_cloud_proto::common::Proposal;
 use cita_cloud_proto::common::ProposalWithProof;
@@ -35,12 +12,28 @@ use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServe
 use cita_cloud_proto::health_check::health_server::HealthServer;
 use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
 use cloud_util::metrics::{run_metrics_exporter, MiddlewareLayer};
-
-use crate::client::{Controller, Network};
-use crate::config::ConsensusServiceConfig;
-use crate::health_check::HealthCheckServer;
-use crate::storage::WalStorage;
-use crate::utils::{addr_to_peer_id, short_hex};
+use prost::Message as _;
+use raft::eraftpb::ConfChangeType;
+use raft::eraftpb::Message as RaftMsg;
+use raft::eraftpb::Snapshot;
+use raft::prelude::ConfChangeSingle;
+use raft::prelude::ConfChangeV2;
+use raft::prelude::Config as RaftConfig;
+use raft::prelude::Entry;
+use raft::prelude::EntryType;
+use raft::prelude::Message;
+use raft::ProgressState;
+use raft::RawNode;
+use slog::o;
+use slog::Logger;
+use slog::{debug, error, info, warn};
+use std::collections::HashSet;
+use std::time::Duration;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time;
+use tonic::transport::Server;
 
 #[derive(Debug)]
 pub struct RaftConsensusService(mpsc::Sender<ConsensusConfiguration>);
@@ -86,7 +79,7 @@ pub struct Peer {
     network: Network,
 
     // pending_conf_change
-    pending_conf_change: Option<ConfChangeV2>,
+    pending_conf_change: Vec<ConfChangeV2>,
     pending_conf_change_proposed: bool,
 
     // pending proposal
@@ -95,6 +88,7 @@ pub struct Peer {
 
     // transfer leader if no receiving valid proposal from controller.
     transfer_leader_timeout: u64,
+    send_time_out_to_transferee: bool,
 
     // slog logger
     logger: Logger,
@@ -287,10 +281,11 @@ impl Peer {
             pending_proposal: None,
             pending_proposal_proposed: false,
 
-            pending_conf_change: None,
+            pending_conf_change: vec![],
             pending_conf_change_proposed: false,
 
             transfer_leader_timeout: config.transfer_leader_timeout_in_secs,
+            send_time_out_to_transferee: false,
 
             logger,
         };
@@ -420,12 +415,89 @@ impl Peer {
                 }
             }
 
+            //if incoming config change at vec[1], means it only contains AddNode type changes,;if voters already contain them, ignore it
+            if self.is_leader() && !self.pending_conf_change.is_empty() {
+                let incoming_conf_change = self.pending_conf_change.last().unwrap();
+                let current_peers: HashSet<u64> = self
+                    .core
+                    .store()
+                    .get_conf_state()
+                    .voters
+                    .iter()
+                    .copied()
+                    .collect();
+                if self.pending_conf_change.len() == 2
+                    && incoming_conf_change
+                        .changes
+                        .iter()
+                        .all(|c| current_peers.contains(&c.node_id))
+                {
+                    self.pending_conf_change.pop();
+                }
+            }
+
+            //if incoming change needs to transfer leader, then transfer leader first
+            let need_to_transfer_leader = self.is_leader()
+                && !self.pending_conf_change.is_empty()
+                && self
+                    .pending_conf_change
+                    .last()
+                    .unwrap()
+                    .changes
+                    .iter()
+                    .any(|c| {
+                        c.change_type == ConfChangeType::RemoveNode as i32
+                            && c.node_id == self.core.raft.id
+                    });
+
+            // try to transfer leader
+            // if send_time_out_to_transferee is true means the leader has sent MsgTimeoutNow to a transferee
+            if need_to_transfer_leader && !self.send_time_out_to_transferee {
+                let validators: HashSet<u64> = self
+                    .core
+                    .store()
+                    .get_validators()
+                    .iter()
+                    .map(|v| addr_to_peer_id(v))
+                    .collect();
+                use rand::prelude::IteratorRandom;
+                use rand::thread_rng;
+                // random pick a up-to-date transferee
+                let transferee = self
+                    .core
+                    .raft
+                    .prs()
+                    .iter()
+                    .filter_map(|(&id, pr)| {
+                        if pr.recent_active
+                            && pr.state == ProgressState::Replicate
+                            && pr.matched == self.core.raft.raft_log.last_index()
+                            && validators.contains(&id)
+                        {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
+                    .choose(&mut thread_rng());
+                if let Some(transferee) = transferee {
+                    self.core.transfer_leader(transferee);
+                    self.send_time_out_to_transferee = true;
+                } else {
+                    warn!(self.logger, "finding a qualified transferee");
+                }
+            }
+
             if self.is_leader() {
                 // propose pending conf change
-                if !self.pending_conf_change_proposed && self.pending_conf_change.is_some() {
+                if !self.pending_conf_change_proposed
+                    && !self.pending_conf_change.is_empty()
+                    && !need_to_transfer_leader
+                    && !self.core.raft.has_pending_conf()
+                {
                     match self
                         .core
-                        .propose_conf_change(vec![], self.pending_conf_change.clone().unwrap())
+                        .propose_conf_change(vec![], self.pending_conf_change.pop().unwrap())
                     {
                         Ok(()) => {
                             info!(self.logger, "pending conf change proposed");
@@ -438,7 +510,8 @@ impl Peer {
                 // propose pending proposal
                 if !self.pending_proposal_proposed
                     && self.pending_proposal.is_some()
-                    && self.pending_conf_change.is_none()
+                    && self.pending_conf_change.is_empty()
+                    && !self.pending_conf_change_proposed
                 {
                     let proposal = self.pending_proposal.as_ref().unwrap();
                     let epxected_height = self.block_height() + 1;
@@ -510,6 +583,7 @@ impl Peer {
                 self.pending_proposal_proposed = false;
                 // If we step down and become leader again, we need to re-propose pending conf change.
                 self.pending_conf_change_proposed = false;
+                self.send_time_out_to_transferee = false;
             }
 
             self.handle_ready().await;
@@ -573,19 +647,18 @@ impl Peer {
     }
 
     async fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) {
-        // Fitler out empty entries produced by new elected leaders.
-        for entry in committed_entries
-            .into_iter()
-            .filter(|ent| !ent.data.is_empty())
-        {
+        // Fitler out empty entries produced by new elected leaders except EntryConfChangeV2 type, it's used to leave joint consensus
+        for entry in committed_entries.into_iter().filter(|ent| {
+            !ent.data.is_empty() || ent.get_entry_type() == EntryType::EntryConfChangeV2
+        }) {
             match entry.get_entry_type() {
                 EntryType::EntryNormal => {
                     let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
                     let proposal_height = proposal.height;
                     let proposal_data_hex = &short_hex(&proposal.data);
                     let current_height = self.block_height();
-                    if proposal_height < current_height {
-                        info!(self.logger, "proposal height lower than current block height, don't check proposal"; "proposal_height" => proposal_height, "current_height" => current_height);
+                    if proposal_height <= current_height {
+                        info!(self.logger, "proposal height less than or equal current block height, don't check proposal"; "proposal_height" => proposal_height, "current_height" => current_height);
                     } else {
                         info!(self.logger, "checking proposal.."; "height" => proposal_height, "data" => proposal_data_hex);
 
@@ -648,8 +721,7 @@ impl Peer {
                         "apply config change `{:?}`; now config state is: {:?}", cc, cs
                     );
                     self.core.mut_store().update_conf_state(cs).await;
-                    // maybe clean the pending conf change.
-                    self.maybe_pending_conf_change();
+                    self.pending_conf_change_proposed = false;
                 }
             }
 
@@ -679,35 +751,54 @@ impl Peer {
             .collect();
 
         let cc = {
-            let added: Vec<u64> = target_peers.difference(&current_peers).copied().collect();
-            let removed: Vec<u64> = current_peers.difference(&target_peers).copied().collect();
+            let added: HashSet<u64> = target_peers.difference(&current_peers).copied().collect();
+            let removed: HashSet<u64> = current_peers.difference(&target_peers).copied().collect();
 
-            let mut changes = vec![];
-            for id in added {
+            let mut added_ccs = vec![];
+            let mut removed_ccs = vec![];
+            for id in added.clone() {
                 let ccs = ConfChangeSingle {
                     change_type: ConfChangeType::AddNode as i32,
                     node_id: id,
                 };
-                changes.push(ccs);
+                added_ccs.push(ccs);
             }
-            for id in removed {
+            for id in removed.clone() {
                 let ccs = ConfChangeSingle {
                     change_type: ConfChangeType::RemoveNode as i32,
                     node_id: id,
                 };
-                changes.push(ccs);
+                removed_ccs.push(ccs);
             }
+
+            // if replace all validators at one time, split it to two steps of config change, first to add new, and then remove old
+            if added == target_peers && removed == current_peers {
+                info!(self.logger, "replacing all validators");
+                let conf_change_add = ConfChangeV2 {
+                    changes: added_ccs,
+                    ..Default::default()
+                };
+                let conf_change_remove = ConfChangeV2 {
+                    changes: removed_ccs,
+                    ..Default::default()
+                };
+                self.pending_conf_change = vec![conf_change_remove, conf_change_add];
+                self.pending_conf_change_proposed = false;
+                return;
+            }
+
+            added_ccs.append(&mut removed_ccs);
             ConfChangeV2 {
-                changes,
+                changes: added_ccs,
                 ..Default::default()
             }
         };
 
         if !cc.changes.is_empty() {
             info!(self.logger, "new pending conf change: `{:?}`", cc);
-            self.pending_conf_change.replace(cc);
+            self.pending_conf_change = vec![cc];
         } else {
-            self.pending_conf_change.take();
+            self.pending_conf_change = vec![];
         }
         self.pending_conf_change_proposed = false;
     }
