@@ -1,6 +1,6 @@
 [package]
 name = "consensus"
-version = "6.6.0"
+version = "6.6.1"
 authors = ["Rivtower Technologies <contact@rivtower.com>"]
 edition = "2021"
 
@@ -23,8 +23,8 @@ bytes = "1.0"
 backtrace = "0.3"
 tower = "0.4.13"
 
-cita_cloud_proto = { git = "https://github.com/cita-cloud/cita_cloud_proto" }
-cloud-util = { git = "https://github.com/cita-cloud/cloud-util" }
+cita_cloud_proto = "=6.6.1"
+cloud-util = "0.5.0"
 
 [dev-dependencies]
 tempfile = "3.3"
