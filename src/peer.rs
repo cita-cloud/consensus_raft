@@ -1,7 +1,7 @@
 use crate::client::{Controller, Network};
 use crate::config::ConsensusServiceConfig;
 use crate::health_check::HealthCheckServer;
-use crate::storage::WalStorage;
+use crate::storage::RaftStorage;
 use crate::utils::{addr_to_peer_id, short_hex};
 use cita_cloud_proto::common::ConsensusConfiguration;
 use cita_cloud_proto::common::Proposal;
@@ -66,7 +66,7 @@ impl ConsensusService for RaftConsensusService {
 
 pub struct Peer {
     // raft core
-    core: RawNode<WalStorage>,
+    core: RawNode<RaftStorage>,
 
     // peers' raft msg receiver.
     peer_rx: mpsc::Receiver<RaftMsg>,
@@ -190,14 +190,7 @@ impl Peer {
         // Recover data from log
         let mut storage = {
             let logger = logger.new(o!("tag" => "storage"));
-            WalStorage::new(
-                &config.wal_path,
-                config.wal_log_file_compact_limit,
-                config.max_wal_log_file_preserved,
-                config.allow_corrupt_wal_log_tail,
-                logger.clone(),
-            )
-            .await
+            RaftStorage::new(&config.wal_path, logger.clone()).await
         };
 
         // Wait for controller's reconfigure.
@@ -225,11 +218,9 @@ impl Peer {
                         s.mut_metadata().mut_conf_state().voters = voters;
                         s
                     };
-
-                    storage.apply_snapshot(snapshot).await.unwrap();
+                    storage.apply_snapshot(snapshot).unwrap();
                     wants_compaign = index == 0;
                 }
-
                 break (wants_compaign, trigger_config);
             } else {
                 info!(
@@ -243,7 +234,7 @@ impl Peer {
         let trigger_height = trigger_config.height;
         #[allow(clippy::comparison_chain)]
         if trigger_height > recorded_height || recorded_height == 0 {
-            storage.update_consensus_config(trigger_config).await;
+            storage.update_consensus_config(trigger_config);
         } else if trigger_config.height < recorded_height {
             warn!(
                 logger, "block height in intial reconfigure is lower than recorded; skip it";
@@ -390,49 +381,13 @@ impl Peer {
                 }
 
                 // reconfigure
-                Some(config) = self.controller_rx.recv() => {
-                    info!(self.logger, "incoming reconfigure request: `{:?}`", config);
+                Some(_) = self.controller_rx.recv() => {}
 
-                    let current_block_height = self.block_height();
-                    let config_height = config.height;
-                    if config_height > current_block_height {
-                        self.core.mut_store().update_consensus_config(config).await;
-                        self.maybe_pending_conf_change();
-                    } else {
-                        warn!(
-                            self.logger,
-                            "ignoring reconfigure request with lower height";
-                            "current_block_height" => current_block_height,
-                            "reconfigure_height" => config.height,
-                        );
-                    }
-                }
                 // raft msg from remote peers
                 Some(raft_msg) = self.peer_rx.recv() => {
                     if let Err(e) = self.core.step(raft_msg) {
                         error!(self.logger, "step raft msg failed: `{}`", e);
                     }
-                }
-            }
-
-            //if incoming config change at vec[1], means it only contains AddNode type changes,;if voters already contain them, ignore it
-            if self.is_leader() && !self.pending_conf_change.is_empty() {
-                let incoming_conf_change = self.pending_conf_change.last().unwrap();
-                let current_peers: HashSet<u64> = self
-                    .core
-                    .store()
-                    .get_conf_state()
-                    .voters
-                    .iter()
-                    .copied()
-                    .collect();
-                if self.pending_conf_change.len() == 2
-                    && incoming_conf_change
-                        .changes
-                        .iter()
-                        .all(|c| current_peers.contains(&c.node_id))
-                {
-                    self.pending_conf_change.pop();
                 }
             }
 
@@ -601,9 +556,10 @@ impl Peer {
         // Apply the snapshot.
         if *ready.snapshot() != Snapshot::default() {
             let s = ready.snapshot().clone();
-            if let Err(e) = self.core.mut_store().apply_snapshot(s).await {
+            if let Err(e) = self.core.mut_store().apply_snapshot(s) {
                 error!(self.logger, "cannot apply snapshot: `{}`", e);
             }
+            self.maybe_pending_conf_change()
         }
 
         self.handle_committed_entries(ready.take_committed_entries())
@@ -611,12 +567,12 @@ impl Peer {
 
         // Persistent raft logs.
         if !ready.entries().is_empty() {
-            self.core.mut_store().append_entries(ready.entries()).await;
+            self.core.mut_store().append_entries(ready.entries());
         }
 
         // Raft HardState changed, and we need to persist it.
         if let Some(hs) = ready.hs() {
-            self.core.mut_store().update_hard_state(hs.clone()).await;
+            self.core.mut_store().update_hard_state(hs.clone());
         }
 
         if !ready.persisted_messages().is_empty() {
@@ -641,9 +597,6 @@ impl Peer {
 
         // Advance the apply index.
         self.core.advance_apply();
-
-        // Maybe compact log file.
-        self.core.mut_store().maybe_compact().await;
     }
 
     async fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) {
@@ -672,7 +625,7 @@ impl Peer {
                                 match self.controller.commit_block(pwp).await {
                                     Ok(config) => {
                                         info!(self.logger, "block committed"; "height" => proposal_height, "data" => proposal_data_hex);
-                                        self.core.mut_store().update_consensus_config(config).await;
+                                        self.core.mut_store().update_consensus_config(config);
                                         self.maybe_pending_conf_change();
                                     }
                                     Err(e) => {
@@ -701,11 +654,10 @@ impl Peer {
                     }
 
                     if proposal_height > self.block_height() {
-                        self.core
-                            .mut_store()
-                            .update_block_height(proposal_height)
-                            .await;
+                        self.core.mut_store().update_block_height(proposal_height);
                     }
+                    self.core.mut_store().advance_applied_index(entry.index);
+                    self.core.mut_store().store_snapshot().await;
                 }
                 // All conf changes are v2.
                 EntryType::EntryConfChange => panic!("unexpected EntryConfChange(V1)"),
@@ -720,15 +672,11 @@ impl Peer {
                         self.logger,
                         "apply config change `{:?}`; now config state is: {:?}", cc, cs
                     );
-                    self.core.mut_store().update_conf_state(cs).await;
+                    self.core.mut_store().update_conf_state(cs);
                     self.pending_conf_change_proposed = false;
+                    self.core.mut_store().advance_applied_index(entry.index);
                 }
             }
-
-            self.core
-                .mut_store()
-                .advance_applied_index(entry.index)
-                .await;
         }
     }
 
@@ -814,7 +762,7 @@ impl Peer {
         info!(self.logger, "ping_controller..");
         match self.controller.commit_block(pwp).await {
             Ok(config) => {
-                self.core.mut_store().update_consensus_config(config).await;
+                self.core.mut_store().update_consensus_config(config);
                 self.maybe_pending_conf_change();
             }
             Err(e) => {

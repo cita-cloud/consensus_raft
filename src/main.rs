@@ -18,17 +18,15 @@ mod health_check;
 mod peer;
 mod storage;
 mod utils;
-
 use clap::{crate_authors, crate_version, Arg, Command};
+use config::ConsensusServiceConfig;
+use peer::Peer;
 use slog::info;
 use sloggers::file::FileLoggerBuilder;
 use sloggers::terminal::TerminalLoggerBuilder;
 use sloggers::Build as _;
 use std::path::Path;
 use std::path::PathBuf;
-
-use config::ConsensusServiceConfig;
-use peer::Peer;
 use utils::set_panic_handler;
 
 fn main() {
