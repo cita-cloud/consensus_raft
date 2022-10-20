@@ -190,7 +190,7 @@ impl Peer {
         // Recover data from log
         let mut storage = {
             let logger = logger.new(o!("tag" => "storage"));
-            RaftStorage::new(&config.wal_path, logger.clone()).await
+            RaftStorage::new(&config.raft_data_path, logger.clone()).await
         };
 
         // Wait for controller's reconfigure.
@@ -565,9 +565,11 @@ impl Peer {
         self.handle_committed_entries(ready.take_committed_entries())
             .await;
 
-        // Persistent raft logs.
-        if !ready.entries().is_empty() {
-            self.core.mut_store().append_entries(ready.entries());
+        // Persistent raft entry
+        let entries = ready.entries();
+        if !entries.is_empty() {
+            self.core.mut_store().append_entries(entries);
+            self.core.mut_store().persist_entry(entries).await;
         }
 
         // Raft HardState changed, and we need to persist it.
@@ -584,8 +586,7 @@ impl Peer {
 
         // Update commit index.
         if let Some(commit) = light_rd.commit_index() {
-            let store = self.core.mut_store();
-            store.update_committed_index(commit).await;
+            self.core.mut_store().update_committed_index(commit);
         }
 
         // Send out the messages.
@@ -657,7 +658,7 @@ impl Peer {
                         self.core.mut_store().update_block_height(proposal_height);
                     }
                     self.core.mut_store().advance_applied_index(entry.index);
-                    self.core.mut_store().store_snapshot().await;
+                    self.core.mut_store().persist_snapshot().await;
                 }
                 // All conf changes are v2.
                 EntryType::EntryConfChange => panic!("unexpected EntryConfChange(V1)"),

@@ -34,6 +34,7 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
 const RAFT_SNAPSHOT_NAME: &str = "raft-snapshot";
+const RAFT_ENTRY_NAME: &str = "raft-entry";
 
 #[derive(Debug)]
 pub struct RaftStorage {
@@ -42,17 +43,17 @@ pub struct RaftStorage {
     entries: Vec<Entry>,
     applied_index: u64,
     consensus_config: ConsensusConfiguration,
-    snapshot_dir: PathBuf,
+    raft_data_dir: PathBuf,
     logger: Logger,
 }
 
 impl RaftStorage {
-    pub async fn new<P: AsRef<Path>>(snapshot_dir: P, logger: Logger) -> Self {
-        let snapshot_dir = snapshot_dir.as_ref().to_path_buf();
-        if !snapshot_dir.exists() {
-            fs::create_dir_all(&snapshot_dir)
+    pub async fn new<P: AsRef<Path>>(raft_data_path: P, logger: Logger) -> Self {
+        let raft_data_dir = raft_data_path.as_ref().to_path_buf();
+        if !raft_data_dir.exists() {
+            fs::create_dir_all(&raft_data_path)
                 .await
-                .expect("cannot create raft wal log dir");
+                .expect("cannot create raft data dir");
         }
         let mut store = Self {
             raft_state: RaftState::default(),
@@ -60,101 +61,53 @@ impl RaftStorage {
             entries: vec![],
             applied_index: 0,
             consensus_config: Default::default(),
-            snapshot_dir,
+            raft_data_dir,
             logger,
         };
         store.recover_from_snapshot().await;
+        store.recover_entries().await;
         store
     }
 
     async fn recover_from_snapshot(&mut self) {
-        let snapshot_path = self.snapshot_dir.join(RAFT_SNAPSHOT_NAME);
+        let snapshot_path = self.raft_data_dir.join(RAFT_SNAPSHOT_NAME);
         if snapshot_path.exists() {
             let mut file = fs::OpenOptions::new()
                 .read(true)
                 .open(&snapshot_path)
                 .await
                 .unwrap();
-            let mut log_data = vec![];
-            file.read_to_end(&mut log_data).await.unwrap();
-            if !log_data.is_empty() {
-                let snapshot = Snapshot::decode_length_delimited(&mut log_data.as_slice()).unwrap();
+            let mut data = vec![];
+            file.read_to_end(&mut data).await.unwrap();
+            if !data.is_empty() {
+                let snapshot = Snapshot::decode_length_delimited(&mut data.as_slice()).unwrap();
                 self.apply_snapshot(snapshot).unwrap();
                 warn!(self.logger, "recover_from_snapshot");
             }
         }
     }
 
-    // for Storage trait
-    fn initial_state(&self) -> RaftState {
-        self.raft_state.clone()
-    }
-
-    fn first_index(&self) -> u64 {
-        match self.entries.first() {
-            Some(ent) => ent.index,
-            None => self.snapshot_metadata.get_index() + 1,
+    async fn recover_entries(&mut self) {
+        let entry_path = self.raft_data_dir.join(RAFT_ENTRY_NAME);
+        if entry_path.exists() {
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .open(&entry_path)
+                .await
+                .unwrap();
+            let mut data = vec![];
+            file.read_to_end(&mut data).await.unwrap();
+            if !data.is_empty() {
+                let ent = Entry::decode_length_delimited(data.as_slice()).unwrap();
+                if ent.index == self.applied_index + 1 {
+                    self.append_entries(&[ent.clone()]);
+                    warn!(
+                        self.logger,
+                        "recover entry index: {}, applied: {}", ent.index, self.applied_index,
+                    );
+                }
+            }
         }
-    }
-
-    fn last_index(&self) -> u64 {
-        match self.entries.last() {
-            Some(ent) => ent.index,
-            None => self.snapshot_metadata.get_index(),
-        }
-    }
-
-    fn term(&self, idx: u64) -> raft::Result<u64> {
-        if idx == self.snapshot_metadata.index {
-            return Ok(self.snapshot_metadata.term);
-        }
-
-        let offset = self.first_index();
-        if idx < offset {
-            return Ok(self.raft_state.hard_state.term);
-        }
-        if idx > self.last_index() {
-            return Err(raft::Error::Store(StorageError::Unavailable));
-        }
-        Ok(self.entries[(idx - offset) as usize].term)
-    }
-
-    fn entries(&self, low: u64, high: u64, _: impl Into<Option<u64>>) -> raft::Result<Vec<Entry>> {
-        if low < self.first_index() {
-            return Err(raft::Error::Store(StorageError::Compacted));
-        }
-
-        if high > self.last_index() + 1 {
-            panic!(
-                "index out of bound (last: {}, high: {})",
-                self.last_index() + 1,
-                high
-            );
-        }
-
-        let offset = self.entries[0].index;
-        let lo = (low - offset) as usize;
-        let hi = (high - offset) as usize;
-        let ents = self.entries[lo..hi].to_vec();
-        Ok(ents)
-    }
-
-    fn snapshot(&self, request_index: u64) -> raft::Result<Snapshot> {
-        if request_index > self.applied_index {
-            return Err(raft::Error::Store(
-                StorageError::SnapshotTemporarilyUnavailable,
-            ));
-        }
-
-        let mut snapshot = Snapshot::default();
-
-        let meta = snapshot.mut_metadata();
-        meta.index = self.applied_index;
-        meta.term = self.term(self.applied_index).unwrap();
-        meta.set_conf_state(self.raft_state.conf_state.clone());
-        snapshot.set_data(self.consensus_config.encode_to_vec());
-
-        Ok(snapshot)
     }
 
     // for updating raft state
@@ -164,27 +117,28 @@ impl RaftStorage {
             None => return,
         };
 
-        if incoming_index < self.first_index() {
+        if incoming_index < self.first_index().unwrap() {
             panic!(
                 "overwrite compacted raft logs, compacted_index: {}, incoming_index: {}",
-                self.first_index() - 1,
+                self.first_index().unwrap() - 1,
                 incoming_index,
             );
         }
-        if incoming_index > self.last_index() + 1 {
+        if incoming_index > self.last_index().unwrap() + 1 {
             panic!(
                 "raft logs should be continuous, last index: {}, new appended: {}",
-                self.last_index(),
+                self.last_index().unwrap(),
                 incoming_index,
             );
         }
         if entries.iter().any(|e| e.entry_type == 0) {
             let drain = cmp::min(
                 self.entries.len(),
-                (self.applied_index + 1 - self.first_index()) as usize,
+                (self.applied_index + 1 - self.first_index().unwrap()) as usize,
             );
             self.entries.drain(..drain);
         }
+
         self.entries.extend_from_slice(entries);
     }
 
@@ -196,7 +150,7 @@ impl RaftStorage {
         self.raft_state.conf_state = conf_state;
     }
 
-    pub async fn update_committed_index(&mut self, committed_index: u64) {
+    pub fn update_committed_index(&mut self, committed_index: u64) {
         let mut hard_state = self.raft_state.hard_state.clone();
         hard_state.commit = committed_index;
         self.update_hard_state(hard_state);
@@ -240,13 +194,41 @@ impl RaftStorage {
         &self.consensus_config.validators
     }
 
-    pub async fn store_snapshot(&mut self) {
-        if !self.snapshot_dir.exists() {
-            fs::create_dir_all(&self.snapshot_dir)
+    pub async fn persist_entry(&mut self, entries: &[Entry]) {
+        if !self.raft_data_dir.exists() {
+            fs::create_dir_all(&self.raft_data_dir)
                 .await
-                .expect("cannot create raft wal log dir");
+                .expect("cannot create raft data dir");
         }
-        let snapshot_path = self.snapshot_dir.join(RAFT_SNAPSHOT_NAME);
+        let entry_path = self.raft_data_dir.join(RAFT_ENTRY_NAME);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&entry_path)
+            .await
+            .unwrap();
+        let entry = entries
+            .iter()
+            .filter(|&e| e.entry_type == 0)
+            .collect::<Vec<_>>();
+        if !entry.is_empty() {
+            if entry.len() > 1 {
+                warn!(self.logger, "more than one NormalEntry: {:?}", entry);
+            }
+            let mut buf = BytesMut::new();
+            entry[0].encode_length_delimited(&mut buf).unwrap();
+            file.write_all(&buf).await.unwrap();
+        }
+    }
+
+    pub async fn persist_snapshot(&mut self) {
+        if !self.raft_data_dir.exists() {
+            fs::create_dir_all(&self.raft_data_dir)
+                .await
+                .expect("cannot create raft data dir");
+        }
+        let snapshot_path = self.raft_data_dir.join(RAFT_SNAPSHOT_NAME);
         let mut file = fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -258,6 +240,11 @@ impl RaftStorage {
         let mut buf = BytesMut::new();
         snapshot.encode_length_delimited(&mut buf).unwrap();
         file.write_all(&buf).await.unwrap();
+        info!(
+            self.logger,
+            "persisted snapshot index: {}",
+            snapshot.get_metadata().index
+        );
     }
 
     pub fn apply_snapshot(&mut self, mut snapshot: Snapshot) -> Result<(), StorageError> {
@@ -296,32 +283,79 @@ impl RaftStorage {
 
 impl Storage for RaftStorage {
     fn initial_state(&self) -> raft::Result<RaftState> {
-        Ok(self.initial_state())
+        Ok(self.raft_state.clone())
     }
 
     fn first_index(&self) -> raft::Result<u64> {
-        Ok(self.first_index())
+        let first = match self.entries.first() {
+            Some(ent) => ent.index,
+            None => self.snapshot_metadata.get_index() + 1,
+        };
+        Ok(first)
     }
 
     fn last_index(&self) -> raft::Result<u64> {
-        Ok(self.last_index())
+        let last = match self.entries.last() {
+            Some(ent) => ent.index,
+            None => self.snapshot_metadata.get_index(),
+        };
+        Ok(last)
     }
 
     fn term(&self, idx: u64) -> raft::Result<u64> {
-        self.term(idx)
+        if idx == self.snapshot_metadata.index {
+            return Ok(self.snapshot_metadata.term);
+        }
+
+        let offset = self.first_index().unwrap();
+        if idx < offset {
+            return Err(raft::Error::Store(StorageError::Compacted));
+        }
+        if idx > self.last_index().unwrap() {
+            return Err(raft::Error::Store(StorageError::Unavailable));
+        }
+        Ok(self.entries[(idx - offset) as usize].term)
     }
 
-    fn entries(
-        &self,
-        low: u64,
-        high: u64,
-        max_size: impl Into<Option<u64>>,
-    ) -> raft::Result<Vec<Entry>> {
-        self.entries(low, high, max_size)
+    fn entries(&self, low: u64, high: u64, _: impl Into<Option<u64>>) -> raft::Result<Vec<Entry>> {
+        if low < self.first_index().unwrap() {
+            return Err(raft::Error::Store(StorageError::Compacted));
+        }
+
+        if high > self.last_index().unwrap() + 1 {
+            panic!(
+                "index out of bound (last: {}, high: {})",
+                self.last_index().unwrap() + 1,
+                high
+            );
+        }
+
+        let offset = self.entries[0].index;
+        let lo = (low - offset) as usize;
+        let hi = (high - offset) as usize;
+        let ents = self.entries[lo..hi].to_vec();
+        Ok(ents)
     }
 
     fn snapshot(&self, request_index: u64) -> raft::Result<Snapshot> {
-        self.snapshot(request_index)
+        if request_index > self.applied_index {
+            return Err(raft::Error::Store(
+                StorageError::SnapshotTemporarilyUnavailable,
+            ));
+        }
+
+        let mut snapshot = Snapshot::default();
+
+        let meta = snapshot.mut_metadata();
+        meta.index = self.applied_index;
+        meta.term = self
+            .term(self.applied_index)
+            .map_err(|_| self.raft_state.hard_state.term)
+            .unwrap();
+        meta.set_conf_state(self.raft_state.conf_state.clone());
+        snapshot.set_data(self.consensus_config.encode_to_vec());
+
+        Ok(snapshot)
     }
 }
 

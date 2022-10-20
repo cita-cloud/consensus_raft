@@ -40,8 +40,8 @@ pub struct ConsensusServiceConfig {
     pub check_quorum: bool,
     // transfer leader if no receiving valid proposal from controller
     pub transfer_leader_timeout_in_secs: u64,
-    // raft wal log
-    pub wal_path: String,
+    // raft data path
+    pub raft_data_path: String,
     //metrics
     pub enable_metrics: bool,
     pub metrics_port: u16,
@@ -72,8 +72,8 @@ impl Default for ConsensusServiceConfig {
             check_quorum: false,
             // transfer leader if no receiving valid proposal from controller
             transfer_leader_timeout_in_secs: 12,
-            // raft snapshot dir
-            wal_path: "raft-data-dir".into(),
+            // raft data dir
+            raft_data_path: "raft-data-dir".into(),
             //metrics
             enable_metrics: true,
             metrics_port: 60001,

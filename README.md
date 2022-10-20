@@ -113,7 +113,7 @@ or [`Broadcast`](https://github.com/cita-cloud/cita_cloud_proto/blob/master/prot
 
 - **Storage**  
   基于`trait Storage`实现`RaftStorage`
-    - **WalStorage**
+    - **RaftStorage**
 
     ``` 
     impl Storage for RaftStorage {
