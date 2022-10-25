@@ -237,7 +237,7 @@ impl Peer {
             storage.update_consensus_config(trigger_config);
         } else if trigger_config.height < recorded_height {
             warn!(
-                logger, "block height in intial reconfigure is lower than recorded; skip it";
+                logger, "block height in initial reconfigure is lower than recorded; skip it";
                 "reconfigure" => trigger_config.height,
                 "recorded" => recorded_height
             );
@@ -324,7 +324,7 @@ impl Peer {
         let init_timeout = time::sleep(Duration::from_secs(1));
         tokio::pin!(init_timeout);
 
-        // used for transfering leader when we can't get a valid proposal from controller
+        // used for transferring leader when we can't get a valid proposal from controller
         let mut last_time_start_fetching: Option<Instant> = None;
 
         loop {
@@ -467,10 +467,11 @@ impl Peer {
                     && self.pending_proposal.is_some()
                     && self.pending_conf_change.is_empty()
                     && !self.pending_conf_change_proposed
+                    && !self.core.raft.has_pending_conf()
                 {
                     let proposal = self.pending_proposal.as_ref().unwrap();
-                    let epxected_height = self.block_height() + 1;
-                    if proposal.height == epxected_height {
+                    let expected_height = self.block_height() + 1;
+                    if proposal.height == expected_height {
                         // received a valid proposal.
                         last_time_start_fetching.take();
 
@@ -487,7 +488,7 @@ impl Peer {
                             self.logger,
                             "receive a proposal with invalid height, drop it";
                             "proposal height" => proposal.height,
-                            "expect height" => epxected_height,
+                            "expect height" => expected_height,
                         );
                         self.pending_proposal.take();
                     }
@@ -601,7 +602,7 @@ impl Peer {
     }
 
     async fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) {
-        // Fitler out empty entries produced by new elected leaders except EntryConfChangeV2 type, it's used to leave joint consensus
+        // Filter out empty entries produced by new elected leaders except EntryConfChangeV2 type, it's used to leave joint consensus
         for entry in committed_entries.into_iter().filter(|ent| {
             !ent.data.is_empty() || ent.get_entry_type() == EntryType::EntryConfChangeV2
         }) {
@@ -622,7 +623,7 @@ impl Peer {
                                     proposal: Some(proposal),
                                     proof: vec![],
                                 };
-                                info!(self.logger, "commiting proposal..");
+                                info!(self.logger, "committing proposal..");
                                 match self.controller.commit_block(pwp).await {
                                     Ok(config) => {
                                         info!(self.logger, "block committed"; "height" => proposal_height, "data" => proposal_data_hex);
