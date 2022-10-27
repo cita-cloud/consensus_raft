@@ -306,9 +306,11 @@ impl Storage for RaftStorage {
         if idx == self.snapshot_metadata.index {
             return Ok(self.snapshot_metadata.term);
         }
-
         let offset = self.first_index().unwrap();
         if idx < offset {
+            if idx == offset - 1 {
+                return Ok(self.raft_state.hard_state.term);
+            }
             return Err(raft::Error::Store(StorageError::Compacted));
         }
         if idx > self.last_index().unwrap() {
@@ -348,10 +350,10 @@ impl Storage for RaftStorage {
 
         let meta = snapshot.mut_metadata();
         meta.index = self.applied_index;
-        meta.term = self
-            .term(self.applied_index)
-            .map_err(|_| self.raft_state.hard_state.term)
-            .unwrap();
+        meta.term = match self.term(self.applied_index) {
+            Ok(term) => term,
+            Err(_) => self.raft_state.hard_state.term,
+        };
         meta.set_conf_state(self.raft_state.conf_state.clone());
         snapshot.set_data(self.consensus_config.encode_to_vec());
 
