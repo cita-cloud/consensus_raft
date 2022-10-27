@@ -18,7 +18,7 @@ mod health_check;
 mod peer;
 mod storage;
 mod utils;
-use clap::{crate_authors, crate_version, Arg, Command};
+use clap::{crate_authors, crate_version, value_parser, Arg, Command};
 use config::ConsensusServiceConfig;
 use peer::Peer;
 use slog::info;
@@ -37,8 +37,8 @@ fn main() {
                 .short('c')
                 .long("config")
                 .help("specify consensus config file path")
-                .takes_value(true)
-                .validator(|s| s.parse::<PathBuf>())
+                .num_args(1)
+                .value_parser(value_parser!(PathBuf))
                 .default_value("config.toml"),
         )
         .arg(
@@ -52,16 +52,16 @@ fn main() {
                 .help("the log dir. Overrides the config")
                 .short('d')
                 .long("log-dir")
-                .takes_value(true)
-                .validator(|s| s.parse::<PathBuf>()),
+                .num_args(1)
+                .value_parser(value_parser!(PathBuf)),
         )
         .arg(
             Arg::new("log-file-name")
                 .help("the log file name. Overrride the config")
                 .short('f')
                 .long("log-file-name")
-                .takes_value(true)
-                .validator(|s| s.parse::<PathBuf>()),
+                .num_args(1)
+                .value_parser(value_parser!(PathBuf)),
         );
 
     let app = Command::new("consensus_raft")
@@ -75,21 +75,20 @@ fn main() {
     match matches.subcommand() {
         Some(("run", m)) => {
             let config = {
-                let path = m.value_of("config").unwrap();
-                ConsensusServiceConfig::new(path)
+                let path = m.get_one::<String>("config").unwrap();
+                ConsensusServiceConfig::new(path.as_str())
             };
 
             let log_level = config.log_level.parse().expect("unrecognized log level");
-            let logger = if m.is_present("stdout") || config.log_to_stdout {
+            let logger = if m.contains_id("stdout") || config.log_to_stdout {
                 let mut log_builder = TerminalLoggerBuilder::new();
                 log_builder.level(config.log_level.parse().expect("unrecognized log level"));
                 log_builder.build().expect("can't build terminal logger")
             } else {
                 // File log
                 let log_path = {
-                    let log_dir = Path::new(m.value_of("log-dir").unwrap_or(&config.log_dir));
-                    let log_file_name =
-                        m.value_of("log-file-name").unwrap_or(&config.log_file_name);
+                    let log_dir = Path::new(m.get_one("log-dir").unwrap_or(&config.log_dir));
+                    let log_file_name = m.get_one("log-file-name").unwrap_or(&config.log_file_name);
 
                     if !log_dir.exists() {
                         std::fs::create_dir_all(&log_dir).expect("cannot create log dir");
