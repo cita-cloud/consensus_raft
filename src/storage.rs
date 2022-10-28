@@ -12,12 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cmp;
-use std::convert::TryFrom;
-use std::convert::TryInto;
-use std::path::Path;
-use std::path::PathBuf;
-
+use bytes::BytesMut;
+use cita_cloud_proto::common::ConsensusConfiguration;
+use prost::Message;
 use raft::prelude::ConfState;
 use raft::prelude::Entry;
 use raft::prelude::HardState;
@@ -26,199 +23,37 @@ use raft::prelude::Snapshot;
 use raft::prelude::SnapshotMetadata;
 use raft::prelude::Storage;
 use raft::StorageError;
-
-use prost::Message;
-
-use tokio::fs;
-use tokio::fs::File;
-use tokio::io;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncSeekExt;
-use tokio::io::AsyncWriteExt;
-use tokio::io::SeekFrom;
-
-use bytes::Buf;
-use bytes::BufMut;
-use bytes::BytesMut;
-
-use slog::error;
 use slog::info;
 use slog::warn;
 use slog::Logger;
+use std::cmp;
+use std::path::Path;
+use std::path::PathBuf;
+use tokio::fs;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 
-use thiserror::Error as ThisError;
-
-use cita_cloud_proto::common::ConsensusConfiguration;
-
-const NO_LIMIT: u64 = u64::MAX;
-const WAL_ACTIVE_LOG_NAME: &str = "raft-wal-log.active";
-const WAL_BACKUP_LOG_NAME: &str = "raft-wal-log.backup";
-// Use as a temp file for creating new active log
-// to ensure snapshot in active log is fully written.
-const WAL_TEMP_LOG_NAME: &str = "raft-wal-log.temp";
+const RAFT_SNAPSHOT_NAME: &str = "raft-snapshot";
+const RAFT_ENTRY_NAME: &str = "raft-entry";
 
 #[derive(Debug)]
-struct LogFile {
-    file: File,
-    path: PathBuf,
-}
-
-impl LogFile {
-    async fn create<P: AsRef<Path>>(path: P, max_preserved: u64) -> Result<Self, io::Error> {
-        preserve_path(&path, max_preserved).await;
-        let file = fs::OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .await?;
-
-        Ok(Self {
-            file,
-            path: path.as_ref().to_path_buf(),
-        })
-    }
-
-    async fn create_truncated<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .await?;
-
-        Ok(Self {
-            file,
-            path: path.as_ref().to_path_buf(),
-        })
-    }
-
-    async fn open<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
-        let path = path.as_ref().to_path_buf();
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .await?;
-
-        Ok(Self { file, path })
-    }
-
-    async fn rename_to(&mut self, file_name: &str, max_preserved: u64) {
-        let new_path = self.path.with_file_name(file_name);
-        preserve_path(&new_path, max_preserved).await;
-        fs::rename(&self.path, &new_path).await.unwrap();
-        self.path = new_path;
-    }
-
-    async fn flush(&mut self) {
-        self.file.flush().await.unwrap()
-    }
-
-    async fn write_all(&mut self, src: &[u8]) {
-        self.file.write_all(src).await.unwrap();
-    }
-
-    #[allow(unused)]
-    async fn seek(&mut self, pos: SeekFrom) {
-        self.file.seek(pos).await.unwrap();
-    }
-
-    async fn len(&self) -> u64 {
-        let metadata = self.file.metadata().await.unwrap();
-        metadata.len()
-    }
-
-    async fn set_len(&mut self, len: u64) {
-        self.file.set_len(len).await.unwrap();
-    }
-
-    async fn read_to_end(&mut self, buf: &mut Vec<u8>) {
-        self.file.read_to_end(buf).await.unwrap();
-    }
-
-    fn file_name(&self) -> String {
-        self.path.file_name().unwrap().to_string_lossy().to_string()
-    }
-}
-
-#[repr(u8)]
-#[derive(Debug)]
-enum WalOpType {
-    UpdateHardState = 1,
-    UpdateConfState = 2,
-    ApplySnapshot = 3,
-    AppendEntries = 4,
-    AdvanceAppliedIndex = 5,
-
-    UpdateBlockHeight = 6,
-    UpdateConsensusConfig = 7,
-}
-
-#[derive(ThisError, Debug)]
-enum DecodeLogError {
-    #[error("provide log data is insufficient")]
-    InsufficientData,
-    #[error("can't parse wal-op type, data may be corrupted")]
-    CorruptedWalOpType,
-    #[error("can't parse wal-op data, data may be corrupted, error: `{0}`")]
-    CorruptedWalData(#[from] prost::DecodeError),
-}
-
-impl TryFrom<u8> for WalOpType {
-    type Error = DecodeLogError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        let ty = match value {
-            1 => Self::UpdateHardState,
-            2 => Self::UpdateConfState,
-            3 => Self::ApplySnapshot,
-            4 => Self::AppendEntries,
-            5 => Self::AdvanceAppliedIndex,
-            6 => Self::UpdateBlockHeight,
-            7 => Self::UpdateConsensusConfig,
-            _ => return Err(DecodeLogError::CorruptedWalOpType),
-        };
-        Ok(ty)
-    }
-}
-
-#[derive(Debug)]
-struct WalStorageCore {
+pub struct RaftStorage {
     raft_state: RaftState,
     snapshot_metadata: SnapshotMetadata,
-
     entries: Vec<Entry>,
     applied_index: u64,
-
-    // It's the state
     consensus_config: ConsensusConfiguration,
-
-    // Storage
-    log_dir: PathBuf,
-    active_log: Option<LogFile>,
-    compact_limit: u64,
-    // raft-log.backup, raft-log.1.backup, ... , raft-log.${max_preserved}.backup
-    max_preserved: u64,
-
-    // slog logger
+    raft_data_dir: PathBuf,
     logger: Logger,
 }
 
-impl WalStorageCore {
-    async fn new<P: AsRef<Path>>(
-        log_dir: P,
-        compact_limit: u64,
-        max_preserved: u64,
-        allow_corrupt_log_tail: bool,
-        logger: Logger,
-    ) -> Self {
-        let log_dir = log_dir.as_ref().to_path_buf();
-        if !log_dir.exists() {
-            fs::create_dir_all(&log_dir)
+impl RaftStorage {
+    pub async fn new<P: AsRef<Path>>(raft_data_path: P, logger: Logger) -> Self {
+        let raft_data_dir = raft_data_path.as_ref().to_path_buf();
+        if !raft_data_dir.exists() {
+            fs::create_dir_all(&raft_data_path)
                 .await
-                .expect("cannot create raft wal log dir");
+                .expect("cannot create raft data dir");
         }
         let mut store = Self {
             raft_state: RaftState::default(),
@@ -226,316 +61,196 @@ impl WalStorageCore {
             entries: vec![],
             applied_index: 0,
             consensus_config: Default::default(),
-            log_dir,
-            active_log: None,
-            compact_limit,
-            max_preserved,
+            raft_data_dir,
             logger,
         };
-
-        let active_path = store.log_dir.join(WAL_ACTIVE_LOG_NAME);
-        if active_path.exists() {
-            info!(store.logger, "recover from active_path.");
-            let mut active_log = LogFile::open(active_path).await.unwrap();
-            // Active log may have corrupt log tail.
-            store
-                .recover_from_log(&mut active_log, allow_corrupt_log_tail)
-                .await;
-            store.active_log.replace(active_log);
-        } else {
-            let backup_path = store.log_dir.join(WAL_BACKUP_LOG_NAME);
-            if backup_path.exists() {
-                info!(store.logger, "recover from backup_path.");
-                let mut bakcup_log = LogFile::open(backup_path).await.unwrap();
-                // Backup log should not contains corrupt data.
-                store.recover_from_log(&mut bakcup_log, false).await;
-            } else {
-                info!(store.logger, "create a new wal log set.");
-            }
-            store.generate_new_active_log().await;
-        }
+        store.recover_from_snapshot().await;
+        store.recover_entries().await;
         store
     }
 
-    fn initial_state(&self) -> RaftState {
-        self.raft_state.clone()
-    }
-
-    fn first_index(&self) -> u64 {
-        match self.entries.first() {
-            Some(ent) => ent.index,
-            None => self.snapshot_metadata.get_index() + 1,
+    async fn recover_from_snapshot(&mut self) {
+        let snapshot_path = self.raft_data_dir.join(RAFT_SNAPSHOT_NAME);
+        if snapshot_path.exists() {
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .open(&snapshot_path)
+                .await
+                .unwrap();
+            let mut data = vec![];
+            file.read_to_end(&mut data).await.unwrap();
+            if !data.is_empty() {
+                let snapshot = Snapshot::decode_length_delimited(&mut data.as_slice()).unwrap();
+                self.apply_snapshot(snapshot).unwrap();
+                warn!(self.logger, "recover_from_snapshot");
+            }
         }
     }
 
-    fn last_index(&self) -> u64 {
-        match self.entries.last() {
-            Some(ent) => ent.index,
-            None => self.snapshot_metadata.get_index(),
-        }
-    }
-
-    fn term(&self, idx: u64) -> raft::Result<u64> {
-        if idx == self.snapshot_metadata.index {
-            return Ok(self.snapshot_metadata.term);
-        }
-
-        let offset = self.first_index();
-        if idx < offset {
-            return Err(raft::Error::Store(StorageError::Compacted));
-        }
-
-        if idx > self.last_index() {
-            return Err(raft::Error::Store(StorageError::Unavailable));
-        }
-        Ok(self.entries[(idx - offset) as usize].term)
-    }
-
-    fn entries(
-        &self,
-        low: u64,
-        high: u64,
-        max_size: impl Into<Option<u64>>,
-    ) -> raft::Result<Vec<Entry>> {
-        let max_size = max_size.into();
-        if low < self.first_index() {
-            return Err(raft::Error::Store(StorageError::Compacted));
-        }
-
-        if high > self.last_index() + 1 {
-            panic!(
-                "index out of bound (last: {}, high: {})",
-                self.last_index() + 1,
-                high
-            );
-        }
-
-        let offset = self.entries[0].index;
-        let lo = (low - offset) as usize;
-        let hi = (high - offset) as usize;
-        let mut ents = self.entries[lo..hi].to_vec();
-        limit_size(&mut ents, max_size);
-        Ok(ents)
-    }
-
-    async fn recover_from_log(&mut self, log_file: &mut LogFile, allow_corrupt_log_tail: bool) {
-        let mut log_data = vec![];
-        log_file.read_to_end(&mut log_data).await;
-
-        if log_data.is_empty() {
-            return;
-        }
-
-        let mut processing_buf = log_data.as_slice();
-        let mut processed = 0usize;
-        while processed < log_data.len() {
-            match self.recover_one(processing_buf) {
-                Ok(consumed) => {
-                    processed += consumed;
-                    processing_buf.advance(consumed);
-                }
-                Err(e) => {
-                    error!(self.logger, "recover wal log failed: {}", e);
-                    if allow_corrupt_log_tail {
-                        error!(
-                            self.logger,
-                            "raft log is corrupted at {}, total {} bytes",
-                            processed,
-                            log_data.len()
-                        );
-                        error!(self.logger, "truncate and backup active log");
-
-                        // backup corrupt data
-                        let backup_path = self.log_dir.join("corrupt-raft-log.backup");
-                        let mut backup_file = LogFile::create(backup_path, self.max_preserved)
-                            .await
-                            .unwrap();
-                        backup_file.write_all(log_data.as_mut_slice()).await;
-                        backup_file.flush().await;
-
-                        // truncate corrupt data
-                        log_file.set_len(processed as u64).await;
-                    } else {
-                        let err_msg = format!("log file `{}` is corrupt", log_file.file_name());
-                        error!(self.logger, "{}", err_msg);
-                        panic!("{}", err_msg);
-                    }
-
-                    return;
+    async fn recover_entries(&mut self) {
+        let entry_path = self.raft_data_dir.join(RAFT_ENTRY_NAME);
+        if entry_path.exists() {
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .open(&entry_path)
+                .await
+                .unwrap();
+            let mut data = vec![];
+            file.read_to_end(&mut data).await.unwrap();
+            if !data.is_empty() {
+                let ent = Entry::decode_length_delimited(data.as_slice()).unwrap();
+                if ent.index == self.applied_index + 1 {
+                    self.append_entries(&[ent.clone()]);
+                    warn!(
+                        self.logger,
+                        "recover entry index: {}, applied: {}", ent.index, self.applied_index,
+                    );
                 }
             }
         }
     }
 
-    fn recover_one(&mut self, mut log_data: &[u8]) -> Result<usize, DecodeLogError> {
-        let remaining = log_data.remaining();
-        if remaining == 0 {
-            return Err(DecodeLogError::InsufficientData);
-        }
-
-        let ty: WalOpType = log_data.get_u8().try_into()?;
-
-        use WalOpType::*;
-        match ty {
-            UpdateHardState => {
-                let hard_state = HardState::decode_length_delimited(&mut log_data)?;
-                self.update_hard_state(hard_state);
-            }
-            UpdateConfState => {
-                let conf_state = ConfState::decode_length_delimited(&mut log_data)?;
-                self.update_conf_state(conf_state);
-            }
-            ApplySnapshot => {
-                let snapshot = Snapshot::decode_length_delimited(&mut log_data)?;
-                let _ = self.apply_snapshot(snapshot);
-            }
-            AppendEntries => {
-                let cnt = prost::decode_length_delimiter(&mut log_data)?;
-                let mut entries = Vec::with_capacity(cnt);
-                for _ in 0..cnt {
-                    let ent = Entry::decode_length_delimited(&mut log_data)?;
-                    entries.push(ent);
-                }
-                self.append_entries(&entries);
-            }
-
-            AdvanceAppliedIndex => {
-                let applied_index = {
-                    if log_data.remaining() < std::mem::size_of::<u64>() {
-                        return Err(DecodeLogError::InsufficientData);
-                    }
-                    log_data.get_u64()
-                };
-                self.advance_applied_index(applied_index);
-            }
-
-            UpdateBlockHeight => {
-                let h = {
-                    if log_data.remaining() < std::mem::size_of::<u64>() {
-                        return Err(DecodeLogError::InsufficientData);
-                    }
-                    log_data.get_u64()
-                };
-                self.update_block_height(h);
-            }
-            UpdateConsensusConfig => {
-                let config = ConsensusConfiguration::decode_length_delimited(&mut log_data)?;
-                self.update_consensus_config(config);
-            }
-        }
-        let consumed = remaining - log_data.remaining();
-        Ok(consumed)
-    }
-
-    // wal operations on storage
-
-    fn append_entries(&mut self, entries: &[Entry]) {
+    // for updating raft state
+    pub fn append_entries(&mut self, entries: &[Entry]) {
         let incoming_index = match entries.first() {
             Some(ent) => ent.index,
             None => return,
         };
 
-        if incoming_index < self.first_index() {
+        if incoming_index < self.first_index().unwrap() {
             panic!(
                 "overwrite compacted raft logs, compacted_index: {}, incoming_index: {}",
-                self.first_index() - 1,
+                self.first_index().unwrap() - 1,
                 incoming_index,
             );
         }
-
-        if incoming_index > self.last_index() + 1 {
+        if incoming_index > self.last_index().unwrap() + 1 {
             panic!(
                 "raft logs should be continuous, last index: {}, new appended: {}",
-                self.last_index(),
+                self.last_index().unwrap(),
                 incoming_index,
             );
         }
+        if entries.iter().any(|e| e.entry_type == 0) {
+            let drain = cmp::min(
+                self.entries.len(),
+                (self.applied_index + 1 - self.first_index().unwrap()) as usize,
+            );
+            self.entries.drain(..drain);
+        }
 
-        let offset = incoming_index - self.first_index();
-        self.entries.truncate(offset as usize);
         self.entries.extend_from_slice(entries);
     }
 
-    async fn log_append_entries(&mut self, entries: &[Entry]) {
-        let mut buf = BytesMut::new();
-        buf.put_u8(WalOpType::AppendEntries as u8);
-
-        let length = entries.len();
-        prost::encode_length_delimiter(length, &mut buf).unwrap();
-
-        for ent in entries {
-            ent.encode_length_delimited(&mut buf).unwrap();
-        }
-        self.mut_active_log().write_all(&buf).await;
-    }
-
-    // ----
-
-    fn update_hard_state(&mut self, hard_state: HardState) {
+    pub fn update_hard_state(&mut self, hard_state: HardState) {
         self.raft_state.hard_state = hard_state;
     }
 
-    async fn log_update_hard_state(&mut self, hard_state: &HardState) {
-        let mut buf = BytesMut::new();
-        buf.put_u8(WalOpType::UpdateHardState as u8);
-        hard_state.encode_length_delimited(&mut buf).unwrap();
-        self.mut_active_log().write_all(&buf).await;
-    }
-
-    // ----
-
-    fn update_conf_state(&mut self, conf_state: ConfState) {
+    pub fn update_conf_state(&mut self, conf_state: ConfState) {
         self.raft_state.conf_state = conf_state;
     }
 
-    async fn log_update_conf_state(&mut self, conf_state: &ConfState) {
-        let mut buf = BytesMut::new();
-        buf.put_u8(WalOpType::UpdateConfState as u8);
-        conf_state.encode_length_delimited(&mut buf).unwrap();
-        self.mut_active_log().write_all(&buf).await;
+    pub fn update_committed_index(&mut self, committed_index: u64) {
+        let mut hard_state = self.raft_state.hard_state.clone();
+        hard_state.commit = committed_index;
+        self.update_hard_state(hard_state);
     }
 
-    // ----
-
-    fn advance_applied_index(&mut self, applied_index: u64) {
+    pub fn advance_applied_index(&mut self, applied_index: u64) {
         self.applied_index = applied_index;
     }
 
-    async fn log_advance_applied_index(&mut self, applied_index: u64) {
-        let mut buf = BytesMut::new();
-        buf.put_u8(WalOpType::AdvanceAppliedIndex as u8);
-        buf.put_u64(applied_index);
-        self.mut_active_log().write_all(&buf).await;
+    pub fn update_block_height(&mut self, h: u64) {
+        self.consensus_config.height = h;
     }
 
-    // ----
+    pub fn update_consensus_config(&mut self, config: ConsensusConfiguration) {
+        self.consensus_config = config;
+    }
 
-    fn snapshot(&self, request_index: u64) -> raft::Result<Snapshot> {
-        if request_index > self.applied_index {
-            return Err(raft::Error::Store(
-                StorageError::SnapshotTemporarilyUnavailable,
-            ));
+    // functions
+    pub fn is_initialized(&self) -> bool {
+        self.raft_state.conf_state != ConfState::default()
+            || self.raft_state.hard_state != HardState::default()
+    }
+
+    pub fn get_applied_index(&self) -> u64 {
+        self.applied_index
+    }
+
+    pub fn get_conf_state(&self) -> &ConfState {
+        &self.raft_state.conf_state
+    }
+
+    pub fn get_block_height(&self) -> u64 {
+        self.consensus_config.height
+    }
+
+    pub fn get_block_interval(&self) -> u32 {
+        self.consensus_config.block_interval
+    }
+
+    pub fn get_validators(&self) -> &[Vec<u8>] {
+        &self.consensus_config.validators
+    }
+
+    pub async fn persist_entry(&mut self, entries: &[Entry]) {
+        if !self.raft_data_dir.exists() {
+            fs::create_dir_all(&self.raft_data_dir)
+                .await
+                .expect("cannot create raft data dir");
         }
-
-        let mut snapshot = Snapshot::default();
-
-        let meta = snapshot.mut_metadata();
-        meta.index = self.applied_index;
-        meta.term = self.term(self.applied_index).unwrap();
-        meta.set_conf_state(self.raft_state.conf_state.clone());
-
-        snapshot.set_data(self.consensus_config.encode_to_vec());
-
-        Ok(snapshot)
+        let entry_path = self.raft_data_dir.join(RAFT_ENTRY_NAME);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&entry_path)
+            .await
+            .unwrap();
+        let entry = entries
+            .iter()
+            .filter(|&e| e.entry_type == 0)
+            .collect::<Vec<_>>();
+        if !entry.is_empty() {
+            if entry.len() > 1 {
+                warn!(self.logger, "more than one NormalEntry: {:?}", entry);
+            }
+            let mut buf = BytesMut::new();
+            entry[0].encode_length_delimited(&mut buf).unwrap();
+            file.write_all(&buf).await.unwrap();
+        }
     }
 
-    fn apply_snapshot(&mut self, mut snapshot: Snapshot) -> Result<(), StorageError> {
+    pub async fn persist_snapshot(&mut self) {
+        if !self.raft_data_dir.exists() {
+            fs::create_dir_all(&self.raft_data_dir)
+                .await
+                .expect("cannot create raft data dir");
+        }
+        let snapshot_path = self.raft_data_dir.join(RAFT_SNAPSHOT_NAME);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&snapshot_path)
+            .await
+            .unwrap();
+        let snapshot = self.snapshot(self.applied_index).unwrap();
+        let mut buf = BytesMut::new();
+        snapshot.encode_length_delimited(&mut buf).unwrap();
+        file.write_all(&buf).await.unwrap();
+        info!(
+            self.logger,
+            "persisted snapshot index: {}",
+            snapshot.get_metadata().index
+        );
+    }
+
+    pub fn apply_snapshot(&mut self, mut snapshot: Snapshot) -> Result<(), StorageError> {
         let mut meta = snapshot.take_metadata();
         let index = meta.index;
 
-        // We allow snapshot to at least as old as the existing snapshot.
-        // This may occur when creating a new active log without new applied entry
-        // than the one in snapshot.
         if self.snapshot_metadata.get_index() > index {
             warn!(
                 self.logger,
@@ -548,331 +263,110 @@ impl WalStorageCore {
 
         self.consensus_config = ConsensusConfiguration::decode(snapshot.data.as_slice())
             .expect("decode snapshot data failed");
-
         self.snapshot_metadata = meta.clone();
-
         self.raft_state.hard_state.term = cmp::max(self.raft_state.hard_state.term, meta.term);
-        // This snapshot may be produced by this peer and is used for compact.
-        // In this case, index is the applied index, which may be less than committed index.
         self.raft_state.hard_state.commit = cmp::max(self.raft_state.hard_state.commit, index);
-
         self.applied_index = index;
-
-        // +1 for exclusive end
-        let compacted = cmp::min(
-            self.entries.len(),
-            (index + 1 - self.first_index()) as usize,
-        );
-        self.entries.drain(..compacted);
-
-        // Update conf states.
         self.raft_state.conf_state = meta.take_conf_state();
 
-        info!(self.logger, "Restore snapshot");
+        self.entries.clear();
 
+        info!(
+            self.logger,
+            "apply_snapshot index: {} conf_state: {:?}",
+            self.applied_index,
+            self.raft_state.conf_state
+        );
         Ok(())
     }
-
-    async fn log_apply_snapshot(&mut self, snapshot: &Snapshot) {
-        let mut buf = BytesMut::new();
-        buf.put_u8(WalOpType::ApplySnapshot as u8);
-        snapshot.encode_length_delimited(&mut buf).unwrap();
-        self.mut_active_log().write_all(&buf).await;
-    }
-
-    // ----
-
-    fn update_block_height(&mut self, h: u64) {
-        self.consensus_config.height = h;
-    }
-
-    async fn log_update_block_height(&mut self, h: u64) {
-        let mut buf = BytesMut::new();
-        buf.put_u8(WalOpType::UpdateBlockHeight as u8);
-        buf.put_u64(h);
-        self.mut_active_log().write_all(&buf).await;
-    }
-
-    // ----
-
-    fn update_consensus_config(&mut self, config: ConsensusConfiguration) {
-        self.consensus_config = config;
-    }
-
-    async fn log_update_consensus_config(&mut self, config: &ConsensusConfiguration) {
-        let mut buf = BytesMut::new();
-        buf.put_u8(WalOpType::UpdateConsensusConfig as u8);
-        config.encode_length_delimited(&mut buf).unwrap();
-        self.mut_active_log().write_all(&buf).await;
-    }
-
-    // ----
-
-    // This is also used for log compaction.
-    async fn generate_new_active_log(&mut self) {
-        if let Some(mut old_log) = self.active_log.take() {
-            old_log.flush().await;
-            old_log
-                .rename_to(WAL_BACKUP_LOG_NAME, self.max_preserved)
-                .await;
-        }
-
-        let temp_log_path = self.log_dir.join(WAL_TEMP_LOG_NAME);
-        self.active_log
-            .replace(LogFile::create_truncated(temp_log_path).await.unwrap());
-
-        let snapshot = self.snapshot(self.applied_index).unwrap();
-        self.log_apply_snapshot(&snapshot).await;
-        // to compact log
-        self.apply_snapshot(snapshot).unwrap();
-
-        // This is used for update committed index, because the snapshot only contains applied index.
-        self.log_update_hard_state(&self.raft_state.hard_state.clone())
-            .await;
-
-        // TODO: clone due to borrow checker, maybe remove it.
-        // Persist unapplied entries.
-        self.log_append_entries(&self.entries.clone()).await;
-
-        let max_preserved = self.max_preserved;
-        let acitve_log = self.mut_active_log();
-        acitve_log.flush().await;
-        acitve_log
-            .rename_to(WAL_ACTIVE_LOG_NAME, max_preserved)
-            .await;
-    }
-
-    // panic if active log is none
-    fn active_log(&self) -> &LogFile {
-        self.active_log.as_ref().unwrap()
-    }
-
-    // panic if active log is none
-    fn mut_active_log(&mut self) -> &mut LogFile {
-        self.active_log.as_mut().unwrap()
-    }
-
-    async fn flush(&mut self) {
-        self.mut_active_log().flush().await;
-    }
-
-    async fn maybe_compact(&mut self) {
-        // 0 means don't compact
-        if self.compact_limit > 0 && self.active_log().len().await > self.compact_limit {
-            self.generate_new_active_log().await;
-        }
-    }
 }
 
-#[derive(Debug)]
-pub struct WalStorage(WalStorageCore);
-
-// The public interface, the WAL operations.
-impl WalStorage {
-    pub async fn new<P: AsRef<Path>>(
-        log_dir: P,
-        compact_limit: u64,
-        max_preserved: u64,
-        allow_corrupt_log_tail: bool,
-        logger: Logger,
-    ) -> Self {
-        let core = WalStorageCore::new(
-            log_dir,
-            compact_limit,
-            max_preserved,
-            allow_corrupt_log_tail,
-            logger,
-        )
-        .await;
-        WalStorage(core)
-    }
-
-    pub fn is_initialized(&self) -> bool {
-        self.0.raft_state.conf_state != ConfState::default()
-            || self.0.raft_state.hard_state != HardState::default()
-    }
-
-    pub fn get_applied_index(&self) -> u64 {
-        self.0.applied_index
-    }
-
-    pub fn get_conf_state(&self) -> &ConfState {
-        &self.0.raft_state.conf_state
-    }
-
-    pub fn get_block_height(&self) -> u64 {
-        self.0.consensus_config.height
-    }
-
-    pub fn get_block_interval(&self) -> u32 {
-        self.0.consensus_config.block_interval
-    }
-
-    pub fn get_validators(&self) -> &[Vec<u8>] {
-        &self.0.consensus_config.validators
-    }
-
-    pub async fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<(), StorageError> {
-        self.0.log_apply_snapshot(&snapshot).await;
-        self.0.flush().await;
-        self.0.apply_snapshot(snapshot)
-    }
-
-    pub async fn append_entries(&mut self, entries: &[Entry]) {
-        self.0.log_append_entries(entries).await;
-        self.0.flush().await;
-        self.0.append_entries(entries);
-    }
-
-    pub async fn update_conf_state(&mut self, conf_state: ConfState) {
-        self.0.log_update_conf_state(&conf_state).await;
-        self.0.flush().await;
-        self.0.update_conf_state(conf_state);
-    }
-
-    pub async fn update_hard_state(&mut self, hard_state: HardState) {
-        self.0.log_update_hard_state(&hard_state).await;
-        self.0.flush().await;
-        self.0.update_hard_state(hard_state);
-    }
-
-    pub async fn update_committed_index(&mut self, committed_index: u64) {
-        let mut hard_state = self.0.raft_state.hard_state.clone();
-        hard_state.commit = committed_index;
-        self.update_hard_state(hard_state).await;
-    }
-
-    pub async fn advance_applied_index(&mut self, applied_index: u64) {
-        self.0.log_advance_applied_index(applied_index).await;
-        self.0.flush().await;
-        self.0.advance_applied_index(applied_index);
-    }
-
-    pub async fn update_block_height(&mut self, h: u64) {
-        self.0.log_update_block_height(h).await;
-        self.0.flush().await;
-        self.0.update_block_height(h);
-    }
-
-    pub async fn update_consensus_config(&mut self, config: ConsensusConfiguration) {
-        self.0.log_update_consensus_config(&config).await;
-        self.0.flush().await;
-        self.0.update_consensus_config(config);
-    }
-
-    pub async fn maybe_compact(&mut self) {
-        self.0.maybe_compact().await;
-    }
-}
-
-impl Storage for WalStorage {
+impl Storage for RaftStorage {
     fn initial_state(&self) -> raft::Result<RaftState> {
-        Ok(self.0.initial_state())
+        Ok(self.raft_state.clone())
     }
 
     fn first_index(&self) -> raft::Result<u64> {
-        Ok(self.0.first_index())
+        let first = match self.entries.first() {
+            Some(ent) => ent.index,
+            None => self.snapshot_metadata.get_index() + 1,
+        };
+        Ok(first)
     }
 
     fn last_index(&self) -> raft::Result<u64> {
-        Ok(self.0.last_index())
+        let last = match self.entries.last() {
+            Some(ent) => ent.index,
+            None => self.snapshot_metadata.get_index(),
+        };
+        Ok(last)
     }
 
     fn term(&self, idx: u64) -> raft::Result<u64> {
-        self.0.term(idx)
+        if idx == self.snapshot_metadata.index {
+            return Ok(self.snapshot_metadata.term);
+        }
+        let offset = self.first_index().unwrap();
+        if idx < offset {
+            if idx == offset - 1 {
+                return Ok(self.raft_state.hard_state.term);
+            }
+            return Err(raft::Error::Store(StorageError::Compacted));
+        }
+        if idx > self.last_index().unwrap() {
+            return Err(raft::Error::Store(StorageError::Unavailable));
+        }
+        Ok(self.entries[(idx - offset) as usize].term)
     }
 
-    fn entries(
-        &self,
-        low: u64,
-        high: u64,
-        max_size: impl Into<Option<u64>>,
-    ) -> raft::Result<Vec<Entry>> {
-        self.0.entries(low, high, max_size)
+    fn entries(&self, low: u64, high: u64, _: impl Into<Option<u64>>) -> raft::Result<Vec<Entry>> {
+        if low < self.first_index().unwrap() {
+            return Err(raft::Error::Store(StorageError::Compacted));
+        }
+
+        if high > self.last_index().unwrap() + 1 {
+            panic!(
+                "index out of bound (last: {}, high: {})",
+                self.last_index().unwrap() + 1,
+                high
+            );
+        }
+
+        let offset = self.entries[0].index;
+        let lo = (low - offset) as usize;
+        let hi = (high - offset) as usize;
+        let ents = self.entries[lo..hi].to_vec();
+        Ok(ents)
     }
 
     fn snapshot(&self, request_index: u64) -> raft::Result<Snapshot> {
-        self.0.snapshot(request_index)
-    }
-}
-
-fn limit_size<T: Message + Clone>(entries: &mut Vec<T>, max: Option<u64>) {
-    if entries.len() <= 1 {
-        return;
-    }
-    let max = match max {
-        None | Some(NO_LIMIT) => return,
-        Some(max) => max,
-    };
-
-    let mut size = 0;
-    let limit = entries
-        .iter()
-        .take_while(|&e| {
-            // This clippy suggestion introduces a *BUG* which wastes me a day!!!
-            #[allow(clippy::branches_sharing_code)]
-            if size == 0 {
-                size += e.encoded_len() as u64;
-                true
-            } else {
-                size += e.encoded_len() as u64;
-                size <= max
-            }
-        })
-        .count();
-
-    entries.truncate(limit);
-}
-
-// Get the next log path.
-fn next_log_path<P: AsRef<Path>>(log_path: P) -> PathBuf {
-    let buf = log_path.as_ref().to_path_buf();
-    let log_name = buf.file_name().unwrap().to_string_lossy();
-    let log_name_components = log_name.split_terminator('.').collect::<Vec<_>>();
-    let next_log_name = match log_name_components.as_slice() {
-        [base_name, count, ext] => {
-            let count = count.parse::<u64>().unwrap();
-            format!("{}.{}.{}", base_name, count + 1, ext)
+        if request_index > self.applied_index {
+            return Err(raft::Error::Store(
+                StorageError::SnapshotTemporarilyUnavailable,
+            ));
         }
-        [base_name, ext] => {
-            format!("{}.{}.{}", base_name, 1, ext)
-        }
-        unexpected => {
-            panic!("unexpected log name: {}", unexpected.join("."))
-        }
-    };
-    buf.with_file_name(next_log_name)
-}
 
-// Rename the path if exists.
-// Examples:
-// raft-log.backup -> raft-log.1.backup -> raft-log.2.bakcup -> ... -> raft-log.${max_preserved}.backup
-async fn preserve_path<P: AsRef<Path>>(path: P, max_preserved: u64) {
-    // Do recursion manually due to async-fn's limitation.
-    let mut current = path.as_ref().to_path_buf();
-    let mut stack: Vec<PathBuf> = vec![];
+        let mut snapshot = Snapshot::default();
 
-    while current.exists() && (stack.len() as u64) < max_preserved {
-        stack.push(current.clone());
-        let next = next_log_path(current);
-        current = next;
-    }
-    while let Some(prev) = stack.pop() {
-        fs::rename(&prev, current).await.unwrap();
-        current = prev;
+        let meta = snapshot.mut_metadata();
+        meta.index = self.applied_index;
+        meta.term = match self.term(self.applied_index) {
+            Ok(term) => term,
+            Err(_) => self.raft_state.hard_state.term,
+        };
+        meta.set_conf_state(self.raft_state.conf_state.clone());
+        snapshot.set_data(self.consensus_config.encode_to_vec());
+
+        Ok(snapshot)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
-    use std::ffi::OsString;
     use tempfile::tempdir;
 
-    const MAX_TEST_LOG_FILE_PRESERVED: u64 = 5;
-
-    async fn new_store<P: AsRef<Path>>(log_dir: &P) -> WalStorage {
+    async fn new_store<P: AsRef<Path>>(log_dir: &P) -> RaftStorage {
         let logger = {
             use sloggers::file::FileLoggerBuilder;
             use sloggers::types::Severity;
@@ -884,7 +378,7 @@ mod tests {
             log_builder.level(log_level);
             log_builder.build().expect("can't build terminal logger")
         };
-        WalStorage::new(log_dir, 0, MAX_TEST_LOG_FILE_PRESERVED, true, logger).await
+        RaftStorage::new(log_dir, logger).await
     }
 
     fn entry(term: u64, index: u64) -> Entry {
@@ -896,136 +390,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_preserve_path() {
-        test_preserve_path_with_cnt(0).await;
-        test_preserve_path_with_cnt(1).await;
-        test_preserve_path_with_cnt(2).await;
-        test_preserve_path_with_cnt(11).await;
-    }
-
-    async fn test_preserve_path_with_cnt(dup_cnt: usize) {
-        let dir = tempdir().unwrap();
-
-        for _ in 0..dup_cnt {
-            let log_path = {
-                let mut buf = dir.as_ref().to_path_buf();
-                buf.push("test-raft-log.backup");
-                buf
-            };
-            // Path preservation is triggered here.
-            let _ = LogFile::create(log_path, MAX_TEST_LOG_FILE_PRESERVED)
-                .await
-                .unwrap();
-        }
-
-        let expected = {
-            let mut log_set = HashSet::<OsString>::new();
-            for i in 0..cmp::min(dup_cnt as u64, MAX_TEST_LOG_FILE_PRESERVED + 1) {
-                if i == 0 {
-                    log_set.insert("test-raft-log.backup".into());
-                } else {
-                    log_set.insert(format!("test-raft-log.{}.backup", i).into());
-                }
-            }
-            log_set
-        };
-
-        let got = {
-            let mut log_set = HashSet::<OsString>::new();
-            let mut it = fs::read_dir(&dir).await.unwrap();
-            while let Ok(Some(ent)) = it.next_entry().await {
-                log_set.insert(ent.file_name());
-            }
-            log_set
-        };
-
-        assert_eq!(got, expected);
-    }
-
-    #[tokio::test]
-    async fn test_rewrite_entries() {
-        let log_dir = tempdir().unwrap();
-        let mut store = new_store(&log_dir).await;
-
-        store
-            .append_entries(&[entry(1, 1), entry(1, 2), entry(1, 3)])
-            .await;
-        store
-            .append_entries(&[entry(2, 2), entry(2, 3), entry(2, 4)])
-            .await;
-
-        let expect_entries = [entry(1, 1), entry(2, 2), entry(2, 3), entry(2, 4)];
-
-        // before and after recovery
-        assert_eq!(store.0.entries, &expect_entries);
-        store = new_store(&log_dir).await;
-        assert_eq!(store.0.entries, &expect_entries);
-    }
-
-    #[tokio::test]
     async fn test_advance_applied_index() {
         let log_dir = tempdir().unwrap();
         let mut store = new_store(&log_dir).await;
-
-        store.advance_applied_index(42).await;
-
-        assert_eq!(store.0.applied_index, 42);
-        store = new_store(&log_dir).await;
-        assert_eq!(store.0.applied_index, 42);
+        store.advance_applied_index(42);
+        assert_eq!(store.applied_index, 42);
     }
 
     #[tokio::test]
     async fn test_update_conf_state() {
         let log_dir = tempdir().unwrap();
         let mut store = new_store(&log_dir).await;
-
         let conf_state = ConfState {
             voters: vec![1, 2, 3],
             learners: vec![5, 6, 7],
             ..Default::default()
         };
-        store.update_conf_state(conf_state.clone()).await;
-
-        assert_eq!(store.0.raft_state.conf_state, conf_state);
-        store = new_store(&log_dir).await;
-        assert_eq!(store.0.raft_state.conf_state, conf_state);
+        store.update_conf_state(conf_state.clone());
+        assert_eq!(store.raft_state.conf_state, conf_state);
     }
 
     #[tokio::test]
     async fn test_update_hard_state() {
         let log_dir = tempdir().unwrap();
         let mut store = new_store(&log_dir).await;
-
         let hard_state = HardState {
             term: 3,
             commit: 5,
             vote: 1,
         };
-        store.update_hard_state(hard_state.clone()).await;
-
-        assert_eq!(store.0.raft_state.hard_state, hard_state);
-        store = new_store(&log_dir).await;
-        assert_eq!(store.0.raft_state.hard_state, hard_state);
+        store.update_hard_state(hard_state.clone());
+        assert_eq!(store.raft_state.hard_state, hard_state);
     }
 
     #[tokio::test]
     async fn test_update_consensus_config() {
         let log_dir = tempdir().unwrap();
         let mut store = new_store(&log_dir).await;
-
         let consensus_config = ConsensusConfiguration {
             height: 1024,
             block_interval: 9,
             validators: vec![b"1234".to_vec(), b"5678".to_vec()],
         };
-
-        store
-            .update_consensus_config(consensus_config.clone())
-            .await;
-
-        assert_eq!(store.0.consensus_config, consensus_config);
-        store = new_store(&log_dir).await;
-        assert_eq!(store.0.consensus_config, consensus_config);
+        store.update_consensus_config(consensus_config.clone());
+        assert_eq!(store.consensus_config, consensus_config);
     }
 
     #[tokio::test]
@@ -1034,243 +442,45 @@ mod tests {
         let mut store = new_store(&log_dir).await;
 
         let snapshot = store.snapshot(0).unwrap();
-        store.apply_snapshot(snapshot).await.unwrap();
+        store.apply_snapshot(snapshot).unwrap();
         store = new_store(&log_dir).await;
-        assert!(store.0.entries.is_empty());
-        assert_eq!(store.0.raft_state.hard_state, HardState::default());
-        assert_eq!(store.0.raft_state.conf_state, ConfState::default());
+        assert!(store.entries.is_empty());
+        assert_eq!(store.raft_state.hard_state, HardState::default());
+        assert_eq!(store.raft_state.conf_state, ConfState::default());
         assert_eq!(
-            store.0.snapshot_metadata,
+            store.snapshot_metadata,
             SnapshotMetadata {
-                conf_state: Some(ConfState::default()),
+                conf_state: None,
                 index: 0,
                 term: 0,
             }
         );
-        assert_eq!(store.0.applied_index, 0);
-    }
-
-    #[tokio::test]
-    async fn test_outdated_snapshot() {
-        let log_dir = tempdir().unwrap();
-        let mut store = new_store(&log_dir).await;
-
-        store.append_entries(&[entry(1, 1), entry(1, 2)]).await;
-        store.advance_applied_index(2).await;
-
-        let mut snapshot = store.snapshot(0).unwrap();
-        store.apply_snapshot(snapshot.clone()).await.unwrap();
-
-        snapshot.mut_metadata().index = 1;
-        assert_eq!(
-            store.apply_snapshot(snapshot).await,
-            Err(StorageError::SnapshotOutOfDate)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_snapshot_preserve_uncommitted_entries() {
-        let log_dir = tempdir().unwrap();
-        let mut store = new_store(&log_dir).await;
-
-        let hard_state = HardState {
-            term: 1,
-            commit: 1,
-            vote: 1,
-        };
-        store.update_hard_state(hard_state.clone()).await;
-
-        let conf_state = ConfState {
-            voters: vec![1, 2, 3],
-            ..Default::default()
-        };
-        store.update_conf_state(conf_state.clone()).await;
-
-        store
-            .append_entries(&[entry(1, 1), entry(1, 2), entry(1, 3)])
-            .await;
-
-        let applied_index = 3;
-        store.advance_applied_index(applied_index).await;
-
-        store.append_entries(&[entry(1, 4), entry(1, 5)]).await;
-
-        assert_eq!(
-            store.0.entries,
-            &[
-                entry(1, 1),
-                entry(1, 2),
-                entry(1, 3),
-                entry(1, 4),
-                entry(1, 5),
-            ]
-        );
-
-        let snapshot = store.snapshot(3).unwrap();
-        store.apply_snapshot(snapshot).await.unwrap();
-
-        assert_eq!(store.0.entries, &[entry(1, 4), entry(1, 5),]);
-
-        store = new_store(&log_dir).await;
-
-        assert_eq!(store.0.entries, &[entry(1, 4), entry(1, 5),]);
+        assert_eq!(store.applied_index, 0);
     }
 
     #[tokio::test]
     async fn test_snapshot_committed_higher_than_applied() {
         let log_dir = tempdir().unwrap();
         let mut store = new_store(&log_dir).await;
-
-        store
-            .append_entries(&[
-                entry(1, 1),
-                entry(2, 2),
-                entry(2, 3),
-                entry(2, 4),
-                entry(3, 5),
-            ])
-            .await;
-
-        store
-            .update_hard_state(HardState {
-                term: 3,
-                vote: 0,
-                commit: 5,
-            })
-            .await;
-
-        store.advance_applied_index(3).await;
-
+        store.append_entries(&[
+            entry(1, 1),
+            entry(2, 2),
+            entry(2, 3),
+            entry(2, 4),
+            entry(3, 5),
+        ]);
+        store.update_hard_state(HardState {
+            term: 3,
+            vote: 0,
+            commit: 5,
+        });
+        store.advance_applied_index(3);
         let snapshot = store.snapshot(3).unwrap();
-        store.apply_snapshot(snapshot).await.unwrap();
-
+        // apply_snapshot will clear entries
+        store.apply_snapshot(snapshot).unwrap();
         // This commit index should not shrink to 3.
-        assert_eq!(store.0.raft_state.hard_state.commit, 5);
-        assert_eq!(store.0.raft_state.hard_state.term, 3);
-        assert_eq!(store.0.entries, &[entry(2, 4), entry(3, 5)]);
-    }
-
-    #[tokio::test]
-    async fn test_recover_from_active_log() {
-        test_recover_from_log(false).await;
-    }
-
-    #[tokio::test]
-    async fn test_recover_from_backup_log() {
-        test_recover_from_log(true).await;
-    }
-
-    async fn test_recover_from_log(from_backup: bool) {
-        let log_dir = tempdir().unwrap();
-        let mut store = new_store(&log_dir).await;
-
-        store
-            .append_entries(&[entry(1, 1), entry(2, 2), entry(2, 3)])
-            .await;
-        store.append_entries(&[entry(2, 4), entry(3, 5)]).await;
-
-        store
-            .update_hard_state(HardState {
-                term: 3,
-                vote: 0,
-                commit: 5,
-            })
-            .await;
-
-        store.advance_applied_index(3).await;
-
-        store.0.generate_new_active_log().await;
-
-        assert_eq!(&store.0.entries, &[entry(2, 4), entry(3, 5),]);
-        assert_eq!(store.0.applied_index, 3);
-        assert_eq!(store.0.raft_state.hard_state.commit, 5);
-        assert_eq!(store.0.raft_state.hard_state.term, 3);
-
-        if from_backup {
-            // Remove current active log file to force recover from backup log.
-            fs::remove_file(log_dir.as_ref().join(WAL_ACTIVE_LOG_NAME))
-                .await
-                .unwrap();
-        }
-
-        store = new_store(&log_dir).await;
-
-        assert_eq!(&store.0.entries, &[entry(2, 4), entry(3, 5),]);
-        assert_eq!(store.0.applied_index, 3);
-        assert_eq!(store.0.raft_state.hard_state.commit, 5);
-        assert_eq!(store.0.raft_state.hard_state.term, 3);
-    }
-
-    #[tokio::test]
-    #[should_panic]
-    async fn test_panic_backup_log_corrupt() {
-        let log_dir = tempdir().unwrap();
-        let mut store = new_store(&log_dir).await;
-
-        store
-            .append_entries(&[entry(1, 1), entry(1, 2), entry(1, 3)])
-            .await;
-
-        store.advance_applied_index(2).await;
-
-        store.0.generate_new_active_log().await;
-
-        assert_eq!(&store.0.entries, &[entry(1, 3),]);
-        assert_eq!(store.0.applied_index, 2);
-
-        // Remove current active log file to force recover from backup log.
-        fs::remove_file(log_dir.as_ref().join(WAL_ACTIVE_LOG_NAME))
-            .await
-            .unwrap();
-
-        let mut backup_log = LogFile::open(log_dir.as_ref().join(WAL_BACKUP_LOG_NAME))
-            .await
-            .unwrap();
-        backup_log.seek(SeekFrom::End(0)).await;
-        backup_log.write_all(&[255]).await;
-
-        // Should panic here
-        let _ = new_store(&log_dir).await;
-    }
-
-    #[tokio::test]
-    async fn test_allow_active_log_corrupt_tail() {
-        let log_dir = tempdir().unwrap();
-        let mut store = new_store(&log_dir).await;
-        store
-            .append_entries(&[entry(1, 1), entry(1, 2), entry(1, 3)])
-            .await;
-
-        store.advance_applied_index(1).await;
-
-        let corrupt_pos = store.0.active_log.as_ref().unwrap().len().await;
-
-        store.advance_applied_index(2).await;
-
-        let active_log = store.0.mut_active_log();
-        active_log.seek(SeekFrom::Start(corrupt_pos)).await;
-        active_log.write_all(&[255]).await;
-
-        store = new_store(&log_dir).await;
-
-        assert_eq!(&store.0.entries, &[entry(1, 1), entry(1, 2), entry(1, 3)]);
-        assert_eq!(store.0.applied_index, 1);
-    }
-
-    #[tokio::test]
-    async fn test_maybe_compact() {
-        let log_dir = tempdir().unwrap();
-        let mut store = new_store(&log_dir).await;
-        store.0.compact_limit = 1;
-        store.append_entries(&[entry(1, 1), entry(1, 2)]).await;
-        store.advance_applied_index(1).await;
-        store.maybe_compact().await;
-
-        assert!(log_dir.as_ref().join(WAL_ACTIVE_LOG_NAME).exists());
-        assert!(log_dir.as_ref().join(WAL_BACKUP_LOG_NAME).exists());
-
-        store = new_store(&log_dir).await;
-        assert_eq!(&store.0.entries, &[entry(1, 2)]);
-        assert_eq!(store.0.applied_index, 1);
+        assert_eq!(store.raft_state.hard_state.commit, 5);
+        assert_eq!(store.raft_state.hard_state.term, 3);
+        assert_eq!(store.entries, &[]);
     }
 }

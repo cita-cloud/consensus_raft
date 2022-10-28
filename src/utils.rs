@@ -1,10 +1,8 @@
-use std::panic::{self, PanicInfo};
-use std::thread;
-
+use backtrace::Backtrace;
 use slog::error;
 use slog::Logger;
-
-use backtrace::Backtrace;
+use std::panic::{self, PanicInfo};
+use std::thread;
 
 // This is a very hacky way to map node address to peer_id.
 // Because raft needs an id of integer type, but only
