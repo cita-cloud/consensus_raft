@@ -18,7 +18,7 @@ mod health_check;
 mod peer;
 mod storage;
 mod utils;
-use clap::{crate_authors, crate_version, value_parser, Arg, Command};
+use clap::{crate_authors, crate_version, value_parser, Arg, ArgAction, Command};
 use config::ConsensusServiceConfig;
 use peer::Peer;
 use slog::info;
@@ -37,7 +37,6 @@ fn main() {
                 .short('c')
                 .long("config")
                 .help("specify consensus config file path")
-                .num_args(1)
                 .value_parser(value_parser!(PathBuf))
                 .default_value("config.toml"),
         )
@@ -45,6 +44,7 @@ fn main() {
             Arg::new("stdout")
                 .help("if specified, log to stdout. Overrides the config")
                 .long("stdout")
+                .action(ArgAction::SetTrue)
                 .conflicts_with_all(&["log-dir", "log-file-name"]),
         )
         .arg(
@@ -52,7 +52,6 @@ fn main() {
                 .help("the log dir. Overrides the config")
                 .short('d')
                 .long("log-dir")
-                .num_args(1)
                 .value_parser(value_parser!(PathBuf)),
         )
         .arg(
@@ -60,7 +59,6 @@ fn main() {
                 .help("the log file name. Overrride the config")
                 .short('f')
                 .long("log-file-name")
-                .num_args(1)
                 .value_parser(value_parser!(PathBuf)),
         );
 
