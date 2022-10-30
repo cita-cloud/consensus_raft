@@ -73,8 +73,8 @@ fn main() {
     match matches.subcommand() {
         Some(("run", m)) => {
             let config = {
-                let path = m.get_one::<String>("config").unwrap();
-                ConsensusServiceConfig::new(path.as_str())
+                let path = m.get_one::<PathBuf>("config").unwrap();
+                ConsensusServiceConfig::new(path.as_path().to_str().unwrap())
             };
 
             let log_level = config.log_level.parse().expect("unrecognized log level");
@@ -85,8 +85,14 @@ fn main() {
             } else {
                 // File log
                 let log_path = {
-                    let log_dir = Path::new(m.get_one("log-dir").unwrap_or(&config.log_dir));
-                    let log_file_name = m.get_one("log-file-name").unwrap_or(&config.log_file_name);
+                    let log_dir = m
+                        .get_one::<PathBuf>("log-dir")
+                        .map(|p| p.as_path())
+                        .unwrap_or_else(|| Path::new(&config.log_dir));
+                    let log_file_name = m
+                        .get_one::<PathBuf>("log-file-name")
+                        .map(|p| p.as_path())
+                        .unwrap_or_else(|| Path::new(&config.log_file_name));
 
                     if !log_dir.exists() {
                         std::fs::create_dir_all(&log_dir).expect("cannot create log dir");
