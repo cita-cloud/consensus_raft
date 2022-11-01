@@ -78,7 +78,7 @@ fn main() {
             };
 
             let log_level = config.log_level.parse().expect("unrecognized log level");
-            let logger = if m.contains_id("stdout") || config.log_to_stdout {
+            let logger = if m.get_one::<bool>("stdout").copied().unwrap() || config.log_to_stdout {
                 let mut log_builder = TerminalLoggerBuilder::new();
                 log_builder.level(config.log_level.parse().expect("unrecognized log level"));
                 log_builder.build().expect("can't build terminal logger")
