@@ -560,6 +560,7 @@ impl Peer {
             if let Err(e) = self.core.mut_store().apply_snapshot(s) {
                 error!(self.logger, "cannot apply snapshot: `{}`", e);
             }
+            self.core.mut_store().persist_snapshot().await;
             self.maybe_pending_conf_change()
         }
 
