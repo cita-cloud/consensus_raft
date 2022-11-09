@@ -45,7 +45,7 @@ fn main() {
                 .help("if specified, log to stdout. Overrides the config")
                 .long("stdout")
                 .action(ArgAction::SetTrue)
-                .conflicts_with_all(&["log-dir", "log-file-name"]),
+                .conflicts_with_all(["log-dir", "log-file-name"]),
         )
         .arg(
             Arg::new("log-dir")
@@ -95,7 +95,7 @@ fn main() {
                         .unwrap_or_else(|| Path::new(&config.log_file_name));
 
                     if !log_dir.exists() {
-                        std::fs::create_dir_all(&log_dir).expect("cannot create log dir");
+                        std::fs::create_dir_all(log_dir).expect("cannot create log dir");
                     }
                     log_dir.join(log_file_name)
                 };
