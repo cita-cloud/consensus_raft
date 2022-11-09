@@ -95,7 +95,7 @@ pub struct Network(Arc<Inner>);
 impl Deref for Network {
     type Target = Inner;
     fn deref(&self) -> &Self::Target {
-        &*self.0
+        &self.0
     }
 }
 
