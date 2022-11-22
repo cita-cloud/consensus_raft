@@ -22,8 +22,8 @@ bytes = "1.2"
 backtrace = "0.3"
 tower = "0.4.13"
 
-cita_cloud_proto = { git = "https://github.com/cita-cloud/cita_cloud_proto" }
-cloud-util = { git = "https://github.com/cita-cloud/cloud-util" }
+cloud-util = { package = "cloud-util", git = "https://github.com/cita-cloud/cloud-common-rs.git" }
+cita_cloud_proto = { package = "cita_cloud_proto", git = "https://github.com/cita-cloud/cloud-common-rs.git" }
 
 [dev-dependencies]
 tempfile = "3.3"
