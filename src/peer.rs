@@ -95,6 +95,42 @@ pub struct Peer {
 }
 
 impl Peer {
+    // return wants_campaign and is_validator
+    fn update_config(
+        trigger_config: &ConsensusConfiguration,
+        node_addr: &[u8],
+        storage: &mut RaftStorage,
+    ) -> (bool, bool) {
+        if let Some(index) = trigger_config
+            .validators
+            .iter()
+            .position(|addr| addr == node_addr)
+        {
+            let mut wants_campaign = false;
+            if !storage.is_initialized() {
+                let snapshot = {
+                    let voters = trigger_config
+                        .validators
+                        .iter()
+                        .map(|addr| addr_to_peer_id(addr))
+                        .collect();
+
+                    // We start with index 5 and term 5
+                    let mut s = Snapshot::default();
+                    s.mut_metadata().index = 5;
+                    s.mut_metadata().term = 5;
+                    s.mut_metadata().mut_conf_state().voters = voters;
+                    s
+                };
+                storage.apply_snapshot(snapshot).unwrap();
+                wants_campaign = index == 0;
+            }
+            (wants_campaign, true)
+        } else {
+            (false, false)
+        }
+    }
+
     pub async fn setup(config: ConsensusServiceConfig, logger: Logger) -> Self {
         let node_addr = {
             let s = &config.node_addr;
@@ -196,37 +232,47 @@ impl Peer {
         // Wait for controller's reconfigure.
         info!(logger, "waiting for `reconfigure` from controller..");
         let (wants_campaign, trigger_config) = loop {
-            let trigger_config = controller_rx.recv().await.unwrap();
-            if let Some(index) = trigger_config
-                .validators
-                .iter()
-                .position(|addr| addr == &node_addr)
-            {
-                let mut wants_compaign = false;
-                if !storage.is_initialized() {
-                    let snapshot = {
-                        let voters = trigger_config
-                            .validators
-                            .iter()
-                            .map(|addr| addr_to_peer_id(addr))
-                            .collect();
-
-                        // We start with index 5 and term 5
-                        let mut s = Snapshot::default();
-                        s.mut_metadata().index = 5;
-                        s.mut_metadata().term = 5;
-                        s.mut_metadata().mut_conf_state().voters = voters;
-                        s
-                    };
-                    storage.apply_snapshot(snapshot).unwrap();
-                    wants_compaign = index == 0;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            match controller_rx.try_recv() {
+                Ok(trigger_config) => {
+                    let (wants_campaign, is_validator) =
+                        Self::update_config(&trigger_config, &node_addr, &mut storage);
+                    if is_validator {
+                        break (wants_campaign, trigger_config);
+                    } else {
+                        info!(
+                            logger,
+                            "incoming config doesn't contain this node, wait for next one"
+                        );
+                    }
                 }
-                break (wants_compaign, trigger_config);
-            } else {
-                info!(
-                    logger,
-                    "incoming config doesn't contain this node, wait for next one"
-                );
+                Err(_) => {
+                    let pwp = ProposalWithProof {
+                        proposal: Some(Proposal {
+                            height: u64::MAX,
+                            data: vec![],
+                        }),
+                        proof: vec![],
+                    };
+                    info!(logger, "ping_controller..");
+                    match controller.commit_block(pwp).await {
+                        Ok(config) => {
+                            let (wants_campaign, is_validator) =
+                                Self::update_config(&config, &node_addr, &mut storage);
+                            if is_validator {
+                                break (wants_campaign, config);
+                            } else {
+                                info!(
+                                    logger,
+                                    "incoming config doesn't contain this node, wait for next one"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(logger, "commit block failed: {}", e);
+                        }
+                    }
+                }
             }
         };
 
@@ -320,28 +366,11 @@ impl Peer {
         let fetching_timeout = time::sleep(Duration::from_secs(0));
         tokio::pin!(fetching_timeout);
 
-        // ping controller
-        let init_timeout = time::sleep(Duration::from_secs(1));
-        tokio::pin!(init_timeout);
-
         // used for transferring leader when we can't get a valid proposal from controller
         let mut last_time_start_fetching: Option<Instant> = None;
 
         loop {
             tokio::select! {
-                // ping controller
-                _ = &mut init_timeout => {
-                    if self.core.mut_store().get_validators().is_empty() {
-                        self.ping_controller().await;
-                        init_timeout
-                            .as_mut()
-                            .reset(time::Instant::now() + Duration::from_secs(1));
-                    } else {
-                        init_timeout
-                            .as_mut()
-                            .reset(time::Instant::now() + Duration::from_secs(0xdeadbeef));
-                    }
-                }
                 // timing
                 _ = &mut tick_timeout => {
                     self.core.tick();
@@ -752,25 +781,5 @@ impl Peer {
             self.pending_conf_change = vec![];
         }
         self.pending_conf_change_proposed = false;
-    }
-
-    async fn ping_controller(&mut self) {
-        let pwp = ProposalWithProof {
-            proposal: Some(Proposal {
-                height: u64::MAX,
-                data: vec![],
-            }),
-            proof: vec![],
-        };
-        info!(self.logger, "ping_controller..");
-        match self.controller.commit_block(pwp).await {
-            Ok(config) => {
-                self.core.mut_store().update_consensus_config(config);
-                self.maybe_pending_conf_change();
-            }
-            Err(e) => {
-                warn!(self.logger, "commit block failed: {}", e);
-            }
-        }
     }
 }
