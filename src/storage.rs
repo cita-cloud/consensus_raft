@@ -374,7 +374,7 @@ mod tests {
 
             let log_level = Severity::Debug;
             let log_path = log_dir.as_ref().join("raft-test.log");
-            let mut log_builder = FileLoggerBuilder::new(&log_path);
+            let mut log_builder = FileLoggerBuilder::new(log_path);
             log_builder.level(log_level);
             log_builder.build().expect("can't build terminal logger")
         };
