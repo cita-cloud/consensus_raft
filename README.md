@@ -12,20 +12,18 @@ docker build -t citacloud/consensus_raft .
 
 ```
 $ consensus -h
-consensus_raft 6.6.0
+consensus 6.6.3
 Rivtower Technologies <contact@rivtower.com>
-Consensus service for CITA-Cloud
 
-USAGE:
-    consensus [SUBCOMMAND]
+Usage: consensus [COMMAND]
 
-OPTIONS:
-    -h, --help       Print help information
-    -V, --version    Print version information
+Commands:
+  run   run the service
+  help  Print this message or the help of the given subcommand(s)
 
-SUBCOMMANDS:
-    help    Print this message or the help of the given subcommand(s)
-    run     run the service
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
 ```
 
 ### consensus-run

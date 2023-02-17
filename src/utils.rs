@@ -65,6 +65,13 @@ fn panic_hook(info: &PanicInfo, logger: &Logger) {
     error!(logger, "{}", error);
 }
 
+pub fn clap_about() -> String {
+    let name = env!("CARGO_PKG_NAME").to_string();
+    let version = env!("CARGO_PKG_VERSION");
+    let authors = env!("CARGO_PKG_AUTHORS");
+    name + " " + version + "\n" + authors
+}
+
 #[cfg(test)]
 mod tests {
     use super::addr_to_peer_id;
