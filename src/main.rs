@@ -18,6 +18,7 @@ mod health_check;
 mod peer;
 mod storage;
 mod utils;
+
 use clap::{crate_authors, crate_version, value_parser, Arg, ArgAction, Command};
 use config::ConsensusServiceConfig;
 use peer::Peer;
@@ -27,7 +28,7 @@ use sloggers::terminal::TerminalLoggerBuilder;
 use sloggers::Build as _;
 use std::path::Path;
 use std::path::PathBuf;
-use utils::set_panic_handler;
+use utils::{clap_about, set_panic_handler};
 
 fn main() {
     let run_cmd = Command::new("run")
@@ -65,7 +66,7 @@ fn main() {
     let app = Command::new("consensus_raft")
         .author(crate_authors!())
         .version(crate_version!())
-        .about("Consensus service for CITA-Cloud")
+        .about(clap_about())
         .subcommands([run_cmd]);
 
     let matches = app.get_matches();
