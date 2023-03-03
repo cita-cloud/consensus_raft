@@ -36,10 +36,8 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(port: u16, logger: Logger) -> Self {
-        let client_options = ClientOptions::new(
-            CLIENT_NAME.to_string(),
-            format!("http://127.0.0.1:{}", port),
-        );
+        let client_options =
+            ClientOptions::new(CLIENT_NAME.to_string(), format!("http://127.0.0.1:{port}"));
         let client = match client_options.connect_controller() {
             Ok(retry_client) => retry_client,
             Err(e) => panic!("client init error: {:?}", &e),
@@ -59,7 +57,7 @@ impl Controller {
         {
             Ok(proposal)
         } else {
-            Err(tonic::Status::internal(format!("bad resp: {:?}", resp)))
+            Err(tonic::Status::internal(format!("bad resp: {resp:?}")))
         }
     }
 
@@ -84,7 +82,7 @@ impl Controller {
         {
             Ok(config)
         } else {
-            Err(tonic::Status::internal(format!("bad resp: {:?}", resp)))
+            Err(tonic::Status::internal(format!("bad resp: {resp:?}")))
         }
     }
 }
@@ -144,7 +142,7 @@ impl Inner {
     ) -> Self {
         let client_options = ClientOptions::new(
             CLIENT_NAME.to_string(),
-            format!("http://127.0.0.1:{}", network_port),
+            format!("http://127.0.0.1:{network_port}"),
         );
         let client = match client_options.connect_network() {
             Ok(retry_client) => retry_client,

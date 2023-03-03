@@ -189,7 +189,7 @@ impl Peer {
         if layer.is_some() {
             tokio::spawn(async move {
                 info!(logger_cloned, "metrics on");
-                let addr = format!("127.0.0.1:{}", grpc_listen_port).parse().unwrap();
+                let addr = format!("127.0.0.1:{grpc_listen_port}").parse().unwrap();
                 let res = Server::builder()
                     .layer(layer.unwrap())
                     .add_service(ConsensusServiceServer::new(raft_svc))
@@ -207,7 +207,7 @@ impl Peer {
         } else {
             tokio::spawn(async move {
                 info!(logger_cloned, "metrics off");
-                let addr = format!("127.0.0.1:{}", grpc_listen_port).parse().unwrap();
+                let addr = format!("127.0.0.1:{grpc_listen_port}").parse().unwrap();
                 let res = Server::builder()
                     .add_service(ConsensusServiceServer::new(raft_svc))
                     .add_service(NetworkMsgHandlerServiceServer::new(network_svc))
@@ -632,62 +632,62 @@ impl Peer {
     }
 
     async fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) {
-        // Filter out empty entries produced by new elected leaders except EntryConfChangeV2 type, it's used to leave joint consensus
-        for entry in committed_entries.into_iter().filter(|ent| {
-            !ent.data.is_empty() || ent.get_entry_type() == EntryType::EntryConfChangeV2
-        }) {
+        for entry in committed_entries.into_iter() {
             match entry.get_entry_type() {
                 EntryType::EntryNormal => {
-                    let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
-                    let proposal_height = proposal.height;
-                    let proposal_data_hex = &short_hex(&proposal.data);
-                    let current_height = self.block_height();
-                    if proposal_height <= current_height {
-                        info!(self.logger, "proposal height less than or equal current block height, don't check proposal"; "proposal_height" => proposal_height, "current_height" => current_height);
-                    } else {
-                        info!(self.logger, "checking proposal.."; "height" => proposal_height, "data" => proposal_data_hex);
+                    if !entry.data.is_empty() {
+                        let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
+                        let proposal_height = proposal.height;
+                        let proposal_data_hex = &short_hex(&proposal.data);
+                        let current_height = self.block_height();
+                        if proposal_height <= current_height {
+                            info!(self.logger, "proposal height less than or equal current block height, don't check proposal"; "proposal_height" => proposal_height, "current_height" => current_height);
+                        } else {
+                            info!(self.logger, "checking proposal.."; "height" => proposal_height, "data" => proposal_data_hex);
 
-                        match self.controller.check_proposal(proposal.clone()).await {
-                            Ok(true) => {
-                                let pwp = ProposalWithProof {
-                                    proposal: Some(proposal),
-                                    proof: vec![],
-                                };
-                                info!(self.logger, "committing proposal..");
-                                match self.controller.commit_block(pwp).await {
-                                    Ok(config) => {
-                                        info!(self.logger, "block committed"; "height" => proposal_height, "data" => proposal_data_hex);
-                                        self.core.mut_store().update_consensus_config(config);
-                                        self.maybe_pending_conf_change();
-                                    }
-                                    Err(e) => {
-                                        warn!(self.logger, "commit block failed: {}", e);
+                            match self.controller.check_proposal(proposal.clone()).await {
+                                Ok(true) => {
+                                    let pwp = ProposalWithProof {
+                                        proposal: Some(proposal),
+                                        proof: vec![],
+                                    };
+                                    info!(self.logger, "committing proposal..");
+                                    match self.controller.commit_block(pwp).await {
+                                        Ok(config) => {
+                                            info!(self.logger, "block committed"; "height" => proposal_height, "data" => proposal_data_hex);
+                                            self.core.mut_store().update_consensus_config(config);
+                                            self.maybe_pending_conf_change();
+                                        }
+                                        Err(e) => {
+                                            warn!(self.logger, "commit block failed: {}", e);
+                                        }
                                     }
                                 }
+                                Ok(false) => warn!(
+                                    self.logger,
+                                    "check proposal failed, controller replies a false"
+                                ),
+                                Err(e) => warn!(self.logger, "check proposal failed: {}", e),
                             }
-                            Ok(false) => warn!(
-                                self.logger,
-                                "check proposal failed, controller replies a false"
-                            ),
-                            Err(e) => warn!(self.logger, "check proposal failed: {}", e),
+                        }
+
+                        if let Some(pending) = self.pending_proposal.as_ref() {
+                            if pending.height <= proposal_height {
+                                debug!(self.logger, "pending proposal removed");
+                                self.pending_proposal.take();
+                            } else {
+                                debug!(
+                                    self.logger, "pending proposal is higher than committed";
+                                    "pending_height" => pending.height, "committed_height" => proposal_height
+                                );
+                            }
+                        }
+
+                        if proposal_height > self.block_height() {
+                            self.core.mut_store().update_block_height(proposal_height);
                         }
                     }
 
-                    if let Some(pending) = self.pending_proposal.as_ref() {
-                        if pending.height <= proposal_height {
-                            debug!(self.logger, "pending proposal removed");
-                            self.pending_proposal.take();
-                        } else {
-                            debug!(
-                                self.logger, "pending proposal is higher than committed";
-                                "pending_height" => pending.height, "committed_height" => proposal_height
-                            );
-                        }
-                    }
-
-                    if proposal_height > self.block_height() {
-                        self.core.mut_store().update_block_height(proposal_height);
-                    }
                     self.core.mut_store().advance_applied_index(entry.index);
                     self.core.mut_store().persist_snapshot().await;
                 }

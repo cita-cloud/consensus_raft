@@ -116,7 +116,12 @@ impl RaftStorage {
             Some(ent) => ent.index,
             None => return,
         };
-
+        if incoming_index <= self.applied_index {
+            panic!(
+                "applied index can't be conflict, applied: {}, incoming_index: {}",
+                self.applied_index, incoming_index,
+            );
+        }
         if incoming_index < self.first_index().unwrap() {
             panic!(
                 "overwrite compacted raft logs, compacted_index: {}, incoming_index: {}",
@@ -126,16 +131,27 @@ impl RaftStorage {
         }
         if incoming_index > self.last_index().unwrap() + 1 {
             panic!(
-                "raft logs should be continuous, last index: {}, new appended: {}",
+                "raft logs should be continuous, last index: {}, incoming_index: {}",
                 self.last_index().unwrap(),
                 incoming_index,
             );
         }
-        if entries.iter().any(|e| e.entry_type == 0) {
-            let drain = cmp::min(
-                self.entries.len(),
-                (self.applied_index + 1 - self.first_index().unwrap()) as usize,
+        // remove conflict entry
+        if incoming_index != self.last_index().unwrap() + 1 {
+            warn!(
+                self.logger,
+                "remove conflict entry, first: {}, last: {}, incoming: {}",
+                self.first_index().unwrap(),
+                self.last_index().unwrap(),
+                incoming_index
             );
+            let drain = (incoming_index - self.first_index().unwrap()) as usize;
+            self.entries.drain(drain..);
+        }
+
+        let applied_count = (self.applied_index + 1 - self.first_index().unwrap()) as usize;
+        if entries.iter().any(|e| e.entry_type == 0) && applied_count > 5 {
+            let drain = applied_count - 5;
             self.entries.drain(..drain);
         }
 
@@ -308,9 +324,6 @@ impl Storage for RaftStorage {
         }
         let offset = self.first_index().unwrap();
         if idx < offset {
-            if idx == offset - 1 {
-                return Ok(self.raft_state.hard_state.term);
-            }
             return Err(raft::Error::Store(StorageError::Compacted));
         }
         if idx > self.last_index().unwrap() {
