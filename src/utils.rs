@@ -30,7 +30,7 @@ pub fn short_hex(data: &[u8]) -> String {
     } else {
         let head = hex::encode(&data[..4]);
         let tail = hex::encode(&data[data.len() - 4..]);
-        format!("{}..{}", head, tail)
+        format!("{head}..{tail}")
     }
 }
 
@@ -55,12 +55,11 @@ fn panic_hook(info: &PanicInfo, logger: &Logger) {
     let backtrace = Backtrace::new();
     let error = format!(
         "\n============================\n\
-         {:?}\n\n\
+         {backtrace:?}\n\n\
          position:\n\
-         Thread {} panicked at {}, {}:{}\n\
+         Thread {name} panicked at {msg}, {file}:{line}\n\
          ============================\n\
-         ",
-        backtrace, name, msg, file, line
+         "
     );
     error!(logger, "{}", error);
 }
