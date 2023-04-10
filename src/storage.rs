@@ -88,6 +88,18 @@ impl RaftStorage {
     }
 
     async fn recover_entries(&mut self) {
+        if let Some(entry) = self.read_persist_entry().await {
+            if entry.index == self.applied_index + 1 {
+                self.append_entries(&[entry.clone()]);
+                warn!(
+                    self.logger,
+                    "recover entry index: {}, applied: {}", entry.index, self.applied_index,
+                );
+            }
+        }
+    }
+
+    pub async fn read_persist_entry(&self) -> Option<Entry> {
         let entry_path = self.raft_data_dir.join(RAFT_ENTRY_NAME);
         if entry_path.exists() {
             let mut file = fs::OpenOptions::new()
@@ -98,15 +110,12 @@ impl RaftStorage {
             let mut data = vec![];
             file.read_to_end(&mut data).await.unwrap();
             if !data.is_empty() {
-                let ent = Entry::decode_length_delimited(data.as_slice()).unwrap();
-                if ent.index == self.applied_index + 1 {
-                    self.append_entries(&[ent.clone()]);
-                    warn!(
-                        self.logger,
-                        "recover entry index: {}, applied: {}", ent.index, self.applied_index,
-                    );
-                }
+                Some(Entry::decode_length_delimited(data.as_slice()).unwrap())
+            } else {
+                None
             }
+        } else {
+            None
         }
     }
 
@@ -226,11 +235,14 @@ impl RaftStorage {
             .unwrap();
         let entry = entries
             .iter()
-            .filter(|&e| e.entry_type == 0)
+            .filter(|&e| e.entry_type == 0 && !e.data.is_empty())
             .collect::<Vec<_>>();
         if !entry.is_empty() {
             if entry.len() > 1 {
-                warn!(self.logger, "more than one NormalEntry: {:?}", entry);
+                warn!(
+                    self.logger,
+                    "more than one not empty NormalEntry: {:?}", entry
+                );
             }
             let mut buf = BytesMut::new();
             entry[0].encode_length_delimited(&mut buf).unwrap();

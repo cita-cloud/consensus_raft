@@ -38,8 +38,6 @@ pub struct ConsensusServiceConfig {
     pub heartbeat_tick: u64,
     pub election_tick: u64,
     pub check_quorum: bool,
-    // transfer leader if no receiving valid proposal from controller
-    pub transfer_leader_timeout_in_secs: u64,
     // raft data path
     pub raft_data_path: String,
     //metrics
@@ -70,8 +68,6 @@ impl Default for ConsensusServiceConfig {
             heartbeat_tick: 15,
             election_tick: 50,
             check_quorum: false,
-            // transfer leader if no receiving valid proposal from controller
-            transfer_leader_timeout_in_secs: 12,
             // raft data dir
             raft_data_path: "raft-data-dir".into(),
             //metrics
