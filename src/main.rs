@@ -20,6 +20,7 @@ mod storage;
 mod utils;
 
 use clap::{crate_authors, crate_version, value_parser, Arg, ArgAction, Command};
+use cloud_util::panic_hook::set_panic_handler;
 use config::ConsensusServiceConfig;
 use peer::Peer;
 use slog::info;
@@ -28,7 +29,7 @@ use sloggers::terminal::TerminalLoggerBuilder;
 use sloggers::Build as _;
 use std::path::Path;
 use std::path::PathBuf;
-use utils::{clap_about, set_panic_handler};
+use utils::clap_about;
 
 fn main() {
     let run_cmd = Command::new("run")
@@ -109,7 +110,7 @@ fn main() {
                 log_builder.build().expect("can't build file logger")
             };
 
-            set_panic_handler(logger.clone());
+            set_panic_handler();
 
             let rt = tokio::runtime::Runtime::new().unwrap();
 
