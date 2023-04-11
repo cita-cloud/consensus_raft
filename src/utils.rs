@@ -1,9 +1,3 @@
-use backtrace::Backtrace;
-use slog::error;
-use slog::Logger;
-use std::panic::{self, PanicInfo};
-use std::thread;
-
 // This is a very hacky way to map node address to peer_id.
 // Because raft needs an id of integer type, but only
 // addresses are provided.
@@ -32,36 +26,6 @@ pub fn short_hex(data: &[u8]) -> String {
         let tail = hex::encode(&data[data.len() - 4..]);
         format!("{head}..{tail}")
     }
-}
-
-/// Set the panic hook
-pub fn set_panic_handler(logger: Logger) {
-    panic::set_hook(Box::new(move |info| panic_hook(info, &logger)));
-}
-
-fn panic_hook(info: &PanicInfo, logger: &Logger) {
-    let location = info.location();
-    let file = location.as_ref().map(|l| l.file()).unwrap_or("<unknown>");
-    let line = location.as_ref().map(|l| l.line()).unwrap_or(0);
-    let msg = match info.payload().downcast_ref::<&'static str>() {
-        Some(s) => *s,
-        None => match info.payload().downcast_ref::<String>() {
-            Some(s) => &s[..],
-            None => "Box<Any>",
-        },
-    };
-    let thread = thread::current();
-    let name = thread.name().unwrap_or("<unnamed>");
-    let backtrace = Backtrace::new();
-    let error = format!(
-        "\n============================\n\
-         {backtrace:?}\n\n\
-         position:\n\
-         Thread {name} panicked at {msg}, {file}:{line}\n\
-         ============================\n\
-         "
-    );
-    error!(logger, "{}", error);
 }
 
 pub fn clap_about() -> String {
