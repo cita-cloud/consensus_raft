@@ -86,8 +86,6 @@ pub struct Peer {
     pending_proposal: Option<Proposal>,
     pending_proposal_proposed: bool,
 
-    // transfer leader if no receiving valid proposal from controller.
-    transfer_leader_timeout: u64,
     send_time_out_to_transferee: bool,
 
     // slog logger
@@ -234,7 +232,62 @@ impl Peer {
         let (wants_campaign, trigger_config) = loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
             match controller_rx.try_recv() {
-                Ok(trigger_config) => {
+                Ok(mut trigger_config) => {
+                    // if recorded_height == trigger_height + 1, try to recommit entry
+                    let recorded_height = storage.get_block_height();
+                    let trigger_height = trigger_config.height;
+                    if recorded_height == trigger_height + 1 {
+                        info!(
+                            logger,
+                            "raft height: {}, controller height: {}, recommit entry",
+                            recorded_height,
+                            trigger_height
+                        );
+                        if let Some(entry) = storage.read_persist_entry().await {
+                            if !entry.data.is_empty() {
+                                let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
+                                if proposal.height == recorded_height {
+                                    match controller.check_proposal(proposal.clone()).await {
+                                        Ok(true) => {
+                                            let pwp = ProposalWithProof {
+                                                proposal: Some(proposal),
+                                                proof: vec![],
+                                            };
+                                            match controller.commit_block(pwp).await {
+                                                Ok(config) => {
+                                                    trigger_config = config;
+                                                    info!(logger, "recommit entry succeed");
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        logger,
+                                                        "recommit entry failed: {}. retry", e
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        Ok(false) => {
+                                            warn!(
+                                                logger,
+                                                "recommit entry failed: check proposal failed, try to recv trigger_config"
+                                            );
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            warn!(logger, "recommit entry failed: {}. retry", e);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            } else {
+                                warn!(logger, "recommit entry failed: empty entry");
+                            }
+                        } else {
+                            warn!(logger, "recommit entry failed: entry not found");
+                        }
+                    }
+
                     let (wants_campaign, is_validator) =
                         Self::update_config(&trigger_config, &node_addr, &mut storage);
                     if is_validator {
@@ -321,7 +374,6 @@ impl Peer {
             pending_conf_change: vec![],
             pending_conf_change_proposed: false,
 
-            transfer_leader_timeout: config.transfer_leader_timeout_in_secs,
             send_time_out_to_transferee: false,
 
             logger,
@@ -524,7 +576,8 @@ impl Peer {
                 }
 
                 if let Some(t) = last_time_start_fetching.as_ref() {
-                    if t.elapsed().as_secs() > self.transfer_leader_timeout {
+                    // transfer leader if no receiving valid proposal from controller
+                    if t.elapsed().as_secs() > self.core.store().get_block_interval() as u64 * 4 {
                         // transfer leader only if not in conf change
                         if self
                             .core
