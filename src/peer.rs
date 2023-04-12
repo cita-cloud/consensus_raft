@@ -186,12 +186,12 @@ impl Peer {
         };
 
         info!(logger_cloned, "start consensus_raft grpc server");
-        if layer.is_some() {
+        if let  Some(layer) = layer {
             tokio::spawn(async move {
                 info!(logger_cloned, "metrics on");
                 let addr = format!("127.0.0.1:{grpc_listen_port}").parse().unwrap();
                 let res = Server::builder()
-                    .layer(layer.unwrap())
+                    .layer(layer)
                     .add_service(ConsensusServiceServer::new(raft_svc))
                     .add_service(NetworkMsgHandlerServiceServer::new(network_svc))
                     .add_service(HealthServer::new(HealthCheckServer {}))
@@ -199,7 +199,7 @@ impl Peer {
                     .await;
 
                 if let Err(e) = res {
-                    info!(logger_cloned, "grpc service exit with error: `{}`", e);
+                    info!(logger_cloned, "grpc service exit with error: `{:?}`", e);
                 } else {
                     info!(logger_cloned, "grpc service exit");
                 }
@@ -216,7 +216,7 @@ impl Peer {
                     .await;
 
                 if let Err(e) = res {
-                    info!(logger_cloned, "grpc service exit with error: `{}`", e);
+                    info!(logger_cloned, "grpc service exit with error: `{:?}`", e);
                 } else {
                     info!(logger_cloned, "grpc service exit");
                 }
