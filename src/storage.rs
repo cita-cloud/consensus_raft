@@ -247,6 +247,7 @@ impl RaftStorage {
             let mut buf = BytesMut::new();
             entry[0].encode_length_delimited(&mut buf).unwrap();
             file.write_all(&buf).await.unwrap();
+            file.flush().await.unwrap();
         }
     }
 
@@ -268,6 +269,7 @@ impl RaftStorage {
         let mut buf = BytesMut::new();
         snapshot.encode_length_delimited(&mut buf).unwrap();
         file.write_all(&buf).await.unwrap();
+        file.flush().await.unwrap();
         info!(
             self.logger,
             "persisted snapshot index: {}",
