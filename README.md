@@ -12,7 +12,7 @@ docker build -t citacloud/consensus_raft .
 
 ```
 $ consensus -h
-consensus 6.6.5
+consensus 6.7.0
 Rivtower Technologies <contact@rivtower.com>
 
 Usage: consensus [COMMAND]
