@@ -20,7 +20,6 @@ mod storage;
 mod utils;
 
 use clap::{crate_authors, crate_version, value_parser, Arg, ArgAction, Command};
-use cloud_util::panic_hook::set_panic_handler;
 use config::ConsensusServiceConfig;
 use peer::Peer;
 use slog::info;
@@ -110,14 +109,12 @@ fn main() {
                 log_builder.build().expect("can't build file logger")
             };
 
-            set_panic_handler();
-
             let rt = tokio::runtime::Runtime::new().unwrap();
 
-            rt.spawn(cloud_util::signal::handle_signals());
             rt.block_on(async move {
-                let mut peer = Peer::setup(config, logger.clone()).await;
-                peer.run().await;
+                let rx_signal = cloud_util::graceful_shutdown::graceful_shutdown();
+                let mut peer = Peer::setup(config, logger.clone(), rx_signal.clone()).await;
+                peer.run(rx_signal).await;
                 info!(logger, "raft service exit");
             });
         }
