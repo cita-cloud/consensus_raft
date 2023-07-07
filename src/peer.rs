@@ -129,7 +129,11 @@ impl Peer {
         }
     }
 
-    pub async fn setup(config: ConsensusServiceConfig, logger: Logger) -> Self {
+    pub async fn setup(
+        config: ConsensusServiceConfig,
+        logger: Logger,
+        rx_signal: flume::Receiver<()>,
+    ) -> Self {
         let node_addr = {
             let s = &config.node_addr;
             hex::decode(s.strip_prefix("0x").unwrap_or(s)).expect("decode node_addr failed")
@@ -193,7 +197,10 @@ impl Peer {
                     .add_service(ConsensusServiceServer::new(raft_svc))
                     .add_service(NetworkMsgHandlerServiceServer::new(network_svc))
                     .add_service(HealthServer::new(HealthCheckServer {}))
-                    .serve(addr)
+                    .serve_with_shutdown(
+                        addr,
+                        cloud_util::graceful_shutdown::grpc_serve_listen_term(rx_signal),
+                    )
                     .await;
 
                 if let Err(e) = res {
@@ -210,7 +217,10 @@ impl Peer {
                     .add_service(ConsensusServiceServer::new(raft_svc))
                     .add_service(NetworkMsgHandlerServiceServer::new(network_svc))
                     .add_service(HealthServer::new(HealthCheckServer {}))
-                    .serve(addr)
+                    .serve_with_shutdown(
+                        addr,
+                        cloud_util::graceful_shutdown::grpc_serve_listen_term(rx_signal),
+                    )
                     .await;
 
                 if let Err(e) = res {
@@ -407,7 +417,7 @@ impl Peer {
         }
     }
 
-    pub async fn run(&mut self) {
+    pub async fn run(&mut self, rx_signal: flume::Receiver<()>) {
         let mut fetching_proposal: Option<JoinHandle<Result<Proposal, tonic::Status>>> = None;
 
         let tick_interval = Duration::from_millis(200);
@@ -470,6 +480,11 @@ impl Peer {
                         error!(self.logger, "step raft msg failed: `{}`", e);
                     }
                 }
+
+                // signal to exit
+                _ = rx_signal.recv_async() => {
+                    break;
+                },
             }
 
             //if incoming change needs to transfer leader, then transfer leader first
