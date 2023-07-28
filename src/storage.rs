@@ -22,6 +22,7 @@ use raft::prelude::RaftState;
 use raft::prelude::Snapshot;
 use raft::prelude::SnapshotMetadata;
 use raft::prelude::Storage;
+use raft::GetEntriesContext;
 use raft::StorageError;
 use slog::info;
 use slog::warn;
@@ -265,7 +266,7 @@ impl RaftStorage {
             .open(&snapshot_path)
             .await
             .unwrap();
-        let snapshot = self.snapshot(self.applied_index).unwrap();
+        let snapshot = self.snapshot(self.applied_index, 0).unwrap();
         let mut buf = BytesMut::new();
         snapshot.encode_length_delimited(&mut buf).unwrap();
         file.write_all(&buf).await.unwrap();
@@ -346,7 +347,13 @@ impl Storage for RaftStorage {
         Ok(self.entries[(idx - offset) as usize].term)
     }
 
-    fn entries(&self, low: u64, high: u64, _: impl Into<Option<u64>>) -> raft::Result<Vec<Entry>> {
+    fn entries(
+        &self,
+        low: u64,
+        high: u64,
+        _: impl Into<Option<u64>>,
+        _: GetEntriesContext,
+    ) -> raft::Result<Vec<Entry>> {
         if low < self.first_index().unwrap() {
             return Err(raft::Error::Store(StorageError::Compacted));
         }
@@ -366,7 +373,7 @@ impl Storage for RaftStorage {
         Ok(ents)
     }
 
-    fn snapshot(&self, request_index: u64) -> raft::Result<Snapshot> {
+    fn snapshot(&self, request_index: u64, _: u64) -> raft::Result<Snapshot> {
         if request_index > self.applied_index {
             return Err(raft::Error::Store(
                 StorageError::SnapshotTemporarilyUnavailable,
@@ -468,7 +475,7 @@ mod tests {
         let log_dir = tempdir().unwrap();
         let mut store = new_store(&log_dir).await;
 
-        let snapshot = store.snapshot(0).unwrap();
+        let snapshot = store.snapshot(0, 0).unwrap();
         store.apply_snapshot(snapshot).unwrap();
         store = new_store(&log_dir).await;
         assert!(store.entries.is_empty());
@@ -502,7 +509,7 @@ mod tests {
             commit: 5,
         });
         store.advance_applied_index(3);
-        let snapshot = store.snapshot(3).unwrap();
+        let snapshot = store.snapshot(3, 0).unwrap();
         // apply_snapshot will clear entries
         store.apply_snapshot(snapshot).unwrap();
         // This commit index should not shrink to 3.
