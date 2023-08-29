@@ -775,6 +775,7 @@ impl Peer {
                     self.core.mut_store().update_conf_state(cs);
                     self.pending_conf_change_proposed = false;
                     self.core.mut_store().advance_applied_index(entry.index);
+                    self.core.mut_store().persist_snapshot().await;
                 }
             }
         }
