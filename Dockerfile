@@ -3,7 +3,7 @@ WORKDIR /build
 ENV PROTOC_NO_VENDOR 1
 RUN rustup component add rustfmt && \
     apt-get update && \
-    apt-get install -y --no-install-recommends wget protobuf-compiler && \
+    apt-get install -y --no-install-recommends wget protobuf-compiler build-essential g++ && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 COPY . /build/
