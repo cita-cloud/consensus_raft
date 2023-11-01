@@ -1,6 +1,6 @@
 [package]
 name = "consensus"
-version = "6.7.2-beta.2"
+version = "6.7.2-beta.3"
 authors = ["Rivtower Technologies <contact@rivtower.com>"]
 edition = "2021"
 
@@ -22,8 +22,8 @@ bytes = "1.5"
 tower = "0.4"
 flume = "0.11"
 
-cloud-util = "=0.8.0-beta.2"
-cita_cloud_proto = "=6.7.2-beta.2"
+cloud-util = "=0.8.0-beta.3"
+cita_cloud_proto = "=6.7.2-beta.3"
 
 [dev-dependencies]
 tempfile = "3.8"
