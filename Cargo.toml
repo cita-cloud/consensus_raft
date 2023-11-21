@@ -1,6 +1,6 @@
 [package]
 name = "consensus"
-version = "6.7.2-beta.3"
+version = "6.7.2"
 authors = ["Rivtower Technologies <contact@rivtower.com>"]
 edition = "2021"
 
