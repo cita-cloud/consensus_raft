@@ -1,22 +1,22 @@
 [package]
 name = "consensus"
-version = "6.7.2"
+version = "6.7.3"
 authors = ["Rivtower Technologies <contact@rivtower.com>"]
 edition = "2021"
 
 [dependencies]
-clap = { version = "4.4", features = ["cargo"] }
-tonic = "0.10"
+clap = { version = "4.5", features = ["cargo"] }
+tonic = "0.11"
 toml = "0.8"
 rand = "0.8"
 # `release_max_level_trace` enables configuring log level at runtime.
 slog = { version = "2.7", features = ["release_max_level_trace"] }
-sloggers = "2.1"
+sloggers = "2.2"
 log = "0.4"
 hex = "0.4"
 raft = { git = "https://github.com/JLerxky/raft-rs", default-features = false, features = ["prost-codec"] }
 prost = "0.12"
-tokio = { version = "1.32", features = ["fs", "io-util", "rt", "macros"] }
+tokio = { version = "1.36", features = ["fs", "io-util", "rt", "macros"] }
 serde = "1.0"
 bytes = "1.5"
 tower = "0.4"
@@ -26,4 +26,4 @@ cloud-util = { package = "cloud-util", git = "https://github.com/cita-cloud/clou
 cita_cloud_proto = { package = "cita_cloud_proto", git = "https://github.com/cita-cloud/cloud-common-rs" }
 
 [dev-dependencies]
-tempfile = "3.8"
+tempfile = "3.10"
