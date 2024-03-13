@@ -19,7 +19,6 @@ use slog::Logger;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio::time;
 
@@ -102,7 +101,7 @@ impl Network {
         local_id: u64,
         local_port: u16,
         network_port: u16,
-        msg_tx: mpsc::Sender<RaftMsg>,
+        msg_tx: flume::Sender<RaftMsg>,
         logger: Logger,
     ) -> Self {
         let mut inner = Inner::new(local_id, network_port, msg_tx, logger);
@@ -117,7 +116,7 @@ pub struct Inner {
     // local peer id
     local_id: u64,
     // Send msg to our local peer
-    msg_tx: mpsc::Sender<RaftMsg>,
+    msg_tx: flume::Sender<RaftMsg>,
 
     // raft_id -> origin
     // Cached origin to avoid broadcasting. These records maybe outdated,
@@ -137,7 +136,7 @@ impl Inner {
     fn new(
         local_id: u64,
         network_port: u16,
-        msg_tx: mpsc::Sender<RaftMsg>,
+        msg_tx: flume::Sender<RaftMsg>,
         logger: Logger,
     ) -> Self {
         let client_options = ClientOptions::new(
@@ -275,7 +274,7 @@ impl NetworkMsgHandlerService for Network {
                     let _ = self.client.clone().send_msg(rest_msg).await;
                 } else {
                     self.msg_tx
-                        .send(raft_msg)
+                        .send_async(raft_msg)
                         .await
                         .map_err(|_| tonic::Status::internal("consensus service is closed"))?;
                 }
