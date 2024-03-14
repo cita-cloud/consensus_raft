@@ -1,17 +1,24 @@
+// Copyright Rivtower Technologies LLC.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::client::{Controller, Network};
 use crate::config::ConsensusServiceConfig;
-use crate::health_check::HealthCheckServer;
 use crate::storage::RaftStorage;
 use crate::utils::{addr_to_peer_id, short_hex};
 use cita_cloud_proto::common::ConsensusConfiguration;
 use cita_cloud_proto::common::Proposal;
 use cita_cloud_proto::common::ProposalWithProof;
-use cita_cloud_proto::common::StatusCode;
-use cita_cloud_proto::consensus::consensus_service_server::ConsensusService;
-use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServer;
-use cita_cloud_proto::health_check::health_server::HealthServer;
-use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
-use cloud_util::metrics::{run_metrics_exporter, MiddlewareLayer};
 use prost::Message as _;
 use raft::eraftpb::ConfChangeType;
 use raft::eraftpb::Message as RaftMsg;
@@ -30,49 +37,15 @@ use slog::{debug, error, info, warn};
 use std::collections::HashSet;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
-use tonic::transport::Server;
-
-#[derive(Debug)]
-pub struct RaftConsensusService(mpsc::Sender<ConsensusConfiguration>);
-
-#[tonic::async_trait]
-impl ConsensusService for RaftConsensusService {
-    async fn reconfigure(
-        &self,
-        request: tonic::Request<ConsensusConfiguration>,
-    ) -> std::result::Result<tonic::Response<StatusCode>, tonic::Status> {
-        let config = request.into_inner();
-        let tx = self.0.clone();
-        // FIXME: it's not safe; but if we wait for it, it may cause a deadlock
-        tokio::spawn(async move {
-            let _ = tx.send(config).await;
-        });
-        // horrible
-        Ok(tonic::Response::new(StatusCode { code: 0 }))
-    }
-
-    async fn check_block(
-        &self,
-        _request: tonic::Request<ProposalWithProof>,
-    ) -> Result<tonic::Response<StatusCode>, tonic::Status> {
-        // Reply ok since we assume no byzantine faults.
-        // horrible
-        Ok(tonic::Response::new(StatusCode { code: 0 }))
-    }
-}
 
 pub struct Peer {
     // raft core
     core: RawNode<RaftStorage>,
 
     // peers' raft msg receiver.
-    peer_rx: mpsc::Receiver<RaftMsg>,
-
-    // controller msg receiver. Currently only used for `reconfigure`.
-    controller_rx: mpsc::Receiver<ConsensusConfiguration>,
+    peer_rx: flume::Receiver<RaftMsg>,
 
     // grpc client to talk with other micro-services.
     controller: Controller,
@@ -132,8 +105,13 @@ impl Peer {
     pub async fn setup(
         config: ConsensusServiceConfig,
         logger: Logger,
-        rx_signal: flume::Receiver<()>,
+        trigger_config: ConsensusConfiguration,
+        network: Network,
+        controller: Controller,
+        peer_rx: flume::Receiver<RaftMsg>,
     ) -> Self {
+        let mut trigger_config = trigger_config;
+
         let node_addr = {
             let s = &config.node_addr;
             hex::decode(s.strip_prefix("0x").unwrap_or(s)).expect("decode node_addr failed")
@@ -141,203 +119,70 @@ impl Peer {
 
         let local_id = addr_to_peer_id(&node_addr);
 
-        // Controller grpc client
-        let controller = {
-            let logger = logger.new(o!("tag" => "controller"));
-            Controller::new(config.controller_port, logger)
-        };
-
-        // Communicate with controller
-        let (controller_tx, mut controller_rx) = mpsc::channel::<ConsensusConfiguration>(1);
-        let raft_svc = RaftConsensusService(controller_tx);
-
-        // Network grpc client
-        let (peer_tx, peer_rx) = mpsc::channel(64);
-        let network = {
-            let logger = logger.new(o!("tag" => "network"));
-            Network::setup(
-                local_id,
-                config.grpc_listen_port,
-                config.network_port,
-                peer_tx,
-                logger,
-            )
-            .await
-        };
-        let network_svc = network.clone();
-
-        let logger_cloned = logger.clone();
-        let grpc_listen_port = config.grpc_listen_port;
-        info!(
-            logger_cloned,
-            "grpc port of consensus_raft: {}", grpc_listen_port
-        );
-
-        let layer = if config.enable_metrics {
-            tokio::spawn(async move {
-                run_metrics_exporter(config.metrics_port).await.unwrap();
-            });
-
-            Some(
-                tower::ServiceBuilder::new()
-                    .layer(MiddlewareLayer::new(config.metrics_buckets))
-                    .into_inner(),
-            )
-        } else {
-            None
-        };
-
-        info!(logger_cloned, "start consensus_raft grpc server");
-        if let Some(layer) = layer {
-            tokio::spawn(async move {
-                info!(logger_cloned, "metrics on");
-                let addr = format!("127.0.0.1:{grpc_listen_port}").parse().unwrap();
-                let res = Server::builder()
-                    .layer(layer)
-                    .add_service(ConsensusServiceServer::new(raft_svc))
-                    .add_service(NetworkMsgHandlerServiceServer::new(network_svc))
-                    .add_service(HealthServer::new(HealthCheckServer {}))
-                    .serve_with_shutdown(
-                        addr,
-                        cloud_util::graceful_shutdown::grpc_serve_listen_term(rx_signal),
-                    )
-                    .await;
-
-                if let Err(e) = res {
-                    info!(logger_cloned, "grpc service exit with error: `{:?}`", e);
-                } else {
-                    info!(logger_cloned, "grpc service exit");
-                }
-            });
-        } else {
-            tokio::spawn(async move {
-                info!(logger_cloned, "metrics off");
-                let addr = format!("127.0.0.1:{grpc_listen_port}").parse().unwrap();
-                let res = Server::builder()
-                    .add_service(ConsensusServiceServer::new(raft_svc))
-                    .add_service(NetworkMsgHandlerServiceServer::new(network_svc))
-                    .add_service(HealthServer::new(HealthCheckServer {}))
-                    .serve_with_shutdown(
-                        addr,
-                        cloud_util::graceful_shutdown::grpc_serve_listen_term(rx_signal),
-                    )
-                    .await;
-
-                if let Err(e) = res {
-                    info!(logger_cloned, "grpc service exit with error: `{:?}`", e);
-                } else {
-                    info!(logger_cloned, "grpc service exit");
-                }
-            });
-        }
-
         // Recover data from log
         let mut storage = {
             let logger = logger.new(o!("tag" => "storage"));
             RaftStorage::new(&config.raft_data_path, logger.clone()).await
         };
 
-        // Wait for controller's reconfigure.
-        info!(logger, "waiting for `reconfigure` from controller..");
-        let (wants_campaign, trigger_config) = loop {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            match controller_rx.try_recv() {
-                Ok(mut trigger_config) => {
-                    // if recorded_height == trigger_height + 1, try to recommit entry
-                    let recorded_height = storage.get_block_height();
-                    let trigger_height = trigger_config.height;
-                    if recorded_height == trigger_height + 1 {
-                        info!(
-                            logger,
-                            "raft height: {}, controller height: {}, recommit entry",
-                            recorded_height,
-                            trigger_height
-                        );
-                        if let Some(entry) = storage.read_persist_entry().await {
-                            if !entry.data.is_empty() {
-                                let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
-                                if proposal.height == recorded_height {
-                                    match controller.check_proposal(proposal.clone()).await {
-                                        Ok(true) => {
-                                            let pwp = ProposalWithProof {
-                                                proposal: Some(proposal),
-                                                proof: vec![],
-                                            };
-                                            match controller.commit_block(pwp).await {
-                                                Ok(config) => {
-                                                    trigger_config = config;
-                                                    info!(logger, "recommit entry succeed");
-                                                }
-                                                Err(e) => {
-                                                    warn!(
-                                                        logger,
-                                                        "recommit entry failed: {}. retry", e
-                                                    );
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                        Ok(false) => {
-                                            warn!(
-                                                logger,
-                                                "recommit entry failed: check proposal failed, try to recv trigger_config"
-                                            );
-                                            continue;
-                                        }
-                                        Err(e) => {
-                                            warn!(logger, "recommit entry failed: {}. retry", e);
-                                            continue;
-                                        }
+        // if recorded_height == trigger_height + 1, try to recommit entry
+        let recorded_height = storage.get_block_height();
+        let trigger_height = trigger_config.height;
+        if recorded_height == trigger_height + 1 {
+            info!(
+                logger,
+                "raft height: {}, controller height: {}, recommit entry",
+                recorded_height,
+                trigger_height
+            );
+            if let Some(entry) = storage.read_persist_entry().await {
+                if !entry.data.is_empty() {
+                    let proposal = Proposal::decode(entry.data.as_slice()).unwrap();
+                    if proposal.height == recorded_height {
+                        match controller.check_proposal(proposal.clone()).await {
+                            Ok(true) => {
+                                let pwp = ProposalWithProof {
+                                    proposal: Some(proposal),
+                                    proof: vec![],
+                                };
+                                match controller.commit_block(pwp).await {
+                                    Ok(config) => {
+                                        trigger_config = config;
+                                        info!(logger, "recommit entry succeed");
+                                    }
+                                    Err(e) => {
+                                        warn!(logger, "recommit entry failed: {}. retry", e);
                                     }
                                 }
-                            } else {
-                                warn!(logger, "recommit entry failed: empty entry");
                             }
-                        } else {
-                            warn!(logger, "recommit entry failed: entry not found");
-                        }
-                    }
-
-                    let (wants_campaign, is_validator) =
-                        Self::update_config(&trigger_config, &node_addr, &mut storage);
-                    if is_validator {
-                        break (wants_campaign, trigger_config);
-                    } else {
-                        info!(
-                            logger,
-                            "incoming config doesn't contain this node, wait for next one"
-                        );
-                    }
-                }
-                Err(_) => {
-                    let pwp = ProposalWithProof {
-                        proposal: Some(Proposal {
-                            height: u64::MAX,
-                            data: vec![],
-                        }),
-                        proof: vec![],
-                    };
-                    info!(logger, "ping_controller..");
-                    match controller.commit_block(pwp).await {
-                        Ok(config) => {
-                            let (wants_campaign, is_validator) =
-                                Self::update_config(&config, &node_addr, &mut storage);
-                            if is_validator {
-                                break (wants_campaign, config);
-                            } else {
-                                info!(
+                            Ok(false) => {
+                                warn!(
                                     logger,
-                                    "incoming config doesn't contain this node, wait for next one"
+                                    "recommit entry failed: check proposal failed, try to recv trigger_config"
                                 );
                             }
-                        }
-                        Err(e) => {
-                            warn!(logger, "commit block failed: {}", e);
+                            Err(e) => {
+                                warn!(logger, "recommit entry failed: {}. retry", e);
+                            }
                         }
                     }
+                } else {
+                    warn!(logger, "recommit entry failed: empty entry");
                 }
+            } else {
+                warn!(logger, "recommit entry failed: entry not found");
             }
-        };
+        }
+
+        let (wants_campaign, is_validator) =
+            Self::update_config(&trigger_config, &node_addr, &mut storage);
+
+        if !is_validator {
+            info!(
+                logger,
+                "incoming config doesn't contain this node, will exit for next one"
+            );
+        }
 
         let recorded_height = storage.get_block_height();
         let trigger_height = trigger_config.height;
@@ -373,8 +218,6 @@ impl Peer {
             core,
             peer_rx,
 
-            controller_rx,
-
             controller,
             network,
 
@@ -386,13 +229,15 @@ impl Peer {
 
             send_time_out_to_transferee: false,
 
-            logger,
+            logger: logger.clone(),
         };
 
         this.maybe_pending_conf_change();
 
         if wants_campaign {
+            info!(logger, "start campaign ...");
             this.core.campaign().unwrap();
+            info!(logger, "campaign success");
         }
 
         this
@@ -417,7 +262,7 @@ impl Peer {
         }
     }
 
-    pub async fn run(&mut self, rx_signal: flume::Receiver<()>) {
+    pub async fn run(&mut self, stop_rx: flume::Receiver<()>) {
         let mut fetching_proposal: Option<JoinHandle<Result<Proposal, tonic::Status>>> = None;
 
         let tick_interval = Duration::from_millis(200);
@@ -471,18 +316,15 @@ impl Peer {
                     }
                 }
 
-                // reconfigure
-                Some(_) = self.controller_rx.recv() => {}
-
                 // raft msg from remote peers
-                Some(raft_msg) = self.peer_rx.recv() => {
+                Ok(raft_msg) = self.peer_rx.recv_async() => {
                     if let Err(e) = self.core.step(raft_msg) {
                         error!(self.logger, "step raft msg failed: `{}`", e);
                     }
                 }
 
-                // signal to exit
-                _ = rx_signal.recv_async() => {
+                // stop raft
+                _ = stop_rx.recv_async() => {
                     break;
                 },
             }
