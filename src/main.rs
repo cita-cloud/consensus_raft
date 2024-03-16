@@ -178,6 +178,12 @@ fn main() {
                 // raft task handle
                 let mut opt_raft_task: Option<JoinHandle<()>> = None;
 
+                // used to delay abort raft task
+                // None means I'm validator no need to abort
+                // Some means I'm not validator, and the height is when I should abort
+                // but we need to delay abort, because the raft task may not complete
+                let mut opt_abort_height = None;
+
                 loop {
                     tokio::time::sleep(Duration::from_secs(3)).await;
 
@@ -219,6 +225,7 @@ fn main() {
                             "get reconfigure from controller, height is {}", trigger_config.height
                         );
                         if trigger_config.validators.contains(&node_addr) {
+                            opt_abort_height = None;
                             if opt_raft_task.is_none()
                                 || opt_raft_task.as_ref().unwrap().is_finished()
                             {
@@ -246,8 +253,13 @@ fn main() {
                             }
                         } else {
                             info!(logger, "I'm not in the validators list");
+                            if opt_abort_height.is_none() {
+                                opt_abort_height = Some(trigger_config.height);
+                            }
                             if let Some(ref handle) = opt_raft_task {
-                                if !handle.is_finished() {
+                                if !handle.is_finished()
+                                    && trigger_config.height > opt_abort_height.unwrap()
+                                {
                                     info!(logger, "abort raft");
                                     handle.abort();
                                 }
