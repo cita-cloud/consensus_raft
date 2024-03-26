@@ -182,7 +182,17 @@ fn main() {
                 // None means I'm validator no need to abort
                 // Some means I'm not validator, and the height is when I should abort
                 // but we need to delay abort, because the raft task may not complete
-                let mut opt_abort_height = None;
+                // to fix restart node during delay abort, we should presist abort height
+                let abort_height_path = Path::new(&config.raft_data_path).join("abort_height");
+                let mut opt_abort_height = if abort_height_path.exists() {
+                    let height = std::fs::read_to_string(&abort_height_path)
+                        .expect("read abort height failed")
+                        .parse::<u64>()
+                        .expect("parse abort height failed");
+                    Some(height)
+                } else {
+                    None
+                };
 
                 loop {
                     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -224,7 +234,11 @@ fn main() {
                             logger,
                             "get reconfigure from controller, height is {}", trigger_config.height
                         );
-                        if trigger_config.validators.contains(&node_addr) {
+                        // if node restart during delay abort, we should start raft task at first
+                        if trigger_config.validators.contains(&node_addr)
+                            || (opt_abort_height.is_some()
+                                && trigger_config.height <= opt_abort_height.unwrap())
+                        {
                             opt_abort_height = None;
                             if opt_raft_task.is_none()
                                 || opt_raft_task.as_ref().unwrap().is_finished()
@@ -254,6 +268,11 @@ fn main() {
                         } else {
                             info!(logger, "I'm not in the validators list");
                             if opt_abort_height.is_none() {
+                                std::fs::write(
+                                    &abort_height_path,
+                                    trigger_config.height.to_string(),
+                                )
+                                .expect("write abort height failed");
                                 opt_abort_height = Some(trigger_config.height);
                             }
                             if let Some(ref handle) = opt_raft_task {
