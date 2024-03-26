@@ -231,6 +231,7 @@ impl RaftStorage {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(true)
             .open(&entry_path)
             .await
             .unwrap();
@@ -263,6 +264,7 @@ impl RaftStorage {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(true)
             .open(&snapshot_path)
             .await
             .unwrap();
