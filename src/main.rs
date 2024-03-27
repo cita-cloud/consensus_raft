@@ -178,21 +178,25 @@ fn main() {
                 // raft task handle
                 let mut opt_raft_task: Option<JoinHandle<()>> = None;
 
-                // used to delay abort raft task
-                // None means I'm validator no need to abort
-                // Some means I'm not validator, and the height is when I should abort
-                // but we need to delay abort, because the raft task may not complete
                 // to fix restart node during delay abort, we should presist abort height
+                // and reload abort height when restart
+                // create raft data path if not exists
+                std::fs::create_dir_all(&config.raft_data_path)
+                    .expect("create raft data path failed");
                 let abort_height_path = Path::new(&config.raft_data_path).join("abort_height");
-                let mut opt_abort_height = if abort_height_path.exists() {
-                    let height = std::fs::read_to_string(&abort_height_path)
+                // abort hight is which height node from validator to non-validator
+                let mut abort_height = if abort_height_path.exists() {
+                    std::fs::read_to_string(&abort_height_path)
                         .expect("read abort height failed")
                         .parse::<u64>()
-                        .expect("parse abort height failed");
-                    Some(height)
+                        .expect("parse abort height failed")
                 } else {
-                    None
+                    0
                 };
+
+                // presist abort height to avoid write file frequently
+                // we only write file when abort height changed
+                let mut presist_abort_height = abort_height;
 
                 loop {
                     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -234,12 +238,25 @@ fn main() {
                             logger,
                             "get reconfigure from controller, height is {}", trigger_config.height
                         );
+                        let is_validator = trigger_config.validators.contains(&node_addr);
+                        if is_validator {
+                            // if we delete this node from validator list at height 100
+                            // finally abort height shoule be 99
+                            // raft start remove node at height 100
+                            // we need abort raft rask at height 101 to let it complete remove node
+                            // so we need add 2 to abort height
+                            abort_height = trigger_config.height + 2;
+                        } else {
+                            info!(logger, "I'm not in the validators list");
+                            if abort_height > presist_abort_height {
+                                std::fs::write(&abort_height_path, abort_height.to_string())
+                                    .expect("write abort height failed");
+                                presist_abort_height = abort_height;
+                            }
+                        }
+
                         // if node restart during delay abort, we should start raft task at first
-                        if trigger_config.validators.contains(&node_addr)
-                            || (opt_abort_height.is_some()
-                                && trigger_config.height <= opt_abort_height.unwrap())
-                        {
-                            opt_abort_height = None;
+                        if is_validator || trigger_config.height < abort_height {
                             if opt_raft_task.is_none()
                                 || opt_raft_task.as_ref().unwrap().is_finished()
                             {
@@ -265,23 +282,10 @@ fn main() {
                                 });
                                 opt_raft_task = Some(handle);
                             }
-                        } else {
-                            info!(logger, "I'm not in the validators list");
-                            if opt_abort_height.is_none() {
-                                std::fs::write(
-                                    &abort_height_path,
-                                    trigger_config.height.to_string(),
-                                )
-                                .expect("write abort height failed");
-                                opt_abort_height = Some(trigger_config.height);
-                            }
-                            if let Some(ref handle) = opt_raft_task {
-                                if !handle.is_finished()
-                                    && trigger_config.height > opt_abort_height.unwrap()
-                                {
-                                    info!(logger, "abort raft");
-                                    handle.abort();
-                                }
+                        } else if let Some(ref handle) = opt_raft_task {
+                            if !handle.is_finished() {
+                                info!(logger, "abort raft");
+                                handle.abort();
                             }
                         }
                     }
