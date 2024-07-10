@@ -36,7 +36,7 @@ pub struct Controller {
 impl Controller {
     pub fn new(port: u16, logger: Logger) -> Self {
         let client_options =
-            ClientOptions::new(CLIENT_NAME.to_string(), format!("http://127.0.0.1:{port}"));
+            ClientOptions::new(CLIENT_NAME.to_string(), format!("http://localhost:{port}"));
         let client = match client_options.connect_controller() {
             Ok(retry_client) => retry_client,
             Err(e) => panic!("client init error: {:?}", &e),
@@ -141,7 +141,7 @@ impl Inner {
     ) -> Self {
         let client_options = ClientOptions::new(
             CLIENT_NAME.to_string(),
-            format!("http://127.0.0.1:{network_port}"),
+            format!("http://localhost:{network_port}"),
         );
         let client = match client_options.connect_network() {
             Ok(retry_client) => retry_client,
@@ -162,7 +162,7 @@ impl Inner {
 
         let request = RegisterInfo {
             module_name: "consensus".to_owned(),
-            hostname: "127.0.0.1".to_owned(),
+            hostname: "localhost".to_owned(),
             port: local_port.to_string(),
         };
 

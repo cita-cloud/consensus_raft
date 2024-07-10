@@ -64,8 +64,8 @@ OPTIONS:
 ```
 $ consensus run -c example/config.toml -d . -f consensus.log
 $ cat consensus.log
-Mar 14 08:32:55.131 INFO controller grpc addr: http://127.0.0.1:50004, tag: controller, module: consensus::client:45
-Mar 14 08:32:55.131 INFO network grpc addr: http://127.0.0.1:50000, tag: network, module: consensus::client:167
+Mar 14 08:32:55.131 INFO controller grpc addr: http://localhost:50004, tag: controller, module: consensus::client:45
+Mar 14 08:32:55.131 INFO network grpc addr: http://localhost:50000, tag: network, module: consensus::client:167
 Mar 14 08:32:55.131 INFO registering network msg handler..., tag: network, module: consensus::client:191
 
 ```
@@ -73,8 +73,8 @@ Mar 14 08:32:55.131 INFO registering network msg handler..., tag: network, modul
 输出到标准输出：
 ```
 $ consensus run -c example/config.toml --stdout
-Mar 14 08:34:00.124 INFO controller grpc addr: http://127.0.0.1:50004, tag: controller, module: consensus::client:45
-Mar 14 08:34:00.125 INFO network grpc addr: http://127.0.0.1:50000, tag: network, module: consensus::client:167
+Mar 14 08:34:00.124 INFO controller grpc addr: http://localhost:50004, tag: controller, module: consensus::client:45
+Mar 14 08:34:00.125 INFO network grpc addr: http://localhost:50000, tag: network, module: consensus::client:167
 Mar 14 08:34:00.125 INFO registering network msg handler..., tag: network, module: consensus::client:191
 ```
 
