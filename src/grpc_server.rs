@@ -91,7 +91,7 @@ pub async fn start_grpc_server(
     if let Some(layer) = layer {
         tokio::spawn(async move {
             info!(logger_cloned, "metrics on");
-            let addr = format!("127.0.0.1:{grpc_listen_port}").parse().unwrap();
+            let addr = format!("[::]:{grpc_listen_port}").parse().unwrap();
             let res = Server::builder()
                 .layer(layer)
                 .add_service(ConsensusServiceServer::new(raft_svc))
@@ -112,7 +112,7 @@ pub async fn start_grpc_server(
     } else {
         tokio::spawn(async move {
             info!(logger_cloned, "metrics off");
-            let addr = format!("127.0.0.1:{grpc_listen_port}").parse().unwrap();
+            let addr = format!("[::]:{grpc_listen_port}").parse().unwrap();
             let res = Server::builder()
                 .add_service(ConsensusServiceServer::new(raft_svc))
                 .add_service(NetworkMsgHandlerServiceServer::new(network))
