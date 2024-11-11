@@ -14,7 +14,7 @@ slog = { version = "2.7", features = ["release_max_level_trace"] }
 sloggers = "2.2"
 log = "0.4"
 hex = "0.4"
-raft = { git = "https://github.com/JLerxky/raft-rs", default-features = false, features = ["prost-codec"] }
+raft = { git = "https://github.com/JLerxky/raft-rs", default-features = false, features = ["prost-codec"], rev = "2a7204f69b116bdc1f88d8c76dd62989f8b10564" }
 prost = "0.13"
 tokio = { version = "1.41", features = ["fs", "io-util", "rt", "macros"] }
 serde = "1.0"
@@ -22,8 +22,8 @@ bytes = "1.8"
 tower = "0.5"
 flume = "0.11"
 
-cloud-util = { package = "cloud-util", git = "https://github.com/cita-cloud/cloud-common-rs" }
-cita_cloud_proto = { package = "cita_cloud_proto", git = "https://github.com/cita-cloud/cloud-common-rs" }
+cloud-util = "=0.8.2"
+cita_cloud_proto = "=6.7.4"
 
 [dev-dependencies]
 tempfile = "3.13"
