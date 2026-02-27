@@ -24,13 +24,13 @@ use crate::client::{Controller, Network};
 use crate::grpc_server::start_grpc_server;
 use cita_cloud_proto::common::ProposalWithProof;
 use cita_cloud_proto::common::{ConsensusConfiguration, Proposal};
-use clap::{crate_authors, crate_version, value_parser, Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, crate_authors, crate_version, value_parser};
 use config::ConsensusServiceConfig;
 use peer::Peer;
 use slog::{debug, info, o, warn};
+use sloggers::Build as _;
 use sloggers::file::FileLoggerBuilder;
 use sloggers::terminal::TerminalLoggerBuilder;
-use sloggers::Build as _;
 use std::path::Path;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -282,11 +282,11 @@ fn main() {
                                 });
                                 opt_raft_task = Some(handle);
                             }
-                        } else if let Some(ref handle) = opt_raft_task {
-                            if !handle.is_finished() {
-                                info!(logger, "abort raft");
-                                handle.abort();
-                            }
+                        } else if let Some(ref handle) = opt_raft_task
+                            && !handle.is_finished()
+                        {
+                            info!(logger, "abort raft");
+                            handle.abort();
                         }
                     }
                 }

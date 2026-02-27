@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use cita_cloud_proto::health_check::{
-    health_check_response::ServingStatus, health_server::Health, HealthCheckRequest,
-    HealthCheckResponse,
+    HealthCheckRequest, HealthCheckResponse, health_check_response::ServingStatus,
+    health_server::Health,
 };
 use tonic::{Request, Response, Status};
 

@@ -22,9 +22,9 @@ use cita_cloud_proto::consensus::consensus_service_server::ConsensusService;
 use cita_cloud_proto::consensus::consensus_service_server::ConsensusServiceServer;
 use cita_cloud_proto::health_check::health_server::HealthServer;
 use cita_cloud_proto::network::network_msg_handler_service_server::NetworkMsgHandlerServiceServer;
-use cloud_util::metrics::{run_metrics_exporter, MiddlewareLayer};
-use slog::info;
+use cloud_util::metrics::{MiddlewareLayer, run_metrics_exporter};
 use slog::Logger;
+use slog::info;
 use tokio::sync::mpsc;
 use tonic::transport::Server;
 

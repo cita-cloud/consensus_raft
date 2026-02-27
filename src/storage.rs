@@ -15,6 +15,8 @@
 use bytes::BytesMut;
 use cita_cloud_proto::common::ConsensusConfiguration;
 use prost::Message;
+use raft::GetEntriesContext;
+use raft::StorageError;
 use raft::prelude::ConfState;
 use raft::prelude::Entry;
 use raft::prelude::HardState;
@@ -22,11 +24,9 @@ use raft::prelude::RaftState;
 use raft::prelude::Snapshot;
 use raft::prelude::SnapshotMetadata;
 use raft::prelude::Storage;
-use raft::GetEntriesContext;
-use raft::StorageError;
+use slog::Logger;
 use slog::info;
 use slog::warn;
-use slog::Logger;
 use std::cmp;
 use std::path::Path;
 use std::path::PathBuf;
@@ -89,14 +89,14 @@ impl RaftStorage {
     }
 
     async fn recover_entries(&mut self) {
-        if let Some(entry) = self.read_persist_entry().await {
-            if entry.index == self.applied_index + 1 {
-                self.append_entries(&[entry.clone()]);
-                warn!(
-                    self.logger,
-                    "recover entry index: {}, applied: {}", entry.index, self.applied_index,
-                );
-            }
+        if let Some(entry) = self.read_persist_entry().await
+            && entry.index == self.applied_index + 1
+        {
+            self.append_entries(std::slice::from_ref(&entry));
+            warn!(
+                self.logger,
+                "recover entry index: {}, applied: {}", entry.index, self.applied_index,
+            );
         }
     }
 
@@ -404,9 +404,9 @@ mod tests {
 
     async fn new_store<P: AsRef<Path>>(log_dir: &P) -> RaftStorage {
         let logger = {
+            use sloggers::Build as _;
             use sloggers::file::FileLoggerBuilder;
             use sloggers::types::Severity;
-            use sloggers::Build as _;
 
             let log_level = Severity::Debug;
             let log_path = log_dir.as_ref().join("raft-test.log");

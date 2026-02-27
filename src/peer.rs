@@ -20,6 +20,8 @@ use cita_cloud_proto::common::ConsensusConfiguration;
 use cita_cloud_proto::common::Proposal;
 use cita_cloud_proto::common::ProposalWithProof;
 use prost::Message as _;
+use raft::ProgressState;
+use raft::RawNode;
 use raft::eraftpb::ConfChangeType;
 use raft::eraftpb::Message as RaftMsg;
 use raft::eraftpb::Snapshot;
@@ -29,10 +31,8 @@ use raft::prelude::Config as RaftConfig;
 use raft::prelude::Entry;
 use raft::prelude::EntryType;
 use raft::prelude::Message;
-use raft::ProgressState;
-use raft::RawNode;
-use slog::o;
 use slog::Logger;
+use slog::o;
 use slog::{debug, error, info, warn};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -354,7 +354,7 @@ impl Peer {
                     .map(|v| addr_to_peer_id(v))
                     .collect();
                 use rand::prelude::IteratorRandom;
-                use rand::thread_rng;
+                use rand::rng;
                 // random pick a up-to-date transferee
                 let transferee = self
                     .core
@@ -372,7 +372,7 @@ impl Peer {
                             None
                         }
                     })
-                    .choose(&mut thread_rng());
+                    .choose(&mut rng());
                 if let Some(transferee) = transferee {
                     self.core.transfer_leader(transferee);
                     self.send_time_out_to_transferee = true;
@@ -444,7 +444,7 @@ impl Peer {
                             .is_empty()
                         {
                             use rand::prelude::IteratorRandom;
-                            use rand::thread_rng;
+                            use rand::rng;
                             // random pick a up-to-date transferee
                             let transferee = self
                                 .core
@@ -461,7 +461,7 @@ impl Peer {
                                         None
                                     }
                                 })
-                                .choose(&mut thread_rng());
+                                .choose(&mut rng());
                             if let Some(transferee) = transferee {
                                 last_time_start_fetching.take();
                                 self.core.transfer_leader(transferee);
