@@ -6,16 +6,16 @@ use cita_cloud_proto::{
     },
     controller::consensus2_controller_service_client::Consensus2ControllerServiceClient as ControllerClient,
     network::{
-        network_msg_handler_service_server::NetworkMsgHandlerService,
-        network_service_client::NetworkServiceClient as NetworkClient, NetworkMsg, RegisterInfo,
+        NetworkMsg, RegisterInfo, network_msg_handler_service_server::NetworkMsgHandlerService,
+        network_service_client::NetworkServiceClient as NetworkClient,
     },
     retry::RetryClient,
 };
 use prost::Message as _;
 use raft::eraftpb::Message as RaftMsg;
+use slog::Logger;
 use slog::debug;
 use slog::info;
-use slog::Logger;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
